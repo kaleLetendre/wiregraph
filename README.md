@@ -2,10 +2,10 @@
 
 codegraph indexes your codebase into a structured graph of its symbols and how they
 connect. Instead of grepping and reading whole files, Claude reads the exact slice it
-needs from that graph — so it answers code questions using **up to half the tokens** a
-session without it would spend, at the same accuracy (measured across held-out A/B
-tests). Less to read also means **faster answers and lower cost**. Embedded, no daemon,
-nothing to compile. **Set it up once and forget it.**
+needs from that graph — answering the same questions just as accurately for **about half
+the tokens** (40–60% fewer in held-out A/B tests). Less to read also means **faster
+answers and lower cost**. Embedded, no daemon, nothing to compile. **Set it up once and
+forget it.**
 
 ```mermaid
 flowchart LR
@@ -23,7 +23,7 @@ flowchart LR
 
 ## Contents
 - [Install](#install)
-- [Daily use](#daily-use)
+- [Index a repo (once)](#index-a-repo-once)
 - [What Claude can do](#what-claude-can-do)
 - [Languages](#languages)
 - [How it works](#how-it-works)
@@ -39,18 +39,18 @@ Three lines, nothing compiles:
 /reload-plugins
 ```
 
-## Daily use
+## Index a repo (once)
 
-Once, in any repo you work in:
+One time per repo, run:
 
 ```
 /codegraph-init
 ```
 
-That's the whole job. It builds the graph, points Claude at it, and keeps it current as
-you edit — **set and forget**. From then on just talk to Claude normally ("where is X",
-"what calls Y", "what breaks if I change Z", "how does A reach B") and it answers from
-the graph, cheaper. Nothing else to run.
+That's the whole job — **once per repo, never again**. It builds the graph, points Claude
+at it, and keeps itself current as you edit (set and forget). From then on just talk to
+Claude normally ("where is X", "what calls Y", "what breaks if I change Z", "how does A
+reach B") and it answers from the graph — cheaper and faster. Nothing else to run, ever.
 
 Rarely needed: `/codegraph-status` (health), `/codegraph-rebuild` (after a big refactor),
 `/codegraph-remove` (uninstall from a repo).
