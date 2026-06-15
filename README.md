@@ -174,8 +174,8 @@ Walk the seams with `trace_contract` and `path_between`.
 ### Packages that import each other in-process
 
 In a monorepo where one package imports another, the link is right there in the code (the
-`import` / `#include`). codegraph doesn't follow cross-repo imports yet — see the
-[Roadmap](#roadmap).
+`import` / `#include`). codegraph doesn't follow cross-repo imports yet (on the roadmap
+below).
 
 ## Roadmap
 
