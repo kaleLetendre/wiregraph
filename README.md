@@ -9,16 +9,23 @@ forget it.**
 
 ```mermaid
 flowchart LR
-  Q(["a code question"]) --> a1
+  Q(["💬 a code question"]):::q --> a1
   Q --> b1
-  subgraph WO["Without codegraph"]
+  subgraph WO["🐢 Without codegraph"]
     direction TB
-    a1["grep the whole tree"] --> a2["read whole files"] --> a3["answer<br/><b>full token cost</b>"]
+    a1["grep the whole tree"]:::bad --> a2["read whole files"]:::bad --> a3["answer<br/><b>full token cost</b>"]:::badout
   end
-  subgraph WI["With codegraph"]
+  subgraph WI["⚡ With codegraph"]
     direction TB
-    b1["query the graph"] --> b2["read just the symbol"] --> b3["same answer<br/><b>~half the cost · faster</b>"]
+    b1["query the graph"]:::good --> b2["read just the symbol"]:::good --> b3["same answer<br/><b>~half the cost · faster</b>"]:::goodout
   end
+  classDef q fill:#1e293b,stroke:#0f172a,color:#f8fafc,font-weight:bold
+  classDef bad fill:#fee2e2,stroke:#ef4444,color:#7f1d1d
+  classDef badout fill:#ef4444,stroke:#b91c1c,color:#ffffff,font-weight:bold
+  classDef good fill:#dcfce7,stroke:#22c55e,color:#14532d
+  classDef goodout fill:#16a34a,stroke:#15803d,color:#ffffff,font-weight:bold
+  style WO fill:#fef2f2,stroke:#fca5a5,color:#991b1b
+  style WI fill:#f0fdf4,stroke:#86efac,color:#166534
 ```
 
 ## Contents
@@ -77,9 +84,14 @@ a call). Everything downstream is language-agnostic.
 
 ```mermaid
 flowchart LR
-  src["your code<br/>C · TS/JS"] --> ts["tree-sitter<br/>parse"] --> db[("graph.db<br/>symbols + how<br/>they connect")]
-  db --> mcp["codegraph<br/>MCP tools"] --> claude(["Claude reads<br/>only what it needs"])
-  edit["you edit code"] -. auto re-index .-> db
+  src["📁 your code<br/>C · TS/JS"]:::src --> ts["🌳 tree-sitter<br/>parse"]:::proc --> db[("🗄️ graph.db<br/>symbols + links")]:::store
+  db --> mcp["🔧 codegraph<br/>tools"]:::proc --> claude(["🤖 Claude reads<br/>only what it needs"]):::ai
+  edit["✏️ you edit code"]:::edit -. auto re-index .-> db
+  classDef src fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a
+  classDef proc fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95
+  classDef store fill:#fef3c7,stroke:#f59e0b,color:#78350f,font-weight:bold
+  classDef ai fill:#dcfce7,stroke:#22c55e,color:#14532d,font-weight:bold
+  classDef edit fill:#f1f5f9,stroke:#94a3b8,color:#334155
 ```
 
 Tree-sitter parses your files into symbols and call sites and stores them in one
