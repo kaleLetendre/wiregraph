@@ -30,7 +30,7 @@ flowchart LR
 
 ## Contents
 - [Install](#install)
-- [Index a repo (once)](#index-a-repo-once)
+- [Index a workspace (once)](#index-a-workspace-once)
 - [What Claude can do](#what-claude-can-do)
 - [Languages](#languages)
 - [How it works](#how-it-works)
@@ -45,21 +45,24 @@ Three lines, nothing compiles:
 /reload-plugins
 ```
 
-## Index a repo (once)
+## Index a workspace (once)
 
-One time per repo, run:
+Run once at the root of a **workspace** — a folder that can hold a single repo or many
+side by side:
 
 ```
 /codegraph-init
 ```
 
-That's the whole job — **once per repo, never again**. It builds the graph, points Claude
-at it, and keeps itself current as you edit (set and forget). From then on just talk to
-Claude normally ("where is X", "what calls Y", "what breaks if I change Z", "how does A
-reach B") and it answers from the graph — cheaper and faster. Nothing else to run, ever.
+That's the whole job — **once per workspace, never again**. It finds every repo under
+that root, indexes them into one graph, and links calls **across** repos through shared
+API/contracts. It keeps itself current as you edit (set and forget). From then on just
+talk to Claude normally ("where is X", "what calls Y", "what breaks if I change Z", "how
+does A reach B") and it answers from the graph — cheaper and faster. Nothing else to run,
+ever.
 
 Rarely needed: `/codegraph-status` (health), `/codegraph-rebuild` (after a big refactor),
-`/codegraph-remove` (uninstall from a repo).
+`/codegraph-remove` (uninstall from a workspace).
 
 ## What Claude can do
 
@@ -95,6 +98,12 @@ flowchart LR
 ```
 
 Tree-sitter parses your files into symbols and call sites and stores them in one
-per-project SQLite file (`<project>/.codegraph/graph.db`). Calls resolve within a repo;
-cross-repo links flow through shared API/contract nodes. Edits re-index a file at a time
-via hooks, so the graph stays fresh without you touching it.
+per-workspace SQLite file (`<workspace>/.codegraph/graph.db`). Calls resolve within a
+repo; cross-repo links flow through shared API/contract nodes — it was built and tested
+on a real multi-repo workspace (four repos linked through shared contracts). Edits
+re-index a file at a time via hooks, so the graph stays fresh without you touching it.
+
+**Git is optional.** codegraph doesn't need it to work — it just walks the folder. When
+git *is* present it uses it to spot what changed between sessions for cheap refreshes;
+without it, codegraph still indexes everything and still re-indexes files as you edit
+them.
