@@ -1,23 +1,25 @@
 # codegraph
 
 codegraph indexes your codebase into a structured graph of its symbols and how they
-connect. Instead of grepping and reading whole files, Claude reads the exact slice it
-needs from that graph — answering the same questions for **about half the tokens**
-(≈40–60% less in internal A/B testing), at no loss in answer quality. Less to read also
-means **faster answers and lower cost**. Everything stays local — the graph is just a
-file in your workspace, nothing is uploaded. **Set it up once and forget it.**
+connect. It makes Claude a better **engineer** on your codebase — not just a better
+search box: when it implements a feature, fixes a bug, or refactors, it works from the
+full picture (every caller, the real blast radius, cross-repo wiring) instead of a
+partial grep — so changes land in the right places. And it gets there reading **about
+half as much** (≈40–60% fewer tokens in internal A/B testing), which also means
+**faster, cheaper** turns. Everything stays local — the graph is just a file in your
+workspace, nothing is uploaded. **Set it up once and forget it.**
 
 ```mermaid
 flowchart LR
-  Q(["💬 a code question"]):::q --> a1
+  Q(["🛠️ a code task<br/>feature · fix · refactor"]):::q --> a1
   Q --> b1
   subgraph WO["🐢 Without codegraph"]
     direction TB
-    a1["grep the whole tree"]:::bad --> a2["read whole files"]:::bad --> a3["answer<br/><b>full token cost</b>"]:::badout
+    a1["grep the whole tree"]:::bad --> a2["read whole files"]:::bad --> a3["change it<br/><b>full token cost</b>"]:::badout
   end
   subgraph WI["⚡ With codegraph"]
     direction TB
-    b1["query the graph"]:::good --> b2["read just the symbol"]:::good --> b3["same answer<br/><b>~half the cost · faster</b>"]:::goodout
+    b1["query the graph"]:::good --> b2["read just what matters"]:::good --> b3["change it from the full picture<br/><b>~half the cost · faster</b>"]:::goodout
   end
   classDef q fill:#1e293b,stroke:#0f172a,color:#f8fafc,font-weight:bold
   classDef bad fill:#fee2e2,stroke:#ef4444,color:#7f1d1d
@@ -59,9 +61,10 @@ That's the whole job — **once per workspace**. It finds every repo under that 
 indexes them into one graph. (If your repos share an **AsyncAPI** contract spec, it also
 links likely producers↔consumers across repos through it — a heuristic, opt-in extra.)
 It keeps itself current as you edit (set and forget) for everyday work; after a big
-refactor or mass rename, run `/codegraph-rebuild` once to resync. From then on just talk
-to Claude normally ("where is X", "what calls Y", "what breaks if I change Z") and it
-answers from the graph — cheaper and faster.
+refactor or mass rename, run `/codegraph-rebuild` once to resync. From then on just put
+Claude to work — "add an endpoint that does X", "fix this bug", "refactor Y safely",
+"what breaks if I change Z" — and it works from the graph instead of guessing from a
+partial read.
 
 Rarely needed: `/codegraph-status` (health), `/codegraph-rebuild` (after a big refactor),
 `/codegraph-remove` (uninstall from a workspace).
