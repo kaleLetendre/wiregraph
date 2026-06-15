@@ -31,13 +31,58 @@ flowchart LR
 ```
 
 ## Contents
+- [How it works](#how-it-works)
+- [Languages](#languages)
 - [Install](#install)
 - [Index a workspace (once)](#index-a-workspace-once)
 - [What Claude can do](#what-claude-can-do)
 - [Cross-repo connections](#cross-repo-connections)
-- [Languages](#languages)
-- [How it works](#how-it-works)
 - [Roadmap](#roadmap)
+
+## How it works
+
+```mermaid
+flowchart LR
+  src["📁 your code<br/>C · TS/JS"]:::src --> ts["🌳 tree-sitter<br/>parse"]:::proc --> db[("🗄️ graph.db<br/>symbols + links")]:::store
+  db --> mcp["🔧 codegraph<br/>tools"]:::proc --> claude(["🤖 Claude reads<br/>only what it needs"]):::ai
+  edit["✏️ you edit code"]:::edit -. auto re-index .-> db
+  classDef src fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a
+  classDef proc fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95
+  classDef store fill:#fef3c7,stroke:#f59e0b,color:#78350f,font-weight:bold
+  classDef ai fill:#dcfce7,stroke:#22c55e,color:#14532d,font-weight:bold
+  classDef edit fill:#f1f5f9,stroke:#94a3b8,color:#334155
+```
+
+Tree-sitter parses your files into symbols and call sites and stores them in one
+per-workspace SQLite file (`<workspace>/.codegraph/graph.db`). Calls resolve by name
+within a repo; cross-repo links go through shared contracts (see
+[Cross-repo connections](#cross-repo-connections)). It was built and tested on a real
+four-repo workspace wired this way. Edits re-index a file at a time via hooks, so the
+graph stays fresh without you touching it.
+
+It's a static, name-based graph, so it's blind to function-pointer/callback dispatch and
+string literals, and a C caller list is an upper bound (it can't see `#ifdef`s) — the
+tools flag this so Claude verifies when it matters.
+
+**Git is optional.** codegraph doesn't need it to work — it just walks the folder. When
+git *is* present it uses it to spot what changed between sessions for cheap refreshes;
+without it, codegraph still indexes everything and still re-indexes files as you edit
+them.
+
+## Languages
+
+| Language | Status |
+|---|---|
+| C | ✅ supported |
+| TypeScript / JavaScript | ✅ supported |
+| Python | 🔜 planned |
+| Go | 🔜 planned |
+| Rust | 🔜 planned |
+| Java | 🔜 planned |
+| C++ | 🔜 planned |
+
+Adding one is small — a tree-sitter grammar plus two short rules (what counts as a
+definition, what counts as a call); everything downstream is language-agnostic.
 
 ## Install
 
@@ -134,50 +179,6 @@ Walk the seams with `trace_contract` and `path_between`.
 In a monorepo where one package imports another, the link is right there in the code (the
 `import` / `#include`). codegraph doesn't follow cross-repo imports yet — see the
 [Roadmap](#roadmap).
-
-## Languages
-
-| Language | Status |
-|---|---|
-| C | ✅ supported |
-| TypeScript / JavaScript | ✅ supported |
-| Python | 🔜 planned |
-| Go | 🔜 planned |
-| Rust | 🔜 planned |
-| Java | 🔜 planned |
-| C++ | 🔜 planned |
-
-Adding one is small — a tree-sitter grammar plus two short rules (what counts as a
-definition, what counts as a call); everything downstream is language-agnostic.
-
-## How it works
-
-```mermaid
-flowchart LR
-  src["📁 your code<br/>C · TS/JS"]:::src --> ts["🌳 tree-sitter<br/>parse"]:::proc --> db[("🗄️ graph.db<br/>symbols + links")]:::store
-  db --> mcp["🔧 codegraph<br/>tools"]:::proc --> claude(["🤖 Claude reads<br/>only what it needs"]):::ai
-  edit["✏️ you edit code"]:::edit -. auto re-index .-> db
-  classDef src fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a
-  classDef proc fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95
-  classDef store fill:#fef3c7,stroke:#f59e0b,color:#78350f,font-weight:bold
-  classDef ai fill:#dcfce7,stroke:#22c55e,color:#14532d,font-weight:bold
-  classDef edit fill:#f1f5f9,stroke:#94a3b8,color:#334155
-```
-
-Tree-sitter parses your files into symbols and call sites and stores them in one
-per-workspace SQLite file (`<workspace>/.codegraph/graph.db`). Calls resolve by name
-within a repo; cross-repo links go through shared contracts (see above). It was built and
-tested on a real four-repo workspace wired this way. Edits re-index a file at a time via
-hooks, so the graph stays fresh without you touching it.
-
-It's a static, name-based graph, so it's blind to function-pointer/callback dispatch and
-string literals, and a C caller list is an upper bound (it can't see `#ifdef`s) — the
-tools flag this so Claude verifies when it matters.
-
-**Git is optional.** codegraph doesn't need it to work — it just walks the folder. When
-git *is* present it uses it to spot what changed between sessions for cheap refreshes;
-without it, codegraph still indexes everything and still re-indexes files as you edit
-them.
 
 ## Roadmap
 
