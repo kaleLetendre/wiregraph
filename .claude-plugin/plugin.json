@@ -12,7 +12,6 @@
     "./commands/codegraph-remove.md",
     "./commands/codegraph-build.md"
   ],
-  "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "codegraph": {
       "command": "node",
