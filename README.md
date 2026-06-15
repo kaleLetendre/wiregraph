@@ -37,6 +37,7 @@ flowchart LR
 - [Cross-repo connections](#cross-repo-connections)
 - [Languages](#languages)
 - [How it works](#how-it-works)
+- [Roadmap](#roadmap)
 
 ## Install
 
@@ -131,8 +132,8 @@ Walk the seams with `trace_contract` and `path_between`.
 ### Packages that import each other in-process
 
 In a monorepo where one package imports another, the link is right there in the code (the
-`import` / `#include`). codegraph doesn't follow cross-repo imports yet — it's on the
-roadmap.
+`import` / `#include`). codegraph doesn't follow cross-repo imports yet — see the
+[Roadmap](#roadmap).
 
 ## Languages
 
@@ -147,8 +148,7 @@ roadmap.
 | C++ | 🔜 planned |
 
 Adding one is small — a tree-sitter grammar plus two short rules (what counts as a
-definition, what counts as a call); everything downstream is language-agnostic — so the
-roadmap is really just "which next."
+definition, what counts as a call); everything downstream is language-agnostic.
 
 ## How it works
 
@@ -178,3 +178,12 @@ tools flag this so Claude verifies when it matters.
 git *is* present it uses it to spot what changed between sessions for cheap refreshes;
 without it, codegraph still indexes everything and still re-indexes files as you edit
 them.
+
+## Roadmap
+
+- **More languages** — Python, Go, Rust, Java, C++ (the 🔜 rows above); each is a grammar
+  plus two small rules.
+- **Cross-repo imports** — follow `import` / `#include` across packages, so in-process
+  cross-repo links work without needing a contract.
+- **Contract-free wire links** — optional matching on shared endpoint paths / field names,
+  to connect services that talk over the wire even when there's no AsyncAPI spec.
