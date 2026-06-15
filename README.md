@@ -27,7 +27,6 @@ flowchart LR
 - [What Claude can do](#what-claude-can-do)
 - [Languages](#languages)
 - [How it works](#how-it-works)
-- [Notes](#notes)
 
 ## Install
 
@@ -87,13 +86,3 @@ Tree-sitter parses your files into symbols and call sites and stores them in one
 per-project SQLite file (`<project>/.codegraph/graph.db`). Calls resolve within a repo;
 cross-repo links flow through shared API/contract nodes. Edits re-index a file at a time
 via hooks, so the graph stays fresh without you touching it.
-
-## Notes
-
-- **Blind spots:** the graph is static and name-based, so it's blind to function-pointer /
-  callback dispatch, string literals (route paths, JSON fields), and the C preprocessor;
-  call resolution is heuristic. The tools carry these caveats so Claude verifies when it
-  matters.
-- **Stack:** WASM SQLite (`sql.js`) + tree-sitter, vendored in the repo so a clean install
-  needs only Node — no compiler, no daemon. The graph file is gitignored. `npm test` runs a
-  regression suite; see `DECISIONS.md` for the architecture rationale.
