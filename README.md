@@ -6,6 +6,20 @@ needs from that graph — so it answers code questions using **up to half the to
 session without it would spend, at the same accuracy (measured across held-out A/B
 tests). Embedded, no daemon, nothing to compile. **Set it up once and forget it.**
 
+```mermaid
+flowchart LR
+  Q(["a code question"]) --> a1
+  Q --> b1
+  subgraph WO["Without codegraph"]
+    direction TB
+    a1["grep the whole tree"] --> a2["read whole files"] --> a3["answer<br/><b>~2x the tokens</b>"]
+  end
+  subgraph WI["With codegraph"]
+    direction TB
+    b1["query the graph"] --> b2["read just the symbol"] --> b3["same answer<br/><b>~half the tokens</b>"]
+  end
+```
+
 ## Contents
 - [Install](#install)
 - [Daily use](#daily-use)
@@ -60,6 +74,13 @@ the tree-sitter grammar plus two short rules (what counts as a definition, what 
 a call). Everything downstream is language-agnostic.
 
 ## How it works
+
+```mermaid
+flowchart LR
+  src["your code<br/>C · TS/JS"] --> ts["tree-sitter<br/>parse"] --> db[("graph.db<br/>symbols + how<br/>they connect")]
+  db --> mcp["codegraph<br/>MCP tools"] --> claude(["Claude reads<br/>only what it needs"])
+  edit["you edit code"] -. auto re-index .-> db
+```
 
 Tree-sitter parses your files into symbols and call sites and stores them in one
 per-project SQLite file (`<project>/.codegraph/graph.db`). Calls resolve within a repo;
