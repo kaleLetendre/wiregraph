@@ -1,13 +1,16 @@
-# Node
-node_modules/
+# node_modules IS committed (vendored): the store is WASM (sql.js) and tree-sitter
+# ships all-platform prebuilds, so the whole tree is portable and the plugin
+# installs/updates with zero npm or compile step. Update it deliberately:
+#   npm install --legacy-peer-deps && git add node_modules
 
 # Build artifacts / exports (generated graph + visualizations embed source symbol
-# names, so they are never committed)
-*.log
-out/
-*.db
-*.db-wal
-*.db-shm
-codegraph-*.html
-codegraph*.gexf
+# names, never committed). Anchored to the repo root so they can't exclude
+# matching files inside the vendored node_modules.
+/out/
+/*.db
+/*.db-wal
+/*.db-shm
+/codegraph-*.html
+/codegraph*.gexf
+/npm-debug.log*
 .codegraph/
