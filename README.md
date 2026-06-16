@@ -43,7 +43,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  src["📁 your code<br/>C · TS/JS"]:::src --> ts["🌳 tree-sitter<br/>parse"]:::proc --> db[("🗄️ graph.db<br/>symbols + links")]:::store
+  src["📁 your code<br/>C · Python · Java · Kotlin · TS/JS"]:::src --> ts["🌳 tree-sitter<br/>parse"]:::proc --> db[("🗄️ graph.db<br/>symbols + links")]:::store
   db --> mcp["🔧 codegraph<br/>tools"]:::proc --> claude(["🤖 Claude reads<br/>only what it needs"]):::ai
   edit["✏️ you edit code"]:::edit -. auto re-index .-> db
   classDef src fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a
@@ -75,10 +75,11 @@ them.
 |---|---|
 | C | ✅ supported |
 | TypeScript / JavaScript | ✅ supported |
-| Python | 🔜 planned |
+| Python | ✅ supported |
+| Java | ✅ supported |
+| Kotlin | ✅ supported |
 | Go | 🔜 planned |
 | Rust | 🔜 planned |
-| Java | 🔜 planned |
 | C++ | 🔜 planned |
 
 ## Install
@@ -179,7 +180,7 @@ below).
 
 ## Roadmap
 
-- **More languages** — Python, Go, Rust, Java, C++ (the 🔜 rows above); each is a grammar
+- **More languages** — Go, Rust, C++ (the 🔜 rows above); each is a grammar
   plus two small rules.
 - **Cross-repo imports** — follow `import` / `#include` across packages, so in-process
   cross-repo links work without needing a contract.

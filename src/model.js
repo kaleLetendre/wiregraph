@@ -1,7 +1,7 @@
 // Graph model: deterministic node/edge identity so re-runs MERGE cleanly.
 //
 // Node kinds : Repo, File, Symbol, Contract
-// Edge kinds : IN_REPO, DEFINED_IN, CALLS, PUBLISHES, CONSUMES, REFERENCES
+// Edge kinds : IN_REPO, DEFINED_IN, CALLS, REFERENCES, WIRE
 //
 // Every id is a stable string derived from content, never a random value, so a
 // second build over unchanged code produces identical ids and the loader's

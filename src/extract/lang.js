@@ -4,6 +4,8 @@ export const IGNORE_DIRS = new Set([
   'node_modules', '.git', '.runtime', '.codegraph', '.shipyard', 'dist', 'build', 'out',
   '.next', 'coverage', 'vendor', '__pycache__', '.venv', 'venv', '.idea',
   '.vscode', 'cmake-build-debug', 'cmake-build-release', '.aws-sam',
+  '.tox', '.eggs', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+  '.gradle', 'target', '.mvn',
 ]);
 
 // Map extension -> { lang, variant }. variant is used by the TS grammar to pick
@@ -20,6 +22,10 @@ const EXT = {
   '.cjs': { lang: 'typescript', variant: 'tsx' },
   '.c': { lang: 'c', variant: 'c' },
   '.h': { lang: 'c', variant: 'c' },
+  '.py': { lang: 'python', variant: 'python' },
+  '.java': { lang: 'java', variant: 'java' },
+  '.kt': { lang: 'kotlin', variant: 'kotlin' },
+  '.kts': { lang: 'kotlin', variant: 'kotlin' },
 };
 
 export function langForFile(path) {

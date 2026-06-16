@@ -3,6 +3,15 @@
 # installs/updates with zero npm or compile step. Update it deliberately:
 #   npm install --legacy-peer-deps && git add node_modules
 
+# Exception: the Kotlin grammar (@tree-sitter-grammars/tree-sitter-kotlin)
+# mis-declares npm-check-updates — a self-contained 5.4 MB dev CLI — as a RUNTIME
+# dependency. It's never loaded (the grammar resolves via its vendored prebuilds),
+# so we keep it out of the committed tree to stay lean. A contributor's
+# `npm install` recreates it locally; it stays ignored and runtime is unaffected.
+node_modules/npm-check-updates/
+node_modules/.bin/ncu
+node_modules/.bin/npm-check-updates
+
 # Build artifacts / exports (generated graph + visualizations embed source symbol
 # names, never committed). Anchored to the repo root so they can't exclude
 # matching files inside the vendored node_modules.
@@ -10,6 +19,7 @@
 /*.db
 /*.db-wal
 /*.db-shm
+/*.db.lock
 /codegraph-*.html
 /codegraph*.gexf
 /npm-debug.log*

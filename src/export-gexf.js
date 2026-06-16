@@ -67,8 +67,9 @@ function renderGexf(nodes, links, repoColor) {
   out.push('    <nodes>');
   for (const n of nodes) {
     const c = hexToRgb(repoColor[n.repo] || '#9aa1ac');
+    // Contract nodes have no repo/file/line — emit empty, not the literal "null".
     out.push(`      <node id="${xml(n.id)}" label="${xml(n.name)}">` +
-      `<attvalues><attvalue for="0" value="${xml(n.repo)}"/><attvalue for="1" value="${xml(n.kind)}"/><attvalue for="2" value="${xml(n.file)}"/><attvalue for="3" value="${xml(n.line)}"/></attvalues>` +
+      `<attvalues><attvalue for="0" value="${xml(n.repo ?? '')}"/><attvalue for="1" value="${xml(n.kind ?? '')}"/><attvalue for="2" value="${xml(n.file ?? '')}"/><attvalue for="3" value="${xml(n.line ?? '')}"/></attvalues>` +
       `<viz:color r="${c.r}" g="${c.g}" b="${c.b}"/></node>`);
   }
   out.push('    </nodes>');
