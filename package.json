@@ -2,6 +2,7 @@
   "name": "codegraph",
   "version": "0.3.0",
   "description": "Cross-repo call/association graph builder + MCP query server, backed by an embedded WASM SQLite file (no daemon, no JVM, no native build)",
+  "license": "AGPL-3.0-or-later",
   "type": "module",
   "bin": {
     "codegraph": "./src/build.js"

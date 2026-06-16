@@ -38,6 +38,7 @@ flowchart LR
 - [What Claude can do](#what-claude-can-do)
 - [Cross-repo connections](#cross-repo-connections)
 - [Roadmap](#roadmap)
+- [License](#license)
 
 ## How it works
 
@@ -84,14 +85,18 @@ them.
 
 ## Install
 
-Inside Claude Code, run these three lines — no compile step on mainstream platforms
-(Linux/macOS/Windows × x64/arm64; the native bits are prebuilt and vendored):
+It's a public repo, so anyone can install it straight from Claude Code — no clone,
+no account setup. Run these three lines; there's no compile step on mainstream
+platforms (Linux/macOS/Windows × x64/arm64; the native bits are prebuilt and vendored):
 
 ```
 /plugin marketplace add kaleLetendre/codegraph
 /plugin install codegraph@codegraph
 /reload-plugins
 ```
+
+When a new version lands, refresh with `/plugin marketplace update codegraph` then
+`/reload-plugins`.
 
 ## Index a workspace (once)
 
@@ -186,3 +191,10 @@ below).
   cross-repo links work without needing a contract.
 - **Contract-free wire links** — optional matching on shared endpoint paths / field names,
   to connect services that talk over the wire even when there's no AsyncAPI spec.
+
+## License
+
+[GNU AGPL-3.0-or-later](LICENSE). Copyleft: you're free to use, study, modify, and
+share it, but distributing it — or running a modified version as a network service —
+means making your source available under the same license. (Licensing may change
+later.)
