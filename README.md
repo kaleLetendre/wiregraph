@@ -34,7 +34,7 @@ flowchart LR
 - [How it works](#how-it-works)
 - [Languages](#languages)
 - [Install](#install)
-- [Why `node_modules` is committed](#why-node_modules-is-committed)
+- [Dependencies](#dependencies)
 - [Index a workspace (once)](#index-a-workspace-once)
 - [What Claude can do](#what-claude-can-do)
 - [Cross-repo connections](#cross-repo-connections)
@@ -86,50 +86,39 @@ them.
 
 ## Install
 
-It's a public repo, so anyone can install it straight from Claude Code — no clone,
-no account setup. Run these three lines; there's no compile step on mainstream
-platforms (Linux/macOS/Windows × x64/arm64; the native bits are prebuilt and vendored):
+This is the **`no-vendored-deps`** branch — dependencies aren't committed, so install
+pulls them from npm (see [Dependencies](#dependencies) for the why and the trade-off).
+Add it by its branch URL, install, then let `/codegraph-init` fetch the dependencies and
+`/reload-plugins` bring the tools online:
 
 ```
-/plugin marketplace add kaleLetendre/codegraph
+/plugin marketplace add https://github.com/kaleLetendre/codegraph.git#no-vendored-deps
 /plugin install codegraph@codegraph
-/reload-plugins
+/codegraph-init      # runs npm install, then builds the graph
+/reload-plugins      # MCP tools come online now that deps exist
 ```
 
 When a new version lands, refresh with `/plugin marketplace update codegraph` then
-`/reload-plugins`.
+`/reload-plugins`. (The default branch vendors `node_modules` and installs with a plain
+three-liner — no `npm install` step — if you'd prefer that.)
 
-## Why `node_modules` is committed
+## Dependencies
 
-codegraph commits its `node_modules/` — unusual enough to look suspicious, so here's
-the reason and how to check it yourself.
+**This branch does not vendor dependencies** — `node_modules/` is gitignored, so the repo
+stays small and contains no prebuilt binaries to audit. You (or the install flow) fetch
+them from the npm registry with `npm install`; `package-lock.json` pins every version by
+integrity hash, so installs are reproducible.
 
-Claude Code starts a plugin's MCP server the moment the plugin loads, and it does **not**
-run `npm install` for you (there's no install-time hook that could run first). If the
-dependencies weren't already on disk, the server would fail to start and the tools would
-silently be missing. Vendoring them is what makes the plugin work the instant you install
-it — no `npm install`, no compile step, on any of Linux/macOS/Windows × x64/arm64. The
-only native bits are official `tree-sitter` grammar prebuilds and `sql.js`'s WebAssembly,
-at versions pinned in `package-lock.json`.
+The catch is the first run. Claude Code starts a plugin's MCP server the moment the plugin
+loads and does **not** run `npm install` for you, so right after installing, the
+dependencies aren't on disk yet and the codegraph tools won't be available. The fix is the
+one extra step in [Install](#install) above — `/codegraph-init` runs `npm install`, then
+`/reload-plugins` brings the MCP server up with the dependencies present.
 
-**You don't have to trust the committed binaries.** The tree is reproducible from the
-committed `package-lock.json`, which carries a per-package integrity hash. Replace it with
-registry-verified copies and confirm nothing meaningful changed:
-
-```
-rm -rf node_modules
-npm ci
-git status
-```
-
-`npm ci` re-fetches every package by its locked integrity hash, so the result is the same
-tree from a source you trust (the npm registry), not hand-placed blobs.
-
-**Prefer a repo without vendored dependencies?** Use the
-[`no-vendored-deps`](https://github.com/kaleLetendre/codegraph/tree/no-vendored-deps)
-branch — it gitignores `node_modules` and you install deps with `npm install` instead. The
-trade-off is a clunkier first run: the MCP tools aren't available until the dependencies
-are installed (via `/codegraph-init`) and you `/reload-plugins`.
+If you'd rather it just work the instant you install it — no `npm install`, no reload
+dance — use the **default branch**, which vendors `node_modules` (all-platform
+`tree-sitter` prebuilds + `sql.js` WASM) so the plugin runs straight from the clone. That
+branch's README explains the trade-off and how to verify the committed tree.
 
 ## Index a workspace (once)
 

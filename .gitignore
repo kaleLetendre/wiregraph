@@ -1,16 +1,8 @@
-# node_modules IS committed (vendored): the store is WASM (sql.js) and tree-sitter
-# ships all-platform prebuilds, so the whole tree is portable and the plugin
-# installs/updates with zero npm or compile step. Update it deliberately:
-#   npm install --legacy-peer-deps && git add node_modules
-
-# Exception: the Kotlin grammar (@tree-sitter-grammars/tree-sitter-kotlin)
-# mis-declares npm-check-updates — a self-contained 5.4 MB dev CLI — as a RUNTIME
-# dependency. It's never loaded (the grammar resolves via its vendored prebuilds),
-# so we keep it out of the committed tree to stay lean. A contributor's
-# `npm install` recreates it locally; it stays ignored and runtime is unaffected.
-node_modules/npm-check-updates/
-node_modules/.bin/ncu
-node_modules/.bin/npm-check-updates
+# This branch does NOT vendor dependencies — node_modules is gitignored. Install
+# them with `npm install` (the /codegraph-init flow runs it for you). The trade-off
+# vs. the default branch is documented in the README ("Dependencies"). package-lock.json
+# stays committed so installs are reproducible.
+node_modules/
 
 # Build artifacts / exports (generated graph + visualizations embed source symbol
 # names, never committed). Anchored to the repo root so they can't exclude
