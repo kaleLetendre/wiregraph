@@ -6,8 +6,14 @@
 import Parser from 'tree-sitter';
 import TS from 'tree-sitter-typescript';
 import CMod from 'tree-sitter-c';
+import PyMod from 'tree-sitter-python';
+import JavaMod from 'tree-sitter-java';
+import KotlinMod from '@tree-sitter-grammars/tree-sitter-kotlin';
 
 const C_LANG = CMod.default || CMod;
+const PY_LANG = PyMod.default || PyMod;
+const JAVA_LANG = JavaMod.default || JavaMod;
+const KOTLIN_LANG = KotlinMod.default || KotlinMod;
 
 const parsers = {};
 function parserFor(variant) {
@@ -16,6 +22,9 @@ function parserFor(variant) {
   if (variant === 'tsx') p.setLanguage(TS.tsx);
   else if (variant === 'typescript') p.setLanguage(TS.typescript);
   else if (variant === 'c') p.setLanguage(C_LANG);
+  else if (variant === 'python') p.setLanguage(PY_LANG);
+  else if (variant === 'java') p.setLanguage(JAVA_LANG);
+  else if (variant === 'kotlin') p.setLanguage(KOTLIN_LANG);
   else throw new Error(`unknown grammar variant: ${variant}`);
   parsers[variant] = p;
   return p;
@@ -119,9 +128,130 @@ function cCall(node) {
   return null;
 }
 
+// --- Python rules -----------------------------------------------------------
+
+// A function_definition is a method when its nearest enclosing scope is a class
+// body (climbing past an optional decorator wrapper); otherwise it's a function.
+function pyEnclosingIsClass(node) {
+  let p = node.parent;
+  if (p && p.type === 'decorated_definition') p = p.parent;
+  return !!(p && p.type === 'block' && p.parent && p.parent.type === 'class_definition');
+}
+
+function pyDef(node) {
+  switch (node.type) {
+    case 'function_definition': {
+      const n = field(node, 'name');
+      if (!n) return null;
+      return { name: n.text, kind: pyEnclosingIsClass(node) ? 'method' : 'function' };
+    }
+    case 'class_definition': {
+      const n = field(node, 'name');
+      return n ? { name: n.text, kind: 'class' } : null;
+    }
+    default:
+      return null;
+  }
+}
+
+function pyCall(node) {
+  if (node.type !== 'call') return null;
+  const fn = field(node, 'function');
+  if (!fn) return null;
+  if (fn.type === 'identifier') return fn.text;       // foo()
+  if (fn.type === 'attribute') {                       // obj.method() -> method
+    const attr = field(fn, 'attribute');
+    return attr ? attr.text : null;
+  }
+  return null;
+}
+
+// --- Java rules -------------------------------------------------------------
+
+function javaDef(node) {
+  switch (node.type) {
+    case 'class_declaration':
+    case 'interface_declaration':
+    case 'enum_declaration':
+    case 'record_declaration': {
+      const n = field(node, 'name');
+      return n ? { name: n.text, kind: 'class' } : null;
+    }
+    case 'method_declaration': {
+      const n = field(node, 'name');
+      return n ? { name: n.text, kind: 'method' } : null;
+    }
+    case 'constructor_declaration': {
+      const n = field(node, 'name');
+      return n ? { name: n.text, kind: 'constructor' } : null;
+    }
+    default:
+      return null;
+  }
+}
+
+function javaCall(node) {
+  if (node.type === 'method_invocation') {           // foo() / obj.foo()
+    const n = field(node, 'name');
+    return n ? n.text : null;
+  }
+  if (node.type === 'object_creation_expression') {  // new Foo<Bar>() -> Foo
+    const t = field(node, 'type');
+    if (!t) return null;
+    return t.text.replace(/<[\s\S]*$/, '').split('.').pop().trim() || null;
+  }
+  return null;
+}
+
+// --- Kotlin rules -----------------------------------------------------------
+
+// A function_declaration is a method when it sits directly in a class/object body.
+function ktEnclosingIsClass(node) {
+  return !!(node.parent && node.parent.type === 'class_body');
+}
+
+function ktDef(node) {
+  switch (node.type) {
+    case 'class_declaration':
+    case 'object_declaration': {
+      const n = field(node, 'name');
+      return n ? { name: n.text, kind: 'class' } : null;
+    }
+    case 'function_declaration': {
+      const n = field(node, 'name');
+      if (!n) return null;
+      return { name: n.text, kind: ktEnclosingIsClass(node) ? 'method' : 'function' };
+    }
+    default:
+      return null;
+  }
+}
+
+// Kotlin call_expression has no name field: the callee is its first child — a bare
+// identifier (foo() / Service()), or a navigation_expression (s.handle()) whose
+// last identifier is the member being called.
+function ktCall(node) {
+  if (node.type !== 'call_expression') return null;
+  const callee = node.namedChild(0);
+  if (!callee) return null;
+  if (callee.type === 'identifier' || callee.type === 'simple_identifier') return callee.text;
+  if (callee.type === 'navigation_expression') {
+    let name = null;
+    for (let i = 0; i < callee.namedChildCount; i++) {
+      const c = callee.namedChild(i);
+      if (c.type === 'identifier' || c.type === 'simple_identifier') name = c.text;
+    }
+    return name;
+  }
+  return null;
+}
+
 const RULES = {
   typescript: { def: tsDef, call: tsCall },
   c: { def: cDef, call: cCall },
+  python: { def: pyDef, call: pyCall },
+  java: { def: javaDef, call: javaCall },
+  kotlin: { def: ktDef, call: ktCall },
 };
 
 // Parse one file's source. Returns { symbols, calls } where:

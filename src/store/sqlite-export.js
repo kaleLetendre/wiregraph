@@ -4,7 +4,9 @@
 // Contract nodes) and a link is { source, target, type, token?, contract?,
 // direction?, count? }. Mirrors the shapes the old Neo4j gather produced.
 
-const isTest = (f) => f && (f.includes('test'));
+// Match the query layer's test-file predicate exactly (path-segment markers, not a
+// bare "test" substring — else "latest"/"fastest"/"contest" would be misfiltered).
+const isTest = (f) => !!f && (f.includes('tests/') || f.includes('/test/') || f.includes('.test.') || f.includes('_test.') || f.includes('/test_'));
 
 function symbolNodes(db, project) {
   const m = new Map();

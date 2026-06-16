@@ -12,10 +12,18 @@
 // so the query + loader code is backend-agnostic. sql.js is in-memory: a writable
 // connection persists on close() by exporting the db and atomically replacing the
 // file; a readonly connection just frees memory.
+//
+// Because the whole writable session is read-file -> mutate-in-memory ->
+// rename-file, two concurrent writers (e.g. the PostToolUse refresh worker firing
+// for two quick edits) would each load the same snapshot and the later rename
+// would clobber the earlier writer's changes — a lost update, not just a torn
+// read. A writable connect() therefore takes a cross-process advisory lock
+// (<db>.lock) for the lifetime of the session, so writers serialize. Read-only
+// connections (the MCP query path) never lock and never wait.
 
 import initSqlJs from 'sql.js';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, openSync, closeSync, statSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const require = createRequire(import.meta.url);
@@ -46,8 +54,49 @@ class Stmt {
   all(...a) { const p = normParams(a); this.raw.reset(); if (p !== undefined) this.raw.bind(p); const out = []; while (this.raw.step()) out.push(this.raw.getAsObject()); this.raw.reset(); return out; }
 }
 
+// Cross-process advisory lock for writable sessions. A lockfile is created with
+// the exclusive 'wx' flag (atomic create-or-fail); contenders spin with a blocking
+// sleep until it frees. A lock older than STALE_MS is assumed to belong to a
+// crashed writer and is stolen — the writable session is short (only the SQLite
+// load + export + rename, never the parse/walk), so a live holder never approaches
+// it. ms-scale blocking is fine in these one-shot CLI/worker processes.
+//
+// Invariant: TIMEOUT > STALE. A contender must be willing to wait longer than the
+// staleness window, or it would give up and throw before it could ever steal a
+// crashed holder's lock (the steal can only fire once the lock is STALE_MS old).
+const LOCK_STALE_MS = 30_000;
+const LOCK_TIMEOUT_MS = 60_000;
+
+function sleepSync(ms) {
+  // Block the thread without burning CPU (no async context to await in).
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireLock(lockPath) {
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, 'wx');
+      writeFileSync(fd, String(process.pid));
+      closeSync(fd);
+      return;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) { rmSync(lockPath, { force: true }); continue; }
+      } catch { continue; /* lock vanished between open and stat — retry immediately */ }
+      if (Date.now() > deadline) throw new Error(`codegraph: timed out waiting for db lock ${lockPath}`);
+      sleepSync(50);
+    }
+  }
+}
+
+function releaseLock(lockPath) {
+  try { rmSync(lockPath, { force: true }); } catch { /* best-effort */ }
+}
+
 class DB {
-  constructor(db, path, readonly) { this._db = db; this._path = path; this._readonly = readonly; }
+  constructor(db, path, readonly, lockPath = null) { this._db = db; this._path = path; this._readonly = readonly; this._lockPath = lockPath; }
   prepare(sql) { return new Stmt(this._db.prepare(sql)); }
   exec(sql) { this._db.exec(sql); return this; }
   pragma() { /* no-op: in-memory WASM db, no WAL/journal to set */ return this; }
@@ -59,19 +108,36 @@ class DB {
     };
   }
   close() {
-    if (!this._readonly) {
-      const tmp = this._path + '.tmp';
-      writeFileSync(tmp, Buffer.from(this._db.export()));
-      renameSync(tmp, this._path); // atomic replace, so a concurrent reader never sees a torn file
+    try {
+      if (!this._readonly) {
+        const tmp = this._path + '.tmp';
+        writeFileSync(tmp, Buffer.from(this._db.export()));
+        renameSync(tmp, this._path); // atomic replace, so a concurrent reader never sees a torn file
+      }
+      this._db.close();
+    } finally {
+      if (this._lockPath) releaseLock(this._lockPath);
     }
-    this._db.close();
   }
 }
 
 export function connect(dbPath, { readonly = false } = {}) {
-  if (!readonly) mkdirSync(dirname(dbPath), { recursive: true });
-  const db = existsSync(dbPath) ? new SQL.Database(readFileSync(dbPath)) : new SQL.Database();
-  return new DB(db, dbPath, readonly);
+  if (readonly) {
+    const db = existsSync(dbPath) ? new SQL.Database(readFileSync(dbPath)) : new SQL.Database();
+    return new DB(db, dbPath, true);
+  }
+  // Writable: lock first, THEN read — so the read-modify-write is atomic against
+  // other writers (a lock taken after the read would not protect the snapshot).
+  mkdirSync(dirname(dbPath), { recursive: true });
+  const lockPath = dbPath + '.lock';
+  acquireLock(lockPath);
+  try {
+    const db = existsSync(dbPath) ? new SQL.Database(readFileSync(dbPath)) : new SQL.Database();
+    return new DB(db, dbPath, false, lockPath);
+  } catch (e) {
+    releaseLock(lockPath);
+    throw e;
+  }
 }
 
 // The schema version stored in the db (0 if absent / pre-versioning). Safe on a
@@ -114,14 +180,7 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
     if (priorVersion) log(`  migrating store schema v${priorVersion} -> v${SCHEMA_VERSION} (recreate)`);
   }
   db.exec(SCHEMA);
-
-  if (reset) {
-    if (!project) throw new Error('sqlite loadGraph --reset requires graph.project');
-    for (const t of ['repos', 'files', 'symbols', 'contracts', 'edges']) {
-      db.prepare(`DELETE FROM ${t} WHERE project = ?`).run(project);
-    }
-    log(`  reset project ${project}`);
-  }
+  if (reset && !project) throw new Error('sqlite loadGraph --reset requires graph.project');
 
   const insRepo = db.prepare('INSERT OR REPLACE INTO repos (id,project,name,root) VALUES (@id,@project,@name,@root)');
   const insFile = db.prepare('INSERT OR REPLACE INTO files (id,project,repo,path,lang) VALUES (@id,@project,@repo,@path,@lang)');
@@ -129,9 +188,20 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
   const insCon = db.prepare('INSERT OR REPLACE INTO contracts (id,project,name,file) VALUES (@id,@project,@name,@file)');
   const insEdge = db.prepare('INSERT INTO edges (type,src,dst,project,token,cnt,resolution,evidence,direction,contract) VALUES (@type,@src,@dst,@project,@token,@cnt,@resolution,@evidence,@direction,@contract)');
 
-  db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
-
   const tx = db.transaction(() => {
+    // The reset wipe runs in the SAME transaction as the reload, so a failure
+    // mid-insert rolls the wipe back too. Otherwise a crashed --reset would leave
+    // the project's rows deleted and close() would persist the emptied db over a
+    // good file — i.e. a transient error during /codegraph-rebuild could destroy
+    // the existing graph, the opposite of the backstop it's meant to be. (The
+    // separate schema-migration DROP path above is exempt: that data is an
+    // already-incompatible old schema the server refuses to query anyway.)
+    if (reset) {
+      for (const t of ['repos', 'files', 'symbols', 'contracts', 'edges']) {
+        db.prepare(`DELETE FROM ${t} WHERE project = ?`).run(project);
+      }
+    }
+    db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
     for (const r of graph.repos.values()) insRepo.run(r);
     for (const f of graph.files.values()) insFile.run(f);
     for (const s of graph.symbols.values()) insSym.run({ lang: null, ...s });
@@ -165,6 +235,7 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
     }
   });
   tx();
+  if (reset) log(`  reset project ${project}`);
   const n = graph.stats();
   log(`  loaded ${n.symbols} symbols, ${n.files} files, ${n.edges} edges into sqlite`);
 }

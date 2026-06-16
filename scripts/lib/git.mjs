@@ -19,9 +19,13 @@ import { langForFile } from '../../src/extract/lang.js';
 // trim() would strip the first line's leading space and corrupt its path parse.
 // stderr is ignored: a failed probe (e.g. a stale sha that's no longer a valid
 // revision) is expected and handled by the null return, not a printed "fatal:".
+//
+// `-c core.quotePath=false` makes git emit raw UTF-8 paths instead of octal-escaped,
+// double-quoted ones for names with non-ASCII/special chars, so the `slice(3)` /
+// ` -> ` porcelain parse below sees the real path (config flags precede the subcommand).
 function git(repoRoot, args) {
   try {
-    return execFileSync('git', ['-C', repoRoot, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return execFileSync('git', ['-C', repoRoot, '-c', 'core.quotePath=false', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   } catch {
     return null;
   }

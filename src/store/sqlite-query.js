@@ -228,12 +228,16 @@ export function pathBetween(db, project, from, to, fromRepo, toRepo, maxHops = 1
 // for structural questions the shaped tools don't cover. The db is per-project so
 // every row already belongs to this project (no scoping needed). Only a single
 // read-only SELECT/WITH…SELECT is allowed; anything that could mutate is rejected.
+// This regex guard is the real protection: the server's "readonly" sql.js handle
+// only means "don't persist on close" (the in-memory WASM db is itself writable),
+// so a write that slipped past here would still be discarded on close — but we
+// reject it up front rather than rely on that.
 export function querySql(db, sql) {
   const q = String(sql || '').trim().replace(/;\s*$/, '');
   if (!q) return 'Empty query.';
   if (/;/.test(q)) return 'Refused: only a single statement is allowed (no ";").';
   if (!/^(SELECT|WITH)\b/i.test(q)) return 'Refused: only read-only SELECT (or WITH … SELECT) queries are allowed.';
-  if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX)\b/i.test(q)) {
+  if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|LOAD_EXTENSION)\b/i.test(q)) {
     return 'Refused: query contains a write/admin keyword. This tool is read-only.';
   }
   let rows;

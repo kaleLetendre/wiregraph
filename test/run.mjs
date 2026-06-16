@@ -6,17 +6,25 @@
 // in-repo path_between, query_sql guards, schema versioning + migration, and
 // incremental idempotency. Self-contained — no external workspace needed.
 
-import { mkdtempSync, cpSync, appendFileSync, rmSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, cpSync, appendFileSync, rmSync, realpathSync, existsSync, writeFileSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { runBuild } from '../src/build.js';
-import { connect, schemaVersion, SCHEMA_VERSION } from '../src/store/sqlite.js';
+import { connect, schemaVersion, SCHEMA_VERSION, loadGraph } from '../src/store/sqlite.js';
+import { Graph } from '../src/model.js';
 import * as Q from '../src/store/sqlite-query.js';
 
+const execFileP = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, 'fixture');
+const FIXTURE_PY = join(HERE, 'fixture-py');
+const FIXTURE_JAVA = join(HERE, 'fixture-java');
+const FIXTURE_KOTLIN = join(HERE, 'fixture-kotlin');
+const BUILD = join(HERE, '..', 'src', 'build.js');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; } else { fail++; console.error(`  FAIL: ${msg}`); } }
@@ -102,7 +110,153 @@ async function fixtureTests() {
   rmSync(work, { recursive: true, force: true });
 }
 
+// Two writers re-indexing different files concurrently (the PostToolUse worker
+// firing for two quick edits) must not lose either update. Each writable session
+// is read-file -> mutate -> rename; without the cross-process lock in sqlite.js
+// the later rename would clobber the earlier writer's new symbol. Run them in
+// separate processes (real parallelism) and assert BOTH new symbols survive.
+async function concurrencyTest() {
+  const work = mkdtempSync(join(tmpdir(), 'cg-conc-'));
+  const src = join(work, 'src');
+  cpSync(FIXTURE, src, { recursive: true });
+  const project = realpathSync(src);
+  const db = join(work, 'graph.db');
+
+  await runBuild({ target: src, project, db, reset: true }); // baseline
+
+  appendFileSync(join(src, 'a.c'), '\nint conc_a(int n) { return a_helper(n); }\n');
+  appendFileSync(join(src, 'util.c'), '\nint conc_u(int n) { return leaf(n); }\n');
+
+  const run = (file) => execFileP('node', [BUILD, src, '--project', project, '--db', db, '--files', file]);
+  await Promise.all([run('a.c'), run('util.c')]);
+
+  const conn = connect(db, { readonly: true });
+  has(Q.findSymbol(conn, project, 'conc_a'), 'a.c', 'concurrent writers: a.c update survived');
+  has(Q.findSymbol(conn, project, 'conc_u'), 'util.c', 'concurrent writers: util.c update survived');
+  conn.close();
+
+  // A lockfile left by a crashed writer (older than the staleness window) must be
+  // stolen, not block forever / time out — else one dead process wedges all
+  // future writes. Backdate a leftover lock and assert the next build succeeds.
+  writeFileSync(db + '.lock', '999999');
+  const longAgo = Date.now() / 1000 - 120; // 2 min old, well past LOCK_STALE_MS
+  utimesSync(db + '.lock', longAgo, longAgo);
+  appendFileSync(join(src, 'a.c'), '\nint after_crash(int n) { return a_helper(n); }\n');
+  await runBuild({ target: src, project, db, files: ['a.c'] });
+  const c2 = connect(db, { readonly: true });
+  has(Q.findSymbol(c2, project, 'after_crash'), 'a.c', 'stale lock from a crashed writer is stolen, build proceeds');
+  c2.close();
+  ok(!existsSync(db + '.lock'), 'stale lock is cleaned up after the steal');
+
+  rmSync(work, { recursive: true, force: true });
+}
+
+// A --reset rebuild wipes the project's rows before reloading. If the reload
+// throws, that wipe must roll back — otherwise close() persists the emptied db
+// and a transient failure during /codegraph-rebuild destroys the existing graph.
+// Inject a symbol with an unbindable value to force the insert phase to throw,
+// then assert the prior graph survived (mimicking build.js's connect/try/finally).
+async function rebuildDurabilityTest() {
+  const work = mkdtempSync(join(tmpdir(), 'cg-dur-'));
+  const db = join(work, 'graph.db');
+  const project = join(work, 'proj');
+
+  const g1 = new Graph(project);
+  g1.addRepo('r', project);
+  g1.addFile('r', 'a.c', 'c');
+  g1.addSymbol({ id: 'sym:r:a.c:keepme:1', repo: 'r', file: 'a.c', name: 'keepme', kind: 'function', lang: 'c', startLine: 1, endLine: 2 });
+  let conn = connect(db);
+  loadGraph(conn, g1);
+  conn.close();
+
+  conn = connect(db, { readonly: true });
+  // NB: assert on 'match(es)', not 'keepme' — the not-found message echoes the
+  // queried name ("No symbol named \"keepme\""), so a name needle would pass even
+  // when the symbol is absent. 'match(es)' only appears on a hit.
+  has(Q.findSymbol(conn, project, 'keepme'), 'match(es)', 'durability: baseline graph present');
+  conn.close();
+
+  const g2 = new Graph(project);
+  g2.addRepo('r', project);
+  // startLine is an object — sql.js can't bind it, so insSym.run throws mid-tx.
+  g2.symbols.set('bad', { id: 'bad', repo: 'r', file: 'b.c', name: 'bad', kind: 'function', lang: 'c', startLine: {}, endLine: 0, project });
+
+  conn = connect(db);
+  let threw = false;
+  try { loadGraph(conn, g2, { reset: true }); } catch { threw = true; } finally { conn.close(); }
+  ok(threw, 'durability: a poisoned --reset load throws');
+
+  conn = connect(db, { readonly: true });
+  has(Q.findSymbol(conn, project, 'keepme'), 'match(es)', 'durability: failed --reset leaves the prior graph intact');
+  conn.close();
+
+  rmSync(work, { recursive: true, force: true });
+}
+
+// Python language support: def/method/class extraction, identifier + attribute
+// call resolution, and a cross-file CALLS chain (run -> handle -> util) reached
+// through a class method.
+async function pythonTests() {
+  const work = mkdtempSync(join(tmpdir(), 'cg-py-'));
+  const src = join(work, 'src');
+  cpSync(FIXTURE_PY, src, { recursive: true });
+  const project = realpathSync(src);
+  const db = join(work, 'graph.db');
+
+  await runBuild({ target: src, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+
+  has(Q.findSymbol(conn, project, 'run'), 'app.py', 'py: find_symbol run locates app.py');
+  has(Q.findSymbol(conn, project, 'handle'), '(method)', 'py: handle is tagged a method');
+  has(Q.findSymbol(conn, project, 'Service'), '(class)', 'py: Service is tagged a class');
+  has(Q.getSource(conn, project, 'helper'), 'return n + 1', 'py: get_source returns the function body');
+
+  const callees = Q.traceCallees(conn, project, 'run');
+  has(callees, 'helper', 'py: callees include same-file helper');
+  has(callees, 'handle', 'py: callees include cross-file method handle (attribute call)');
+  has(callees, 'util', 'py: callees reach util transitively through handle');
+
+  has(Q.traceCallers(conn, project, 'util'), 'run', 'py: callers of util reach run');
+  conn.close();
+
+  rmSync(work, { recursive: true, force: true });
+}
+
+// Java and Kotlin share the same fixture shape as the Python one: run() reaches a
+// cross-file class method (handle), a same-file helper, and a constructor; handle
+// calls util, so callees(run) reaches util transitively. One parametrized harness.
+async function jvmLangTests(label, fixtureDir, mainFile) {
+  const work = mkdtempSync(join(tmpdir(), `cg-${label}-`));
+  const src = join(work, 'src');
+  cpSync(fixtureDir, src, { recursive: true });
+  const project = realpathSync(src);
+  const db = join(work, 'graph.db');
+
+  await runBuild({ target: src, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+
+  has(Q.findSymbol(conn, project, 'run'), mainFile, `${label}: find_symbol run locates ${mainFile}`);
+  has(Q.findSymbol(conn, project, 'handle'), '(method)', `${label}: handle is tagged a method`);
+  has(Q.findSymbol(conn, project, 'Service'), '(class)', `${label}: Service is tagged a class`);
+  has(Q.getSource(conn, project, 'helper'), 'n + 1', `${label}: get_source returns the function body`);
+
+  const callees = Q.traceCallees(conn, project, 'run');
+  has(callees, 'helper', `${label}: callees include same-file helper`);
+  has(callees, 'handle', `${label}: callees include cross-file method handle`);
+  has(callees, 'util', `${label}: callees reach util transitively through handle`);
+
+  has(Q.traceCallers(conn, project, 'util'), 'run', `${label}: callers of util reach run`);
+  conn.close();
+
+  rmSync(work, { recursive: true, force: true });
+}
+
 console.log('codegraph regression test');
 await fixtureTests();
+await pythonTests();
+await jvmLangTests('java', FIXTURE_JAVA, 'App.java');
+await jvmLangTests('kotlin', FIXTURE_KOTLIN, 'App.kt');
+await concurrencyTest();
+await rebuildDurabilityTest();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
