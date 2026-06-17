@@ -27,13 +27,34 @@ staleness and calling `update_graph` at all (it also covers edits the user makes
 outside Claude and the edit-then-query race against the background PostToolUse
 re-index).
 
-**Cost.** A schema bump: existing v1 graphs report a schema mismatch and must run
-`/codegraph-rebuild` once (the loader's migrate-on-reset path handles it). Each read
-pays a cheap git-diff + `stat` probe when the TTL window has expired, and a fast
-incremental re-index only when something actually changed. Staleness enumeration
-still seeds from git, so a change in a non-git directory isn't detected on read
-(unchanged from before; the SessionStart catch-up and a manual `update_graph` remain
-the backstops).
+**Cost.** A schema bump: existing v1 graphs are migrated to v2 automatically on the
+next read (see D11). Each read pays a cheap git-diff + `stat` probe when the TTL
+window has expired, and a fast incremental re-index only when something actually
+changed. Staleness enumeration still seeds from git, so a change in a non-git
+directory isn't detected on read (unchanged from before; the SessionStart catch-up
+and a manual `update_graph` remain the backstops).
+
+## D11 — Schema mismatch self-heals too, not just stale files — 2026-06-17
+
+**Decision.** Extend self-heal-on-read to cover a schema-version mismatch: when a
+read tool opens a db on an older schema, the server runs a full reset rebuild
+(migrating v1 → v2) and then serves, instead of returning "run /codegraph-rebuild".
+The rebuild is deduped within the process (`schemaHealPromise`) and awaited by every
+caller, and `update_graph`'s incremental path migrates first too.
+
+**Why.** D10's mtime self-heal didn't cover the schema bump it introduced — the
+staleness probe bails on a schema mismatch, and `withDb` returned the rebuild prompt,
+so a read on a v1 graph still fell back to grep. A user hit exactly this in daily
+use: a verifier subagent saw the v1/v2 mismatch and grepped instead of rebuilding.
+Making the migration transparent closes the last "graph looks broken → abandon it"
+path, so a plugin update with a schema change needs no manual `/codegraph-rebuild`.
+
+**Cost.** The first read after a schema-changing update pays a one-time full rebuild
+inline (seconds on a real project); on a very large graph that single call could
+approach an MCP timeout, after which the rebuild still completes in the background
+and the next call succeeds. If several plugin processes each run their own MCP
+server, each may trigger one redundant rebuild (serialized by the db lock); they
+converge. `/codegraph-rebuild` remains the explicit backstop.
 
 ## D9 — WASM SQLite (`sql.js`) is the store, not `better-sqlite3` — 2026-06-15
 

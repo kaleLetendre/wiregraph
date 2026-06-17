@@ -28,7 +28,7 @@ import { runBuild } from '../build.js';
 import { readState, updateState } from '../../scripts/lib/state.mjs';
 import { changedSince, projectRepos } from '../../scripts/lib/git.mjs';
 
-const VERSION = '0.4.1';
+const VERSION = '0.4.2';
 
 // Resolve the active project once at startup. realpath so it matches the build
 // (build.js tags nodes with realpathSync of the init root).
@@ -81,6 +81,33 @@ function withDb(fn, { requireIndexed = true } = {}) {
 // burst of queries pays the git+stat probe at most once per window.
 const FRESH_TTL_MS = 1500;
 let lastFreshAt = 0;
+let schemaConfirmed = false;   // set once the on-disk db is known to be on the current schema (per process)
+let schemaHealPromise = null;  // dedups a concurrent schema-migration rebuild
+
+// A schema bump (e.g. v1 -> v2) leaves an existing graph on the OLD schema. Until
+// now the read tools returned "run /codegraph-rebuild" and the model fell back to
+// grep — the exact failure users hit after an update. Migrate transparently
+// instead: a full reset rebuild recreates the tables at the current schema (the
+// loader's migrate-on-reset path). It's deduped within the process and AWAITED by
+// every caller before serving, so a fan-out of verifier subagents triggers a
+// single rebuild and none of them ever sees the mismatch and bails to grep.
+async function ensureSchemaCurrent() {
+  if (schemaConfirmed) return;
+  const p = dbPath();
+  if (!existsSync(p)) return; // not built at all → withDb surfaces NOT_BUILT, not a schema issue
+  let v = null, db;
+  try { db = connect(p, { readonly: true }); v = schemaVersion(db); }
+  catch { return; }
+  finally { try { db?.close(); } catch { /* */ } }
+  if (v === SCHEMA_VERSION) { schemaConfirmed = true; return; }
+  if (!schemaHealPromise) {
+    schemaHealPromise = runBuild({ target: PROJECT, project: PROJECT, reset: true })
+      .then(() => { schemaConfirmed = true; lastFreshAt = Date.now(); }) // just rebuilt → also fresh
+      .catch(() => { /* withDb's mismatch message remains the backstop */ })
+      .finally(() => { schemaHealPromise = null; });
+  }
+  await schemaHealPromise;
+}
 
 // Read-only probe: of the files git says changed, which actually differ from what
 // was indexed (mtime/size)? Cheap, and free of the old false-positive where an
@@ -109,8 +136,10 @@ async function ensureFresh() {
   catch { /* best-effort: serve what we have rather than fail the read */ }
 }
 
-// Wrap a read tool: refresh stale files first, then open read-only and serve.
+// Wrap a read tool: migrate an out-of-date schema, refresh stale files, then open
+// read-only and serve. Schema heal comes first so ensureFresh runs against v2.
 async function freshRead(fn, opts) {
+  await ensureSchemaCurrent();
   await ensureFresh();
   return withDb(fn, opts);
 }
@@ -236,6 +265,9 @@ server.registerTool('update_graph', {
     full: z.boolean().optional().describe('Full project-scoped rebuild instead of incremental (default false).'),
   },
 }, async ({ files, full }) => {
+  // An incremental update against an old-schema db would try to write v2 columns
+  // into v1 tables and fail; migrate first (no-op once on the current schema).
+  if (!full) await ensureSchemaCurrent();
   const state = readState(PROJECT);
   const now = new Date().toISOString();
   try {

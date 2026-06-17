@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "codegraph — cross-repo call graph in an embedded SQLite file (no daemon), exposed to Claude as MCP tools.",
-    "version": "0.4.1"
+    "version": "0.4.2"
   },
   "plugins": [
     {
