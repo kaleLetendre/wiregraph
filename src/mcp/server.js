@@ -28,7 +28,7 @@ import { runBuild } from '../build.js';
 import { readState, updateState } from '../../scripts/lib/state.mjs';
 import { changedSince, projectRepos } from '../../scripts/lib/git.mjs';
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 
 // Resolve the active project once at startup. realpath so it matches the build
 // (build.js tags nodes with realpathSync of the init root).

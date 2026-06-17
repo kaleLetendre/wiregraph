@@ -1,21 +1,31 @@
 #!/usr/bin/env node
-// PreToolUse hook on Grep|Glob. The token win is gated on Claude actually
+// PreToolUse hook on Grep|Glob|Read. The token win is gated on Claude actually
 // reaching for the graph, and the CLAUDE.md directive (loaded once at session
 // start) decays as context grows — so on an indexed project the model drifts
 // back to its grep/Read priors and codegraph goes unused until asked.
 //
-// This puts the nudge at the decision point: when Claude is about to grep/glob
-// for code, inject a one-line reminder (additionalContext) to prefer the graph.
-// It NEVER blocks — it just reminds, and Claude still chooses. To stay true to
-// codegraph's "fewer tokens" promise it is rate-limited to NUDGE_CAP times per
-// session (counter kept under .codegraph/nudges/), and it stays silent unless
-// the project is indexed with a non-'off' posture.
+// This puts the nudge at the decision point: when Claude is about to search or
+// open a source file, inject a one-line reminder (additionalContext) to prefer
+// the graph. It NEVER blocks — it just reminds, and Claude still chooses. To stay
+// true to codegraph's "fewer tokens" promise it is rate-limited to NUDGE_CAP
+// times per session (counter under .codegraph/nudges/) and silent unless the
+// project is indexed with a non-'off' posture.
+//
+// Grep/Glob always qualify — they're inherently code search. Read is gated: only
+// a FULL read of a sizable SOURCE file qualifies (where get_source/trace would
+// actually save tokens). A partial read, a small file, or a non-code file (md,
+// json, logs, images) is left alone — both because the graph can't help there and
+// so the small per-session budget isn't spent on irrelevant reads.
 
-import { realpathSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { realpathSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { readState, codegraphDir } from '../lib/state.mjs';
+import { langForFile } from '../../src/extract/lang.js';
 
 const NUDGE_CAP = 3;
+// A full read worth nudging on: ~200+ lines, where get_source's single-symbol
+// slice meaningfully beats opening the whole file. ~8 KB ≈ 200 lines of code.
+const READ_NUDGE_MIN_BYTES = 8 * 1024;
 
 function readStdin() {
   return new Promise((res) => {
@@ -68,16 +78,32 @@ async function main() {
   // Not indexed, or the user opted all the way out → say nothing.
   if (!state || state.autoUpdate === 'off') quiet();
 
+  // Relevance gate. Grep/Glob pass through; Read must be a full read of a sizable
+  // source file. This runs BEFORE bumpCount so the budget is only ever spent on a
+  // moment where the graph could actually help.
+  const tool = payload?.tool_name || '';
+  if (tool === 'Read') {
+    const ti = payload?.tool_input || {};
+    const file = ti.file_path;
+    if (!file || ti.limit || ti.offset) quiet();  // missing path or an already-targeted partial read
+    if (!langForFile(file)) quiet();               // non-code file — the graph doesn't index it
+    try { if (statSync(file).size < READ_NUDGE_MIN_BYTES) quiet(); } catch { quiet(); } // small/unreadable
+  }
+
   const seen = bumpCount(proj, payload?.session_id);
   if (seen >= NUDGE_CAP) quiet();
 
-  nudge(
-    'codegraph is indexed for this project — prefer its MCP tools over grep/Read ' +
-    'for code navigation: find_symbol (locate a symbol), get_source (read one ' +
-    "function's body), trace_callers/trace_callees/path_between (whole call chains " +
-    'in one call). They cost ~50% fewer tokens. Fall back to grep/Read for string ' +
-    'literals, callback/function-pointer edges, or non-code files.'
-  );
+  const msg = tool === 'Read'
+    ? 'codegraph is indexed for this project — before reading a whole source file, ' +
+      'prefer get_source (returns just one function/symbol\'s body) or ' +
+      'trace_callers/trace_callees/path_between (whole call chains in one call). ' +
+      'They cost ~50% fewer tokens; open the full file only when you need broad context.'
+    : 'codegraph is indexed for this project — prefer its MCP tools over grep for ' +
+      'code navigation: find_symbol (locate a symbol), get_source (read one ' +
+      "function's body), trace_callers/trace_callees/path_between (whole call chains " +
+      'in one call). They cost ~50% fewer tokens. Fall back to grep for string ' +
+      'literals, callback/function-pointer edges, or non-code files.';
+  nudge(msg);
 }
 
 main().catch(() => process.exit(0));
