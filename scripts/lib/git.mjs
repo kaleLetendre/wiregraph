@@ -77,3 +77,37 @@ export function changedSince(project, reposLastSha = {}) {
 
   return { files: [...files], newShas, repos };
 }
+
+// Per-repo divergence from the configured upstream tracking branch.
+//
+// codegraph indexes the WORKING TREE, so "fresh" only ever means "the index
+// matches your checkout" — it has no view of the remote. A checkout parked on a
+// branch far behind its upstream therefore looks perfectly fresh while serving
+// stale code (the failure that burned a session reasoning over a branch 38
+// commits behind origin/main). This is the missing signal: ahead/behind counts
+// vs @{upstream}, surfaced as a caveat — never a gate.
+//
+// Compared against each repo's own @{upstream} (not a hard-coded origin/main) so
+// forks and repos that legitimately track a non-default branch read correctly.
+// Repos with no upstream configured or a detached HEAD are skipped (no baseline).
+// One `git rev-list` per repo; read-only like the rest of this module.
+// Returns [{ name, branch, upstream, ahead, behind }] for repos NOT in sync.
+export function upstreamDivergence(project) {
+  const out = [];
+  for (const repo of projectRepos(project)) {
+    const branch = git(repo.root, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const b = branch ? branch.trim() : null;
+    if (!b || b === 'HEAD') continue; // detached HEAD / unknown → no branch baseline
+    const up = git(repo.root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+    const upstream = up ? up.trim() : null;
+    if (!upstream) continue; // no tracking branch configured → nothing to compare against
+    // `A...B --left-right --count` → "<left> <right>": left = commits in upstream
+    // not in HEAD (behind), right = commits in HEAD not in upstream (ahead).
+    const counts = git(repo.root, ['rev-list', '--left-right', '--count', '@{upstream}...HEAD']);
+    if (!counts) continue;
+    const [behind, ahead] = counts.trim().split(/\s+/).map((n) => parseInt(n, 10) || 0);
+    if (!behind && !ahead) continue; // in sync → no caveat needed
+    out.push({ name: repo.name, branch: b, upstream, ahead, behind });
+  }
+  return out;
+}

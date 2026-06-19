@@ -26,7 +26,7 @@ import { connect, schemaVersion, SCHEMA_VERSION } from '../store/sqlite.js';
 import * as Q from '../store/sqlite-query.js';
 import { runBuild } from '../build.js';
 import { readState, updateState } from '../../scripts/lib/state.mjs';
-import { changedSince, projectRepos } from '../../scripts/lib/git.mjs';
+import { changedSince, projectRepos, upstreamDivergence } from '../../scripts/lib/git.mjs';
 
 const VERSION = '0.4.2';
 
@@ -136,12 +136,43 @@ async function ensureFresh() {
   catch { /* best-effort: serve what we have rather than fail the read */ }
 }
 
+// --- upstream-divergence caveat ---------------------------------------------
+// ensureFresh keeps the index matching the WORKING TREE, but "matches my
+// checkout" is not "matches the code I think I'm reading" when the checkout is a
+// branch behind its upstream — the graph then serves stale code while reporting
+// Fresh, and an agent that trusts it (without ever calling graph_status) reasons
+// over the wrong tree. Surface ahead/behind vs @{upstream} as a one-line caveat.
+// Warn, never block: the graph isn't wrong, it's just indexing an old branch.
+let upstreamBannerSent = false; // once per process — not on every read
+function upstreamCaveatLine() {
+  let div;
+  try { div = upstreamDivergence(PROJECT); } catch { return null; }
+  const behind = (div || []).filter((d) => d.behind > 0);
+  if (!behind.length) return null;
+  const parts = behind.map((d) =>
+    `${d.name}: on '${d.branch}', ${d.behind} behind${d.ahead ? `/${d.ahead} ahead` : ''} of ${d.upstream}`);
+  return `⚠ codegraph reflects your CHECKOUT, which is behind upstream — ${parts.join('; ')}. `
+    + `Pull or switch branches if you expect upstream's code; the graph isn't wrong, it's indexing an old branch.`;
+}
+
 // Wrap a read tool: migrate an out-of-date schema, refresh stale files, then open
 // read-only and serve. Schema heal comes first so ensureFresh runs against v2.
 async function freshRead(fn, opts) {
   await ensureSchemaCurrent();
   await ensureFresh();
-  return withDb(fn, opts);
+  const res = withDb(fn, opts);
+  // One-time-per-process banner so the FIRST read of a session flags a stale
+  // checkout without the agent having to call graph_status (the skipped step in
+  // the session this guards against). Mark sent unconditionally — exactly one git
+  // probe per process — and prepend only when actually behind and serving text.
+  if (!upstreamBannerSent) {
+    upstreamBannerSent = true;
+    const caveat = upstreamCaveatLine();
+    if (caveat && res?.content?.[0]?.type === 'text') {
+      res.content[0].text = `${caveat}\n\n${res.content[0].text}`;
+    }
+  }
+  return res;
 }
 
 const server = new McpServer({ name: 'codegraph', version: VERSION });
@@ -229,7 +260,7 @@ server.registerTool('path_between', {
 // A cheap "is the graph healthy and fresh for this project?" check Claude calls
 // to decide whether to update before trusting a trace.
 server.registerTool('graph_status', {
-  description: 'Health + freshness of the codegraph for THIS project: is the project indexed (counts), when was the last full build, and is the graph STALE (any file whose on-disk content differs from what was indexed). The read tools already self-heal — they re-index changed files before answering — so you rarely need this; use it only to confirm freshness or before a full rebuild after a big refactor.',
+  description: 'Health + freshness of the codegraph for THIS project: is the project indexed (counts), when was the last full build, is the graph STALE (any file whose on-disk content differs from what was indexed), and whether the checkout is BEHIND its upstream branch (the graph mirrors your working tree, so a stale branch serves stale code while still reporting fresh). The read tools already self-heal — they re-index changed files before answering — so you rarely need this; use it to confirm freshness, check you are not on a stale branch, or before a full rebuild after a big refactor.',
   inputSchema: {},
 }, async () => withDb((db) => {
   const stats = Q.graphStats(db, PROJECT);
@@ -252,6 +283,21 @@ server.registerTool('graph_status', {
     lines.push(`STALE: ${changed.length} changed source file(s) (${preview}${changed.length > 5 ? ', …' : ''}). Run update_graph to refresh.`);
   } else {
     lines.push('Fresh: no source changes detected since last index.');
+  }
+  // Upstream divergence: the graph mirrors the working tree, so "fresh" can still
+  // mean "indexing a branch behind origin". Report ahead/behind vs each repo's
+  // @{upstream} — a trust caveat, not a staleness error (no re-index would fix it;
+  // only a pull/switch would). Recomputed live here, unlike the once-per-session
+  // banner the read tools emit.
+  let div = [];
+  try { div = upstreamDivergence(PROJECT); } catch { /* git not available — skip */ }
+  const behind = div.filter((d) => d.behind > 0);
+  if (behind.length) {
+    for (const d of behind) {
+      lines.push(`BEHIND UPSTREAM: ${d.name} on '${d.branch}' is ${d.behind} behind${d.ahead ? `/${d.ahead} ahead` : ''} of ${d.upstream}. The graph reflects this checkout — pull or switch if you expect upstream's code.`);
+    }
+  } else if (div.length) {
+    lines.push('Upstream: ahead of upstream but not behind (checkout is current).');
   }
   return text(lines.join('\n'));
 }, { requireIndexed: false }));
