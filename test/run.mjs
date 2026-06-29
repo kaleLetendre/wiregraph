@@ -6,7 +6,7 @@
 // in-repo path_between, query_sql guards, schema versioning + migration, and
 // incremental idempotency. Self-contained — no external workspace needed.
 
-import { mkdtempSync, cpSync, appendFileSync, rmSync, realpathSync, existsSync, writeFileSync, utimesSync } from 'node:fs';
+import { mkdtempSync, cpSync, appendFileSync, rmSync, realpathSync, existsSync, writeFileSync, utimesSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -305,6 +305,63 @@ async function jvmLangTests(label, fixtureDir, mainFile) {
   rmSync(work, { recursive: true, force: true });
 }
 
+// Impact metrics: estTokens, gated best-effort record(), and the summarize()
+// rollup including the grep-gap classifier (which resolves grep patterns against
+// a real built graph). Self-contained — builds the C fixture into a temp project.
+async function metricsTests() {
+  const M = await import('../scripts/lib/metrics.mjs');
+  const S = await import('../scripts/lib/state.mjs');
+
+  eq(M.estTokens(''), 0, 'metrics: estTokens("") is 0');
+  ok(M.estTokens('abcdefgh') > 0, 'metrics: estTokens positive for non-empty');
+  ok(M.estTokens('a'.repeat(100)) > M.estTokens('a'.repeat(10)), 'metrics: estTokens monotonic');
+
+  const work = mkdtempSync(join(tmpdir(), 'cg-metrics-'));
+  const src = join(work, 'src');
+  cpSync(FIXTURE, src, { recursive: true });
+  const project = realpathSync(src);
+  const db = join(project, '.codegraph', 'graph.db');           // where summarize() looks
+  await runBuild({ target: src, project, db, reset: true });
+  S.writeState(project, S.defaultState(project));                // balanced posture ⇒ recording enabled
+
+  // record() writes a parseable, timestamped line
+  M.record(project, { kind: 'use', tool: 'get_source', returnedTokens: 7, fileTokens: 130, savedTokens: 123 });
+  const lines = readFileSync(M.metricsPath(project), 'utf8').trim().split('\n');
+  const last = JSON.parse(lines[lines.length - 1]);
+  eq(last.tool, 'get_source', 'metrics: recorded tool field');
+  eq(last.savedTokens, 123, 'metrics: recorded savedTokens field');
+  ok(typeof last.t === 'number', 'metrics: stamped a numeric timestamp');
+
+  // gating: the env kill-switch and posture:off are both silent no-ops
+  const before = readFileSync(M.metricsPath(project), 'utf8');
+  process.env.CODEGRAPH_METRICS = '0';
+  M.record(project, { kind: 'use', tool: 'get_source' });
+  delete process.env.CODEGRAPH_METRICS;
+  S.updateState(project, { autoUpdate: 'off' });
+  M.record(project, { kind: 'use', tool: 'get_source' });
+  S.updateState(project, { autoUpdate: 'balanced' });
+  eq(readFileSync(M.metricsPath(project), 'utf8'), before, 'metrics: gating (env + posture off) silences record');
+
+  // a trace + greps, then the rollup. "a_helper" is a real fixture symbol;
+  // "no_such_symbol_xyz" is not; "foo.*bar" is a regex, not a bare identifier.
+  M.record(project, { kind: 'use', tool: 'trace_callees', nodes: 4, returnedTokens: 50 });
+  M.record(project, { kind: 'grep', pattern: 'a_helper' });
+  M.record(project, { kind: 'grep', pattern: 'no_such_symbol_xyz' });
+  M.record(project, { kind: 'grep', pattern: 'foo.*bar' });
+
+  const agg = await M.summarize(project);
+  eq(agg.getSourceCalls, 1, 'metrics: summarize counts get_source calls');
+  eq(agg.savedTokens, 123, 'metrics: summarize sums savedTokens');
+  eq(agg.traceCalls, 1, 'metrics: summarize counts trace calls');
+  eq(agg.traceNodes, 4, 'metrics: summarize sums trace nodes');
+  eq(agg.grepTotal, 3, 'metrics: summarize counts every grep');
+  eq(agg.gapCount, 1, 'metrics: only the known-symbol grep counts as a gap');
+  ok(agg.gapTokens > 0, 'metrics: gap tokens estimated from the symbol file');
+  has(M.formatSummary(agg), 'Adoption gap', 'metrics: formatSummary renders the gap line');
+
+  rmSync(work, { recursive: true, force: true });
+}
+
 console.log('codegraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -313,5 +370,6 @@ await jvmLangTests('kotlin', FIXTURE_KOTLIN, 'App.kt');
 await freshnessTests();
 await concurrencyTest();
 await rebuildDurabilityTest();
+await metricsTests();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

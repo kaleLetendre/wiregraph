@@ -38,4 +38,19 @@ that's off. **Target** = `${CLAUDE_PROJECT_DIR}` or cwd; call it `<TARGET>`.
 4. **Recent background refreshes** (optional): if `<TARGET>/.codegraph/refresh.log`
    exists, show the last few lines so the user can see auto-updates are running.
 
+5. **Measured impact** (optional): if `<TARGET>/.codegraph/metrics.jsonl` exists,
+   show the rollup:
+
+   ```
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/metrics.mjs summary "<TARGET>"
+   ```
+
+   This reports graph-tool usage, estimated tokens saved by `get_source`, trace
+   coverage, and the **adoption gap** (greps that searched for a symbol the graph
+   already knows). Pass `--session <id>` to scope it to one session. Make clear to
+   the user these are **local estimates under a counterfactual** (chars-per-token
+   proxy), not billed tokens — useful for trend and for spotting where codegraph
+   is being bypassed, not for exact accounting. No file yet just means no graph
+   tools have run since this was added.
+
 Summarize the health as a short checklist with any fixes needed.

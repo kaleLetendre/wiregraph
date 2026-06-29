@@ -20,13 +20,14 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { connect, schemaVersion, SCHEMA_VERSION } from '../store/sqlite.js';
 import * as Q from '../store/sqlite-query.js';
 import { runBuild } from '../build.js';
 import { readState, updateState } from '../../scripts/lib/state.mjs';
 import { changedSince, projectRepos, upstreamDivergence } from '../../scripts/lib/git.mjs';
+import { record, estTokens } from '../../scripts/lib/metrics.mjs';
 
 const VERSION = '0.4.2';
 
@@ -37,6 +38,7 @@ function resolveProject() {
   try { return realpathSync(raw); } catch { return raw; }
 }
 const PROJECT = resolveProject();
+const SESSION = process.env.CLAUDE_SESSION_ID || null; // best-effort; MCP servers may not get it
 const NOT_BUILT = `No codegraph for this project (${PROJECT}). Run /codegraph-init here to build it.`;
 
 function dbPath() {
@@ -175,6 +177,44 @@ async function freshRead(fn, opts) {
   return res;
 }
 
+// --- impact metrics ---------------------------------------------------------
+// Record graph-tool usage + an estimate of tokens saved to .codegraph/metrics.jsonl
+// (see scripts/lib/metrics.mjs for the honesty caveats). ALL best-effort: a
+// measurement failure must NEVER fail the tool call.
+const GS_HEADER = /^([^:\n]+):([^:\n]+):(\d+)-(\d+)\s/; // "repo:file:start-end name" header (sqlite-query.js:94)
+
+// get_source's saving is the clean counterfactual: the whole file you'd have Read
+// vs the symbol body it returned. Parse the header for repo/file, resolve the
+// file via the live db (same repos lookup Q.getSource does), measure both sides.
+function recordGetSource(db, out) {
+  try {
+    const returnedTokens = estTokens(out);
+    const m = GS_HEADER.exec(out);
+    if (!m) { record(PROJECT, { sessionId: SESSION, kind: 'use', tool: 'get_source', returnedTokens }); return; }
+    const [, repo, file] = m;
+    let fileTokens = 0;
+    const root = db.prepare('SELECT root FROM repos WHERE project=? AND name=?').get(PROJECT, repo)?.root;
+    if (root) { try { fileTokens = estTokens(readFileSync(join(root, file), 'utf8')); } catch { /* file gone */ } }
+    record(PROJECT, { sessionId: SESSION, kind: 'use', tool: 'get_source', repo, file,
+      returnedTokens, fileTokens, savedTokens: Math.max(0, fileTokens - returnedTokens) });
+  } catch { /* best-effort */ }
+}
+
+// A trace answers a whole call tree in one call. Node count (one arrow per node)
+// and returned tokens are exact; the modeled "saved" figure lives in summarize.
+function recordTrace(tool, out) {
+  try {
+    record(PROJECT, { sessionId: SESSION, kind: 'use', tool,
+      nodes: (String(out).match(/[→◄]/g) || []).length, returnedTokens: estTokens(out) });
+  } catch { /* best-effort */ }
+}
+
+// Plain usage tally for the other read tools (the denominator).
+function recordUse(tool, out) {
+  try { record(PROJECT, { sessionId: SESSION, kind: 'use', tool, returnedTokens: estTokens(out) }); }
+  catch { /* best-effort */ }
+}
+
 const server = new McpServer({ name: 'codegraph', version: VERSION });
 
 // --- graph_stats ------------------------------------------------------------
@@ -190,7 +230,11 @@ server.registerTool('find_symbol', {
     name: z.string().describe('Exact symbol name, e.g. "parse_request"'),
     repo: z.string().optional().describe('Restrict to a repo, e.g. "api-server"'),
   },
-}, async ({ name, repo }) => freshRead((db) => text(Q.findSymbol(db, PROJECT, name, repo))));
+}, async ({ name, repo }) => freshRead((db) => {
+  const out = Q.findSymbol(db, PROJECT, name, repo);
+  recordUse('find_symbol', out);
+  return text(out);
+}));
 
 // --- get_source -------------------------------------------------------------
 // Returns ONLY a symbol's definition lines (file:startLine..endLine), read from
@@ -205,7 +249,11 @@ server.registerTool('get_source', {
     file: z.string().optional().describe('Substring of the file path, to disambiguate'),
     context: z.number().optional().describe('Extra lines of context above/below (default 0)'),
   },
-}, async ({ name, repo, file, context }) => freshRead((db) => text(Q.getSource(db, PROJECT, name, repo, file, context))));
+}, async ({ name, repo, file, context }) => freshRead((db) => {
+  const out = Q.getSource(db, PROJECT, name, repo, file, context);
+  recordGetSource(db, out);
+  return text(out);
+}));
 
 // --- trace_callees / trace_callers -----------------------------------------
 server.registerTool('trace_callees', {
@@ -218,7 +266,11 @@ server.registerTool('trace_callees', {
     includeTests: z.boolean().optional().describe('Include callees in test files (default false)'),
   },
 }, async ({ name, repo, file, depth, includeTests }) =>
-  freshRead((db) => text(Q.traceCallees(db, PROJECT, name, repo, file, depth, includeTests))));
+  freshRead((db) => {
+    const out = Q.traceCallees(db, PROJECT, name, repo, file, depth, includeTests);
+    recordTrace('trace_callees', out);
+    return text(out);
+  }));
 
 server.registerTool('trace_callers', {
   description: 'Upward call stack: who calls this symbol, transitively, within its repo. Returns the WHOLE tree in one call (don\'t walk it hop-by-hop) — callers above the symbol. Use to find entrypoints reaching a function. Caveat: the caller set is an UPPER BOUND in C — it includes call sites inside disabled #if 0 / #ifdef blocks (the static graph is blind to the preprocessor); it is also blind to function-pointer/callback dispatch.',
@@ -230,7 +282,11 @@ server.registerTool('trace_callers', {
     includeTests: z.boolean().optional().describe('Include callers in test files (default false)'),
   },
 }, async ({ name, repo, file, depth, includeTests }) =>
-  freshRead((db) => text(Q.traceCallers(db, PROJECT, name, repo, file, depth, includeTests))));
+  freshRead((db) => {
+    const out = Q.traceCallers(db, PROJECT, name, repo, file, depth, includeTests);
+    recordTrace('trace_callers', out);
+    return text(out);
+  }));
 
 // --- trace_contract ---------------------------------------------------------
 server.registerTool('trace_contract', {
@@ -241,7 +297,11 @@ server.registerTool('trace_contract', {
     includeTests: z.boolean().optional().describe('Include symbols in test files (default false)'),
   },
 }, async ({ contract, token, includeTests }) =>
-  freshRead((db) => text(Q.traceContract(db, PROJECT, contract, token, includeTests))));
+  freshRead((db) => {
+    const out = Q.traceContract(db, PROJECT, contract, token, includeTests);
+    recordUse('trace_contract', out);
+    return text(out);
+  }));
 
 // --- path_between -----------------------------------------------------------
 server.registerTool('path_between', {
@@ -254,7 +314,11 @@ server.registerTool('path_between', {
     maxHops: z.number().optional().describe('Max path length, 1-20 (default 12)'),
   },
 }, async ({ from, to, fromRepo, toRepo, maxHops }) =>
-  freshRead((db) => text(Q.pathBetween(db, PROJECT, from, to, fromRepo, toRepo, maxHops))));
+  freshRead((db) => {
+    const out = Q.pathBetween(db, PROJECT, from, to, fromRepo, toRepo, maxHops);
+    recordUse('path_between', out);
+    return text(out);
+  }));
 
 // --- graph_status -----------------------------------------------------------
 // A cheap "is the graph healthy and fresh for this project?" check Claude calls
@@ -365,7 +429,11 @@ server.registerTool('query_sql', {
   inputSchema: {
     query: z.string().describe('A single read-only SQL SELECT (or WITH … SELECT)'),
   },
-}, async ({ query }) => freshRead((db) => text(Q.querySql(db, query))));
+}, async ({ query }) => freshRead((db) => {
+  const out = Q.querySql(db, query);
+  recordUse('query_sql', out);
+  return text(out);
+}));
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

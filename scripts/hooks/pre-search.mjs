@@ -20,6 +20,7 @@
 import { realpathSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { readState, codegraphDir } from '../lib/state.mjs';
+import { record } from '../lib/metrics.mjs';
 import { langForFile } from '../../src/extract/lang.js';
 
 const NUDGE_CAP = 3;
@@ -82,6 +83,17 @@ async function main() {
   // source file. This runs BEFORE bumpCount so the budget is only ever spent on a
   // moment where the graph could actually help.
   const tool = payload?.tool_name || '';
+
+  // Tier-3 adoption signal: record every grep (cheap append, NO db access — the
+  // summary classifies which patterns name a symbol the graph already knows).
+  // Done here, before the nudge budget below, so the full-session denominator is
+  // captured even after the per-session nudge cap is spent.
+  if (tool === 'Grep') {
+    const pat = payload?.tool_input?.pattern;
+    record(proj, { sessionId: payload?.session_id || null, kind: 'grep',
+      pattern: typeof pat === 'string' ? pat.slice(0, 200) : null });
+  }
+
   if (tool === 'Read') {
     const ti = payload?.tool_input || {};
     const file = ti.file_path;
