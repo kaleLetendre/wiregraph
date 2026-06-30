@@ -457,6 +457,38 @@ async function messagingTest() {
   rmSync(work, { recursive: true, force: true });
 }
 
+// Shared-state detector: an env var read in 2+ repos is a seam; ubiquitous env
+// vars (NODE_ENV) are filtered so they don't become bogus contracts.
+async function stateTest() {
+  const I = await import('../src/contracts/infer.js');
+  const work = mkdtempSync(join(tmpdir(), 'cg-state-'));
+  const a = join(work, 'svc-a'), b = join(work, 'svc-b');
+  mkdirSync(join(a, '.git'), { recursive: true });
+  mkdirSync(join(b, '.git'), { recursive: true });
+  writeFileSync(join(a, 'cfg.js'), "export const url = process.env.FEIG_TMS_ENDPOINT;\nconst e = process.env.NODE_ENV;\n");
+  writeFileSync(join(b, 'cfg.js'), "function load() { return process.env.FEIG_TMS_ENDPOINT; }\nconst e2 = process.env.NODE_ENV;\n");
+  const project = realpathSync(work);
+
+  const seams = I.clusterSeams(I.extractCandidates(project));
+  const st = seams.find((s) => s.kind === 'state' && s.token === 'FEIG_TMS_ENDPOINT');
+  ok(st, `state: shared env-var seam detected (got ${seams.map((s) => s.kind + ':' + s.token).join(', ') || 'none'})`);
+  ok(!seams.some((s) => s.token === 'NODE_ENV'), 'state: ubiquitous env var NODE_ENV is filtered out even when cross-repo');
+
+  const yaml = I.synthesizeAsyncApi(seams);
+  const cdir = join(project, 'contracts'); mkdirSync(cdir, { recursive: true });
+  writeFileSync(join(cdir, 'wiregraph-inferred.asyncapi.yaml'), yaml);
+  const db = join(project, '.wiregraph', 'graph.db');
+  await runBuild({ target: project, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+  const repos = new Set(
+    conn.prepare("SELECT DISTINCT s.repo repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES'")
+      .all(project).map((r) => r.repo),
+  );
+  ok(repos.has('svc-a') && repos.has('svc-b'), `state: round-trip links both env readers (got ${[...repos].join(', ') || 'none'})`);
+  conn.close();
+  rmSync(work, { recursive: true, force: true });
+}
+
 console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -469,5 +501,6 @@ await metricsTests();
 await resolutionTests();
 await contractsTests();
 await messagingTest();
+await stateTest();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

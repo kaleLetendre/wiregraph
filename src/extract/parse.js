@@ -382,18 +382,83 @@ function wireCandidate(r) {
   return { kind: 'wire', token: r.path, label: r.method,
     role: r.side === 'server' ? 'in' : r.side === 'client' ? 'out' : 'unknown' };
 }
+// --- shared-state detection (env vars) --------------------------------------
+// An env var read in 2+ repos is a shared-config contract (renaming the var
+// breaks every reader). Scoped to env-access syntax (high signal) and filtered
+// against ubiquitous names so common vars don't become bogus seams. (DB tables /
+// config keys are deferred — too noisy without ORM/SQL context.)
+const STATE_STOP = new Set([
+  'NODE_ENV', 'PORT', 'HOME', 'PATH', 'PWD', 'USER', 'SHELL', 'LANG', 'TERM', 'TZ',
+  'CI', 'DEBUG', 'NODE_OPTIONS', 'HOSTNAME', 'TMPDIR', 'EDITOR', 'LOGNAME', 'SHLVL',
+  'OLDPWD', 'DISPLAY',
+]);
+function stateCandidate(name) {
+  if (!name || STATE_STOP.has(name)) return null;
+  return { kind: 'state', token: name, role: 'unknown', label: 'env' };
+}
+// TS: object is `process.env` or `import.meta.env`.
+function isTsEnvObject(n) {
+  if (!n || n.type !== 'member_expression') return false;
+  if (field(n, 'property')?.text !== 'env') return false;
+  const o = field(n, 'object');
+  const oName = o && (o.type === 'identifier' ? o.text : o.type === 'member_expression' ? field(o, 'property')?.text : null);
+  return oName === 'process' || oName === 'meta';
+}
+function tsState(node) {
+  if (node.type === 'member_expression' && isTsEnvObject(field(node, 'object'))) {
+    return stateCandidate(field(node, 'property')?.text);                 // process.env.NAME
+  }
+  if (node.type === 'subscript_expression' && isTsEnvObject(field(node, 'object'))) {
+    return stateCandidate(strLiteral(field(node, 'index')));              // process.env['NAME']
+  }
+  return null;
+}
+function pyState(node) {
+  if (node.type === 'subscript') {                                       // os.environ['NAME']
+    const val = field(node, 'value');
+    if (val?.type === 'attribute' && field(val, 'attribute')?.text === 'environ') {
+      return stateCandidate(strLiteral(field(node, 'subscript')));
+    }
+    return null;
+  }
+  if (node.type === 'call') {
+    const fn = field(node, 'function');
+    if (fn?.type === 'attribute') {
+      const method = field(fn, 'attribute')?.text;
+      if (method === 'getenv') return stateCandidate(strLiteral(firstArg(node)));         // os.getenv('NAME')
+      if (method === 'get' && field(fn, 'object')?.type === 'attribute'
+          && field(field(fn, 'object'), 'attribute')?.text === 'environ') {
+        return stateCandidate(strLiteral(firstArg(node)));                                 // os.environ.get('NAME')
+      }
+    }
+    if (fn?.type === 'identifier' && fn.text === 'getenv') return stateCandidate(strLiteral(firstArg(node)));
+  }
+  return null;
+}
+function cState(node) {                                                  // getenv("NAME")
+  if (node.type !== 'call_expression') return null;
+  const fn = field(node, 'function');
+  if (fn?.type === 'identifier' && fn.text === 'getenv') return stateCandidate(strLiteral(firstArg(node)));
+  return null;
+}
+
 function tsSig(node) {
   const r = tsRoute(node);
-  return r ? wireCandidate(r) : tsMessage(node);
+  if (r) return wireCandidate(r);
+  return tsMessage(node) || tsState(node);
 }
 function pySig(node) {
   const r = pyRoute(node);
-  return r ? wireCandidate(r) : pyMessage(node);
+  if (r) return wireCandidate(r);
+  return pyMessage(node) || pyState(node);
+}
+function cSig(node) {
+  return cState(node);
 }
 
 const RULES = {
   typescript: { def: tsDef, call: tsCall, sig: tsSig },
-  c: { def: cDef, call: cCall },
+  c: { def: cDef, call: cCall, sig: cSig },
   python: { def: pyDef, call: pyCall, sig: pySig },
   java: { def: javaDef, call: javaCall },
   kotlin: { def: ktDef, call: ktCall },
