@@ -1,7 +1,7 @@
 // Extension -> language, plus the directories we never descend into.
 
 export const IGNORE_DIRS = new Set([
-  'node_modules', '.git', '.runtime', '.wiregraph', '.shipyard', 'dist', 'build', 'out',
+  'node_modules', '.git', '.runtime', '.wiregraph', '.codegraph', '.shipyard', 'dist', 'build', 'out',
   '.next', 'coverage', 'vendor', '__pycache__', '.venv', 'venv', '.idea',
   '.vscode', 'cmake-build-debug', 'cmake-build-release', '.aws-sam',
   '.tox', '.eggs', '.pytest_cache', '.mypy_cache', '.ruff_cache',

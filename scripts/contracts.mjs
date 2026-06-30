@@ -49,13 +49,7 @@ function main(argv) {
   const seams = clusterSeams(extractRoutes(root));
 
   process.stdout.write(formatSeams(seams) + '\n');
-  if (!seams.length) {
-    process.stdout.write(
-      '\nTip: cross-repo contracts need related repos indexed TOGETHER in one workspace '
-      + '(each its own git repo, side by side under one folder). If your repos are indexed '
-      + 'separately, wiregraph can\'t see the shared routes.\n');
-    return;
-  }
+  if (!seams.length) return; // formatSeams already explains the likely reasons
 
   const yaml = synthesizeAsyncApi(seams);
   const home = contractsHome(root);

@@ -109,9 +109,14 @@ export function inferSeams(root, fileFilter = null) {
 // Human-readable summary of what was found (for the command output).
 export function formatSeams(seams) {
   if (!seams.length) {
-    return 'No cross-repo wire seams found (no HTTP path is referenced by 2+ repos). '
-      + 'wiregraph infers contracts from shared HTTP routes across repos — make sure related '
-      + 'repos are indexed together in one workspace.';
+    return [
+      'No cross-repo HTTP route seams to infer. That is often expected — common reasons:',
+      '  • you already have hand-written AsyncAPI contracts: those are matched directly,',
+      '    so there is nothing left to infer (see the contract count in /wiregraph-status);',
+      '  • services talk over message queues, or build request URLs dynamically, rather',
+      '    than sharing a literal HTTP route string the static scan can pair across repos;',
+      '  • the related repos are not indexed together in one workspace.',
+    ].join('\n');
   }
   const lines = [`Found ${seams.length} cross-repo wire seam(s):`, ''];
   for (const s of seams) {
