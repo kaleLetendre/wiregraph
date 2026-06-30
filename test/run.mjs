@@ -489,6 +489,24 @@ async function stateTest() {
   rmSync(work, { recursive: true, force: true });
 }
 
+// Recognize-potential: a full build persists the cross-repo seam count + contracts
+// dir to state, which is what gates the SessionStart/status nudge.
+async function potentialTest() {
+  const S = await import('../scripts/lib/state.mjs');
+  const work = mkdtempSync(join(tmpdir(), 'cg-pot-'));
+  const a = join(work, 'producer'), b = join(work, 'consumer');
+  mkdirSync(join(a, '.git'), { recursive: true });
+  mkdirSync(join(b, '.git'), { recursive: true });
+  writeFileSync(join(a, 'p.js'), "function go(ch){ ch.publish('jobs.created', '{}'); }\n");
+  writeFileSync(join(b, 'c.js'), "function on(ch){ ch.subscribe('jobs.created', (m) => m); }\n");
+  const project = realpathSync(work);
+  await runBuild({ target: project, project, db: join(project, '.wiregraph', 'graph.db'), reset: true });
+  const st = S.readState(project);
+  eq(st && st.inferredSeams, 1, 'potential: full build persists the cross-repo seam count');
+  ok(st && !st.contractsDir, 'potential: no contracts dir → nudge gate (seams>0 && !contractsDir) would fire');
+  rmSync(work, { recursive: true, force: true });
+}
+
 console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -502,5 +520,6 @@ await resolutionTests();
 await contractsTests();
 await messagingTest();
 await stateTest();
+await potentialTest();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

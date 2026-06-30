@@ -14,6 +14,7 @@ const MAX_BYTES = 2_000_000; // skip pathologically large/generated files
 // changed file is attributed to the right repo.
 export function extractCode(graph, rootDir, log = () => {}, fileFilter = null) {
   const calls = []; // { fromId, repo, relPath, name, line }
+  const candidates = []; // contract signals { kind, token, role, label, repo, file, line }
   let fileCount = 0;
 
   for (const f of walkSources(rootDir)) {
@@ -67,11 +68,14 @@ export function extractCode(graph, rootDir, log = () => {}, fileFilter = null) {
       const fromId = c.enclosing == null ? modId : localIds[c.enclosing];
       calls.push({ fromId, repo: f.repo, relPath: f.relPath, name: c.name, line: c.line });
     }
+    for (const c of parsed.candidates || []) {
+      candidates.push({ kind: c.kind, token: c.token, role: c.role, label: c.label, repo: f.repo, file: f.relPath, line: c.line });
+    }
 
     fileCount++;
     if (fileCount % 200 === 0) log(`  parsed ${fileCount} files...`);
   }
 
   log(`  parsed ${fileCount} files total`);
-  return calls;
+  return { calls, candidates };
 }

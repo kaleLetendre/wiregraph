@@ -43,9 +43,10 @@ that's off. **Target** = `${CLAUDE_PROJECT_DIR}` or cwd; call it `<TARGET>`.
    dashboard of graph-tool usage, estimated tokens saved, and the adoption gap
    (it explains how the numbers are projected). Don't recompute it here.
 
-6. **Contract coverage** (multi-repo only): from `graph_stats`, note the Contracts
-   count. If the graph spans **2+ repos but has 0 contracts**, cross-repo wire seams
-   aren't being traced — suggest `/wiregraph-contracts` to infer them from the code.
-   (Single-repo projects don't need contracts.)
+6. **Contract coverage**: from the state shown in step 3, read `inferredSeams` (the
+   cross-repo seams — messaging/state/HTTP — the last full build detected) and
+   `contractsDir`. If `inferredSeams > 0` and there's no `contractsDir`, those seams
+   aren't captured yet — recommend `/wiregraph-contracts` to draft contracts for
+   them. If a `contractsDir` is present, coverage is in place (nothing to do).
 
 Summarize the health as a short checklist with any fixes needed.

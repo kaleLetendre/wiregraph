@@ -26,7 +26,8 @@ import { resolveCalls } from './extract/resolve.js';
 import { loadContracts, matchContracts, buildWireEdges } from './extract/contracts.js';
 import { findRepoRoots, repoNameFor } from './extract/walk.js';
 import { connect, loadGraph, loadProjectSymbols, pruneFile } from './store/sqlite.js';
-import { wiregraphDir } from '../scripts/lib/state.mjs';
+import { wiregraphDir, updateState } from '../scripts/lib/state.mjs';
+import { clusterSeams } from './contracts/infer.js';
 
 function parseArgs(argv) {
   const opts = { target: process.cwd(), reset: false, load: true, dump: null, contracts: null, project: null, files: null, db: null };
@@ -75,7 +76,7 @@ function fullBuild(opts, root, project) {
   const graph = new Graph(project);
 
   log('1/4 extracting code symbols + calls...');
-  const calls = extractCode(graph, root, log);
+  const { calls, candidates } = extractCode(graph, root, log);
 
   log('2/4 resolving calls...');
   resolveCalls(graph, calls, log);
@@ -89,6 +90,12 @@ function fullBuild(opts, root, project) {
   } else {
     log('3/4 no contracts dir found — skipping cross-repo wire edges');
   }
+
+  // Persist the cross-repo seam count + detected contracts dir so SessionStart and
+  // /wiregraph-status nudge toward /wiregraph-contracts only when there's real,
+  // *uncovered* potential (seams found AND no contracts dir present).
+  try { updateState(project, { inferredSeams: clusterSeams(candidates).length, contractsDir: contractsDir || null }); }
+  catch { /* metadata only — never fail a build over it */ }
 
   const stats = graph.stats();
   log('graph stats: ' + JSON.stringify(stats, null, 2));
@@ -145,7 +152,7 @@ function incrementalBuild(opts, root, project) {
     const present = changed.filter((c) => c.exists);
     const fileFilter = new Set(present.map((c) => c.abs));
     const graph = new Graph(project);
-    const calls = present.length ? extractCode(graph, root, log, fileFilter) : [];
+    const { calls } = present.length ? extractCode(graph, root, log, fileFilter) : { calls: [] };
 
     // 2. resolve outgoing calls against the rest of the project (read from the db).
     if (present.length) {

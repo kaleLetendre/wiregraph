@@ -66,6 +66,7 @@ export function defaultState(project, pluginVersion = null) {
     lastFullBuild: null,
     pluginVersion,
     autoUpdate: 'balanced',
+    inferredSeams: 0,
     contractsDir: null,
   };
 }

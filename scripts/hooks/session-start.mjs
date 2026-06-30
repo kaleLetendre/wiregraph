@@ -65,13 +65,14 @@ async function main() {
   });
   child.unref();
 
-  // A multi-repo workspace with no contracts yet can't trace cross-repo wire
-  // seams — nudge toward inferring them. Cheap: just repo count + the contractsDir
-  // flag from state (no scan here). Appended to whichever note fires below, since
-  // emit() exits.
-  const repoCount = Object.keys(state.reposLastSha || {}).length;
-  const contractsHint = (repoCount > 1 && !state.contractsDir)
-    ? ' Multi-repo workspace with no contracts — run /wiregraph-contracts to infer cross-repo wire links from the code.'
+  // Nudge toward inferring contracts only when there's REAL, uncovered potential:
+  // the last full build found cross-repo seams (messaging/state/HTTP) AND no
+  // contracts dir is present. Both come from state (persisted at build time), so
+  // this stays a cheap read — no scan. Appended to whichever note fires below,
+  // since emit() exits. Silent for contracted or signal-free workspaces.
+  const seams = state.inferredSeams || 0;
+  const contractsHint = (seams > 0 && !state.contractsDir)
+    ? ` wiregraph spotted ${seams} cross-repo seam(s) (messaging/state/HTTP) with no contract yet — run /wiregraph-contracts to capture them.`
     : '';
 
   // Tailor a short note from a quick git check (don't block on the refresh).
