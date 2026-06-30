@@ -20,6 +20,10 @@ import { fileURLToPath } from 'node:url';
 export const BEGIN = '<!-- BEGIN wiregraph (managed) -->';
 export const END = '<!-- END wiregraph -->';
 
+// Pre-rename (codegraph) sentinels — stripped on upsert/teardown so a project
+// initialized before the rename migrates cleanly instead of carrying two blocks.
+const LEGACY = [{ begin: '<!-- BEGIN codegraph (managed) -->', end: '<!-- END codegraph -->' }];
+
 // The directive body (between the sentinels).
 const DIRECTIVE = `## Code navigation — use wiregraph first, economically
 
@@ -37,28 +41,43 @@ export function targetPath(project) {
   return join(project, 'CLAUDE.md');
 }
 
-// Upsert the managed block into existing CLAUDE.md content.
+// Remove one sentinel-delimited block, tidying the blank lines it leaves behind.
+function stripBlock(content, begin, end) {
+  const bi = content.indexOf(begin);
+  const ei = content.indexOf(end);
+  if (bi === -1 || ei === -1 || ei < bi) return content;
+  const before = content.slice(0, bi).replace(/\n+$/, '\n');
+  const after = content.slice(ei + end.length).replace(/^\n+/, '');
+  return (before + after).replace(/\n{3,}/g, '\n\n');
+}
+
+// Strip any pre-rename codegraph block (migration cleanup).
+function stripLegacy(content) {
+  let c = content;
+  for (const { begin, end } of LEGACY) c = stripBlock(c, begin, end);
+  return c;
+}
+
+// Upsert the managed block into existing CLAUDE.md content. Removes a legacy
+// codegraph block first, so re-init after the rename leaves exactly one block.
 export function withBlock(content) {
   const b = block();
   if (!content || !content.trim()) return b + '\n';
-  const bi = content.indexOf(BEGIN);
-  const ei = content.indexOf(END);
+  const c = stripLegacy(content);
+  const bi = c.indexOf(BEGIN);
+  const ei = c.indexOf(END);
   if (bi !== -1 && ei !== -1 && ei > bi) {
-    return content.slice(0, bi) + b + content.slice(ei + END.length);
+    return c.slice(0, bi) + b + c.slice(ei + END.length);
   }
   // Append with a blank-line separator.
-  return content.replace(/\n*$/, '') + '\n\n' + b + '\n';
+  return c.replace(/\n*$/, '') + '\n\n' + b + '\n';
 }
 
-// Remove the managed block (and any surrounding blank lines it introduced).
+// Remove the managed block (and any legacy codegraph block) plus the blank lines
+// they introduced.
 export function withoutBlock(content) {
   if (!content) return content;
-  const bi = content.indexOf(BEGIN);
-  const ei = content.indexOf(END);
-  if (bi === -1 || ei === -1 || ei < bi) return content;
-  const before = content.slice(0, bi).replace(/\n+$/, '\n');
-  const after = content.slice(ei + END.length).replace(/^\n+/, '');
-  return (before + after).replace(/\n{3,}/g, '\n\n');
+  return stripLegacy(stripBlock(content, BEGIN, END));
 }
 
 export function present(content) {

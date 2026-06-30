@@ -27,7 +27,7 @@
 
 import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, renameSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { readState, wiregraphDir } from './state.mjs';
+import { readState, wiregraphDir, findIndexedRoot } from './state.mjs';
 
 // Approximate chars-per-token for source code. Good for trend/relative tracking,
 // not for billing. Configurable here if we ever calibrate against a tokenizer.
@@ -79,7 +79,7 @@ export function record(project, event) {
 export async function summarize(project, { sessionId = null } = {}) {
   const agg = {
     events: 0,
-    getSourceCalls: 0, savedTokens: 0,
+    getSourceCalls: 0, savedTokens: 0, gsFileTokens: 0, gsReturnedTokens: 0,
     traceCalls: 0, traceNodes: 0, traceReturnedTokens: 0,
     otherUses: 0,
     grepTotal: 0, gapCount: 0, gapTokens: 0,
@@ -96,7 +96,12 @@ export async function summarize(project, { sessionId = null } = {}) {
     if (sessionId && e.sessionId !== sessionId) continue;
     agg.events++;
     if (e.kind === 'use') {
-      if (e.tool === 'get_source') { agg.getSourceCalls++; agg.savedTokens += e.savedTokens || 0; }
+      if (e.tool === 'get_source') {
+        agg.getSourceCalls++;
+        agg.savedTokens += e.savedTokens || 0;
+        agg.gsFileTokens += e.fileTokens || 0;        // what a full Read would have cost
+        agg.gsReturnedTokens += e.returnedTokens || 0; // what get_source actually returned
+      }
       else if (e.tool === 'trace_callers' || e.tool === 'trace_callees') {
         agg.traceCalls++; agg.traceNodes += e.nodes || 0; agg.traceReturnedTokens += e.returnedTokens || 0;
       } else agg.otherUses++;
@@ -163,19 +168,87 @@ export function formatSummary(agg) {
   ].join('\n');
 }
 
+// --- dashboard report (deterministic; the /wiregraph-stats output) ----------
+// A self-contained, usage-page-style rollup. The command that calls this prints
+// it VERBATIM — all the framing/explanation lives here, not in agent prose.
+function fmt(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function bar(v, max, width) {
+  if (!(max > 0)) return '░'.repeat(width);
+  const f = Math.max(0, Math.min(width, Math.round((v / max) * width)));
+  return '█'.repeat(f) + '░'.repeat(width - f);
+}
+
+export function formatReport(agg, project) {
+  const name = project ? (project.split('/').filter(Boolean).pop() || '') : '';
+  const W = 70;
+  const top = '╭' + '─'.repeat(W) + '╮';
+  const bot = '╰' + '─'.repeat(W) + '╯';
+  const titleText = `  wiregraph · measured impact${name ? ' · ' + name : ''}`;
+  const head = '│' + (titleText + ' '.repeat(W)).slice(0, W) + '│';
+
+  if (!agg.events) {
+    return [top, head, bot, '',
+      '   No activity recorded yet — numbers accrue once Claude uses the graph',
+      '   tools (get_source, trace_*) in this project.'].join('\n');
+  }
+
+  const used = agg.getSourceCalls + agg.traceCalls + agg.otherUses;
+  const oldWay = agg.gsFileTokens;        // what full Reads would have cost
+  const newWay = agg.gsReturnedTokens;    // what get_source returned instead
+  const saved = agg.savedTokens;
+  const pct = oldWay > 0 ? Math.round((saved / oldWay) * 100) : 0;
+  const modeled = agg.traceNodes * ASSUMED_PER_NODE_TOKENS;
+  const BW = 24;
+  const row = (label, n, b) => `     ${label.padEnd(31)}  ~${fmt(n).padStart(7)}  ${b}`;
+
+  const L = [top, head, bot, ''];
+  L.push(`   ESTIMATED TOKENS SAVED        ~${fmt(saved)}   (${pct}% less than reading whole files)`);
+  L.push('');
+  L.push('   get_source — read one symbol instead of the whole file');
+  L.push(row('reading whole files would cost', oldWay, bar(oldWay, oldWay, BW)));
+  L.push(row('wiregraph returned', newWay, bar(newWay, oldWay, BW)));
+  L.push('');
+  L.push(`   Graph-tool calls (${used})`);
+  L.push(`     get_source   ${String(agg.getSourceCalls).padStart(4)}    saved ~${fmt(saved)}`);
+  L.push(`     traces       ${String(agg.traceCalls).padStart(4)}    ${agg.traceNodes} node(s) · +~${fmt(modeled)} if walked by hand (modeled)`);
+  L.push(`     other        ${String(agg.otherUses).padStart(4)}    find_symbol / path_between / trace_contract / query_sql`);
+  L.push('');
+  L.push('   Adoption gap');
+  L.push(`     ${agg.gapCount} of ${agg.grepTotal} grep(s) searched for a symbol the graph already had`);
+  if (agg.gapCount) L.push(`     (~${fmt(agg.gapTokens)} tokens of files opened the slow way — get_source would answer)`);
+  L.push('');
+  L.push('   How this is projected');
+  L.push('     • get_source saved = whole-file tokens − returned-symbol tokens —');
+  L.push('       what a full Read would cost, minus what you actually got back.');
+  L.push(`     • traces are MODELED: a tree returned in one query vs. walking it by`);
+  L.push(`       hand at ~${ASSUMED_PER_NODE_TOKENS} tok/node. Shown apart; never in the headline.`);
+  L.push(`     • tokens ≈ chars ÷ ${DIV} (a proxy). Local estimate, not billed tokens.`);
+  L.push('');
+  L.push(`   ${agg.events} events · counterfactual estimate · never leaves your machine`);
+  return L.join('\n');
+}
+
 // --- CLI --------------------------------------------------------------------
+// Resolve the indexed workspace root so the command needs no path argument.
+function resolveProject(arg) {
+  const raw = arg || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  return findIndexedRoot(raw) || (() => { try { return realpathSync(raw); } catch { return raw; } })();
+}
+
 async function main(argv) {
-  const [cmd, projectArg, ...rest] = argv;
-  if (cmd !== 'summary' || !projectArg) {
-    process.stderr.write('usage: metrics.mjs summary <project> [--session <id>]\n');
+  const cmd = argv[0];
+  if (cmd !== 'report' && cmd !== 'summary') {
+    process.stderr.write('usage: metrics.mjs <report|summary> [project] [--session <id>]\n');
     process.exit(2);
   }
-  let project = projectArg;
-  try { project = realpathSync(projectArg); } catch { /* keep as-is */ }
-  const si = rest.indexOf('--session');
-  const sessionId = si !== -1 ? rest[si + 1] : null;
+  let projectArg = null, sessionId = null;
+  for (let i = 1; i < argv.length; i++) {
+    if (argv[i] === '--session') sessionId = argv[++i];
+    else if (!projectArg) projectArg = argv[i];
+  }
+  const project = resolveProject(projectArg);
   const agg = await summarize(project, { sessionId });
-  process.stdout.write(formatSummary(agg) + '\n');
+  process.stdout.write((cmd === 'report' ? formatReport(agg, project) : formatSummary(agg)) + '\n');
 }
 
 const isCli = process.argv[1] && process.argv[1].endsWith('metrics.mjs');

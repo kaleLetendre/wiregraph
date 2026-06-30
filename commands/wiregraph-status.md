@@ -39,19 +39,9 @@ that's off. **Target** = `${CLAUDE_PROJECT_DIR}` or cwd; call it `<TARGET>`.
    exists, show the last few lines so the user can see auto-updates are running.
 
 5. **Measured impact** (optional): if `<TARGET>/.wiregraph/metrics.jsonl` exists,
-   show the rollup:
-
-   ```
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/metrics.mjs summary "<TARGET>"
-   ```
-
-   This reports graph-tool usage, estimated tokens saved by `get_source`, trace
-   coverage, and the **adoption gap** (greps that searched for a symbol the graph
-   already knows). Pass `--session <id>` to scope it to one session. Make clear to
-   the user these are **local estimates under a counterfactual** (chars-per-token
-   proxy), not billed tokens — useful for trend and for spotting where wiregraph
-   is being bypassed, not for exact accounting. No file yet just means no graph
-   tools have run since this was added.
+   point the user to **`/wiregraph-stats`** — the dedicated, deterministic
+   dashboard of graph-tool usage, estimated tokens saved, and the adoption gap
+   (it explains how the numbers are projected). Don't recompute it here.
 
 6. **Contract coverage** (multi-repo only): from `graph_stats`, note the Contracts
    count. If the graph spans **2+ repos but has 0 contracts**, cross-repo wire seams
