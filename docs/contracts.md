@@ -1,5 +1,7 @@
 # Contracts: connecting two compartments
 
+*See also: [Architecture](architecture.md) for how detection + matching work internally · [docs home](index.md).*
+
 A **contract** is simply **the defined communication between two compartments**. A
 "compartment" is any bounded unit of a system, and the contract is the agreed shape
 of whatever crosses the boundary between them. That's the whole idea — it is **not**

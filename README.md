@@ -9,6 +9,8 @@ half as much** (≈40–60% fewer tokens in internal A/B testing), which also me
 **faster, cheaper** turns. Everything stays local — the graph is just a file in your
 workspace, nothing is uploaded. **Set it up once and forget it.**
 
+📖 **Docs:** <https://kaleletendre.github.io/wiregraph/> — [contracts (the concept)](docs/contracts.md) · [architecture](docs/architecture.md)
+
 ```mermaid
 flowchart LR
   Q(["🛠️ a code task<br/>feature · fix · refactor"]):::q --> a1
