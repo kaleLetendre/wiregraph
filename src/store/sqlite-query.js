@@ -57,7 +57,7 @@ export function graphStats(db, project) {
   const nodes = { Repo: c('repos'), File: c('files'), Symbol: c('symbols'), Contract: c('contracts') };
   const edges = db.prepare('SELECT type, count(*) n FROM edges WHERE project=? GROUP BY type ORDER BY n DESC').all(project);
   const repos = db.prepare("SELECT repo, count(*) n FROM symbols WHERE project=? AND kind<>'module' GROUP BY repo ORDER BY n DESC").all(project);
-  if (!nodes.Symbol) return `No codegraph for this project (${project}).`;
+  if (!nodes.Symbol) return `No wiregraph for this project (${project}).`;
   return [
     `Project: ${project}`,
     'Nodes: ' + Object.entries(nodes).filter(([, n]) => n).map(([k, n]) => `${k}=${n}`).join(', '),
@@ -97,7 +97,7 @@ export function getSource(db, project, name, repo, file, context = 0) {
 
 // Shared CALLS adjacency + symbol metadata for a project.
 // NOTE (deferred perf): this rebuilds the full CALLS adjacency on every trace_*
-// call (O(edges) — a few ms at a few-thousand-node scale). Negligible here; if codegraph ever
+// call (O(edges) — a few ms at a few-thousand-node scale). Negligible here; if wiregraph ever
 // targets much larger graphs, memoize this per (db, project) for the process.
 function callGraph(db, project) {
   const meta = new Map();

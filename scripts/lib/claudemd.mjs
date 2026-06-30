@@ -1,8 +1,8 @@
 // Managed CLAUDE.md directive block.
 //
-// The token win codegraph delivers is gated on a behavioral directive that tells
+// The token win wiregraph delivers is gated on a behavioral directive that tells
 // Claude to reach for the graph first and use it economically. A plugin cannot
-// ship an always-on CLAUDE.md, so /codegraph-init writes this block into the
+// ship an always-on CLAUDE.md, so /wiregraph-init writes this block into the
 // project's CLAUDE.md (consent-gated, idempotent: replace between the sentinels
 // if present, else append). Teardown removes it. The prose below is the proven
 // "economical" directive (validated across Experiments 5–10), adapted to call the
@@ -17,17 +17,17 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const BEGIN = '<!-- BEGIN codegraph (managed) -->';
-export const END = '<!-- END codegraph -->';
+export const BEGIN = '<!-- BEGIN wiregraph (managed) -->';
+export const END = '<!-- END wiregraph -->';
 
 // The directive body (between the sentinels).
-const DIRECTIVE = `## Code navigation — use codegraph first, economically
+const DIRECTIVE = `## Code navigation — use wiregraph first, economically
 
-When locating or reading code in this project, prefer the **codegraph** call-graph — its registered MCP tools — over grep/Read. It indexes every symbol and CALLS/REFERENCES edge across the project's repos. Call the MCP tools directly: \`find_symbol\` (locate a symbol); \`get_source\` (read one function's body — use instead of opening the whole file); \`trace_callers\`/\`trace_callees\`/\`path_between\` (call structure — these return the *whole* chain in one call, so don't walk it hop-by-hop); \`trace_contract\` (cross-repo wire seams); \`graph_stats\`/\`graph_status\` (size + freshness). Reach for the graph on any "where is X / what calls Y / how do these connect" question and before opening any file larger than ~200 lines.
+When locating or reading code in this project, prefer the **wiregraph** call-graph — its registered MCP tools — over grep/Read. It indexes every symbol and CALLS/REFERENCES edge across the project's repos. Call the MCP tools directly: \`find_symbol\` (locate a symbol); \`get_source\` (read one function's body — use instead of opening the whole file); \`trace_callers\`/\`trace_callees\`/\`path_between\` (call structure — these return the *whole* chain in one call, so don't walk it hop-by-hop); \`trace_contract\` (cross-repo wire seams); \`graph_stats\`/\`graph_status\` (size + freshness). Reach for the graph on any "where is X / what calls Y / how do these connect" question and before opening any file larger than ~200 lines. In a multi-repo workspace, cross-repo links flow through **contracts**: use \`trace_contract\`/\`path_between\`, and if a cross-repo wire question comes up with no contracts defined yet, tell the user to run \`/wiregraph-contracts\` to infer them from the code.
 
 **Be economical:** plan a minimal set of queries, trust the result, and don't re-grep what the graph already showed — query count is the dominant token cost, not file reads. The static graph is **blind to (a) function-pointer/callback edges, (b) string literals** (JSON field names, route paths), and **(c) the C preprocessor** — it counts call sites inside \`#if 0\` / disabled \`#ifdef\` blocks, so a C refactor caller-list is an *upper bound*; verify compilation guards before trusting it. Reason about indirect call paths yourself (a callback adapter is its own distinct path), and for wire questions confirm the exact field/endpoint the server actually *reads* with a single targeted grep/get_source. Fall back to grep/Read only for those cases and non-code files.
 
-These are the **registered codegraph MCP tools**, not a CLI. **The graph self-heals on read:** every query re-indexes any file that changed on disk (yours or the user's, committed or not) before answering, so traces reflect the latest code — **do not fall back to grep on the assumption the graph is out of date.** Reach for \`update_graph full:true\` only after a large cross-file rename/refactor (the correctness backstop); \`graph_status\` reports freshness if you want to confirm. If the tools report the project isn't indexed, run \`/codegraph-init\`.`;
+These are the **registered wiregraph MCP tools**, not a CLI. **The graph self-heals on read:** every query re-indexes any file that changed on disk (yours or the user's, committed or not) before answering, so traces reflect the latest code — **do not fall back to grep on the assumption the graph is out of date.** Reach for \`update_graph full:true\` only after a large cross-file rename/refactor (the correctness backstop); \`graph_status\` reports freshness if you want to confirm. If the tools report the project isn't indexed, run \`/wiregraph-init\`.`;
 
 export function block() {
   return `${BEGIN}\n${DIRECTIVE}\n${END}`;
@@ -83,20 +83,20 @@ function main(argv) {
 
   if (cmd === 'diff') {
     const next = withBlock(cur);
-    if (next === cur) { process.stdout.write(`No change: ${path} already has the current codegraph block.\n`); return; }
-    process.stdout.write(`Would ${present(cur) ? 'update' : 'add'} the codegraph block in ${path}:\n\n${block()}\n`);
+    if (next === cur) { process.stdout.write(`No change: ${path} already has the current wiregraph block.\n`); return; }
+    process.stdout.write(`Would ${present(cur) ? 'update' : 'add'} the wiregraph block in ${path}:\n\n${block()}\n`);
     return;
   }
   if (cmd === 'apply') {
     const next = withBlock(cur);
     writeFileSync(path, next);
-    process.stdout.write(`${present(cur) ? 'Updated' : 'Wrote'} codegraph block in ${path}.\n`);
+    process.stdout.write(`${present(cur) ? 'Updated' : 'Wrote'} wiregraph block in ${path}.\n`);
     return;
   }
   if (cmd === 'remove') {
-    if (!present(cur)) { process.stdout.write(`No codegraph block in ${path}.\n`); return; }
+    if (!present(cur)) { process.stdout.write(`No wiregraph block in ${path}.\n`); return; }
     writeFileSync(path, withoutBlock(cur));
-    process.stdout.write(`Removed codegraph block from ${path}.\n`);
+    process.stdout.write(`Removed wiregraph block from ${path}.\n`);
     return;
   }
   process.stderr.write(`unknown command: ${cmd}\n`);

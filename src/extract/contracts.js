@@ -235,17 +235,17 @@ export function matchContracts(graph, rootDir, contracts, log = () => {}, fileFi
 // touches yields no edge — that asymmetry is the gap, made visible by absence.
 // WIRE edges encode a producer->consumer direction, which needs to know which
 // repo is the "server" side. That's project-specific, so it's configured via env
-// (CODEGRAPH_SERVER_REPO, and optionally CODEGRAPH_SELF_REPO to exclude a
+// (WIREGRAPH_SERVER_REPO, and optionally WIREGRAPH_SELF_REPO to exclude a
 // root/aggregate repo). With no server repo set, directional WIRE derivation is
 // skipped — the REFERENCES edges and Contract nodes (which trace_contract and
 // path_between use) are unaffected; only the export visualizations use WIRE.
-const SERVER_REPO = process.env.CODEGRAPH_SERVER_REPO || null;
-const SELF_REPO = process.env.CODEGRAPH_SELF_REPO || null;
+const SERVER_REPO = process.env.WIREGRAPH_SERVER_REPO || null;
+const SELF_REPO = process.env.WIREGRAPH_SELF_REPO || null;
 const MAX_PAIRS_PER_TOKEN = 25;
 
 export function buildWireEdges(graph, contracts, log = () => {}) {
   if (!SERVER_REPO) {
-    log('  WIRE edges skipped (set CODEGRAPH_SERVER_REPO to derive directional wire edges)');
+    log('  WIRE edges skipped (set WIREGRAPH_SERVER_REPO to derive directional wire edges)');
     return { wire: 0, gaps: 0 };
   }
   const cById = new Map(contracts.map((c) => [c.id, c]));

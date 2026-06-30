@@ -8,9 +8,9 @@
 //   node refresh.mjs --full          # full project-scoped rebuild
 //
 // PROJECT comes from CLAUDE_PROJECT_DIR (set for hooks) or cwd. Failures are
-// non-fatal and logged to <project>/.codegraph/refresh.log — a missed
+// non-fatal and logged to <project>/.wiregraph/refresh.log — a missed
 // background refresh is recovered by the next SessionStart catch-up or a manual
-// /codegraph-update / /codegraph-rebuild.
+// /wiregraph-update / /wiregraph-rebuild.
 
 import { realpathSync, appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';

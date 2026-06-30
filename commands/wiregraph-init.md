@@ -1,10 +1,10 @@
 ---
-description: Initialize codegraph for a project — build the graph, install the directive + auto-update, and start using Claude at ~50% fewer tokens
+description: Initialize wiregraph for a project — build the graph, install the directive + auto-update, and start using Claude at ~50% fewer tokens
 argument-hint: "[target-dir] (defaults to the current project root)"
 allowed-tools: Bash, Read, Edit, AskUserQuestion
 ---
 
-Set up codegraph for a project end to end: install dependencies, build the
+Set up wiregraph for a project end to end: install dependencies, build the
 cross-repo call graph into an embedded SQLite file, install the proven navigation
 directive into the project's CLAUDE.md, and turn on balanced auto-update. After
 this, just use Claude normally — code navigation/audit/refactor questions cost
@@ -26,23 +26,41 @@ Do the steps in order; stop and report if a step fails.
    ```
 
    If this is the FIRST run right after installing the plugin from a marketplace,
-   the codegraph MCP server started before these deps existed, so its tools aren't
+   the wiregraph MCP server started before these deps existed, so its tools aren't
    available yet. After this install completes, tell the user to run
    `/reload-plugins` (once) so the MCP server restarts with the deps present — then
    the `find_symbol`/`trace_*`/etc. tools come online for the rest of the steps.
 
-2. **Build the graph** (full, project-scoped) into `<TARGET>/.codegraph/graph.db`.
-   Report the printed stats (repos, files, symbols, contracts, edge counts) back
-   to the user:
+2. **Confirm scope, then build the graph.** wiregraph indexes EVERY git repo under
+   `<TARGET>`, so first list what it would cover and confirm the scope is what the
+   user meant (this prevents the two footguns: indexing one repo when they meant the
+   workspace, or pointing at a huge tree like `$HOME`):
+
+   ```
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/workspace.mjs repos "<TARGET>"
+   ```
+
+   Read the `scope:` line and act before building:
+   - **SINGLE-REPO** — only that one repo is indexed, so cross-repo contracts won't
+     be possible. Ask the user (AskUserQuestion) whether they meant the **parent**
+     folder. wiregraph works best as a *workspace*: all related repos cloned
+     side-by-side under one parent folder, with `/wiregraph-init` run there. Proceed
+     with the single repo only if they confirm.
+   - **WORKSPACE** — show the repo list and confirm it's the intended set.
+   - **NO-GIT** — the whole folder is indexed as one unit (fine for a lone non-git
+     project; note cross-repo contracts need separate git repos).
+
+   Then build (full, project-scoped) into `<TARGET>/.wiregraph/graph.db` and report
+   the printed stats (repos, files, symbols, contracts, edge counts):
 
    ```
    node ${CLAUDE_PLUGIN_ROOT}/src/build.js "<TARGET>" --reset
    ```
 
-3. **Seed state + gitignore the footprint.** Everything codegraph writes per
-   project lives in one hidden folder `<TARGET>/.codegraph/` (`graph.db`,
+3. **Seed state + gitignore the footprint.** Everything wiregraph writes per
+   project lives in one hidden folder `<TARGET>/.wiregraph/` (`graph.db`,
    `state.json`, `refresh.log`). This step seeds the state (build time, per-repo
-   git shas for incremental catch-up, posture → `balanced`) AND adds `.codegraph/`
+   git shas for incremental catch-up, posture → `balanced`) AND adds `.wiregraph/`
    to `<TARGET>/.gitignore` so the indexed graph + machine-local state are never
    committed:
 
@@ -50,7 +68,7 @@ Do the steps in order; stop and report if a step fails.
    node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs seed "<TARGET>"
    ```
 
-   Confirm to the user that `.codegraph/` was added to `.gitignore` (the command
+   Confirm to the user that `.wiregraph/` was added to `.gitignore` (the command
    prints whether it added it, it was already present, or there's no `.git` here).
 
 4. **Install the navigation directive** into `<TARGET>/CLAUDE.md`. First show the
@@ -72,7 +90,7 @@ Do the steps in order; stop and report if a step fails.
    guidance, but note the win is strongest with the directive installed.
 
 5. **Auto-update / hooks.** The plugin ships `SessionStart`, `PreToolUse`, and
-   `PostToolUse` hooks; they fire automatically whenever the codegraph plugin is
+   `PostToolUse` hooks; they fire automatically whenever the wiregraph plugin is
    enabled. `SessionStart` catches up on out-of-session changes (and re-asserts
    the directive), `PreToolUse` on `Grep`/`Glob`/`Read` reminds Claude to prefer
    the graph (rate-limited per session so it stays cheap; the `Read` nudge only
@@ -90,10 +108,12 @@ Do the steps in order; stop and report if a step fails.
 
 6. **Confirm** by calling the `graph_status` MCP tool. Then summarize: graph
    built (counts), directive installed (or declined), posture, and that the
-   codegraph MCP tools (`find_symbol`, `get_source`, `trace_callers`,
+   wiregraph MCP tools (`find_symbol`, `get_source`, `trace_callers`,
    `trace_callees`, `trace_contract`, `path_between`, `graph_status`,
    `update_graph`, `query_sql`) are now queryable for this project.
 
-Note: a project may contain several git repos (codegraph indexes them all under
+Note: a project may contain several git repos (wiregraph indexes them all under
 this one project); cross-repo links flow through Contract nodes — see
-`trace_contract` / `path_between`.
+`trace_contract` / `path_between`. **If you indexed more than one repo, suggest
+running `/wiregraph-contracts`** — it infers the wire contracts between them from
+the code so those cross-repo seams light up without hand-written specs.

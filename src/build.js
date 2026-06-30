@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// codegraph build — walk a folder, extract the call/association graph, load it
+// wiregraph build — walk a folder, extract the call/association graph, load it
 // into an embedded SQLite file (no daemon, no JVM).
 //
 // Usage:
@@ -12,8 +12,8 @@
 //   --contracts <dir>   AsyncAPI contracts dir (default: auto-detect a `contracts`,
 //                       `asyncapi`, or `*-contracts` dir under the target)
 //   --reset             project-scoped wipe before loading (full build only)
-//   --db <path>         SQLite file to write (default: <project>/.codegraph/graph.db,
-//                       or $CODEGRAPH_DB)
+//   --db <path>         SQLite file to write (default: <project>/.wiregraph/graph.db,
+//                       or $WIREGRAPH_DB)
 //   --dump <file>       also write the raw graph as JSON (for inspection)
 //   --no-load           skip the SQLite load, just extract (+ optional --dump)
 
@@ -26,6 +26,7 @@ import { resolveCalls } from './extract/resolve.js';
 import { loadContracts, matchContracts, buildWireEdges } from './extract/contracts.js';
 import { findRepoRoots, repoNameFor } from './extract/walk.js';
 import { connect, loadGraph, loadProjectSymbols, pruneFile } from './store/sqlite.js';
+import { wiregraphDir } from '../scripts/lib/state.mjs';
 
 function parseArgs(argv) {
   const opts = { target: process.cwd(), reset: false, load: true, dump: null, contracts: null, project: null, files: null, db: null };
@@ -62,15 +63,15 @@ function resolveContractsDir(opts, root) {
   return null;
 }
 
-// One db per project, alongside the project's .codegraph/ state. The MCP server
+// One db per project, alongside the project's .wiregraph/ state. The MCP server
 // resolves the same path, so a build here is immediately queryable there.
 export function resolveDbPath(opts, project) {
-  return opts.db || process.env.CODEGRAPH_DB || join(project, '.codegraph', 'graph.db');
+  return opts.db || process.env.WIREGRAPH_DB || join(wiregraphDir(project), 'graph.db');
 }
 
 // --- full build -------------------------------------------------------------
 function fullBuild(opts, root, project) {
-  log(`codegraph: scanning ${root} (project ${project})`);
+  log(`wiregraph: scanning ${root} (project ${project})`);
   const graph = new Graph(project);
 
   log('1/4 extracting code symbols + calls...');
@@ -135,7 +136,7 @@ function incrementalBuild(opts, root, project) {
     const { name: repo, root: repoRoot } = repoNameFor(abs, repoRoots, rootName, root);
     return { abs, repo, relPath: relative(repoRoot, abs), exists: existsSync(abs) };
   });
-  log(`codegraph incremental: ${changed.length} file(s) in project ${project}`);
+  log(`wiregraph incremental: ${changed.length} file(s) in project ${project}`);
 
   const dbPath = resolveDbPath(opts, project);
   const db = connect(dbPath);

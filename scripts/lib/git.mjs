@@ -70,7 +70,7 @@ export function changedSince(project, reposLastSha = {}) {
     }
 
     for (const rel of rels) {
-      if (!langForFile(rel)) continue; // only source files codegraph indexes
+      if (!langForFile(rel)) continue; // only source files wiregraph indexes
       files.add(join(repo.root, rel));
     }
   }
@@ -80,7 +80,7 @@ export function changedSince(project, reposLastSha = {}) {
 
 // Per-repo divergence from the configured upstream tracking branch.
 //
-// codegraph indexes the WORKING TREE, so "fresh" only ever means "the index
+// wiregraph indexes the WORKING TREE, so "fresh" only ever means "the index
 // matches your checkout" — it has no view of the remote. A checkout parked on a
 // branch far behind its upstream therefore looks perfectly fresh while serving
 // stale code (the failure that burned a session reasoning over a branch 38

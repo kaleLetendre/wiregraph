@@ -20,7 +20,7 @@ node_modules/.bin/npm-check-updates
 /*.db-wal
 /*.db-shm
 /*.db.lock
-/codegraph-*.html
-/codegraph*.gexf
+/wiregraph-*.html
+/wiregraph*.gexf
 /npm-debug.log*
-.codegraph/
+.wiregraph/

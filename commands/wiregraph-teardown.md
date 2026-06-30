@@ -1,14 +1,14 @@
 ---
-description: Soft-remove codegraph's footprint from a project (directive block, hook enablement). Leaves the graph db for instant re-init.
+description: Soft-remove wiregraph's footprint from a project (directive block, hook enablement). Leaves the graph db for instant re-init.
 argument-hint: "[target-dir] (defaults to the active project)"
 allowed-tools: Bash, Read, AskUserQuestion
 ---
 
-Cleanly back codegraph out of a project. **Target** = `$1` or the active project
+Cleanly back wiregraph out of a project. **Target** = `$1` or the active project
 (`${CLAUDE_PROJECT_DIR}` or cwd); call it `<TARGET>`.
 
 1. **Remove the managed CLAUDE.md block.** This only strips the text between the
-   `BEGIN codegraph (managed)` / `END codegraph` sentinels; the rest of the file
+   `BEGIN wiregraph (managed)` / `END wiregraph` sentinels; the rest of the file
    is untouched:
 
    ```
@@ -26,10 +26,10 @@ Cleanly back codegraph out of a project. **Target** = `$1` or the active project
    tell them to remove those entries too (show the file; don't edit without
    consent).
 
-3. **Leave in place:** this project's graph data lives in `<TARGET>/.codegraph/`
+3. **Leave in place:** this project's graph data lives in `<TARGET>/.wiregraph/`
    (`graph.db` + `state.json`) — left intact so re-init is instant. There is no
-   daemon to stop. To fully remove codegraph from the project, use
-   `/codegraph-remove` (it deletes that folder, the directive block, and the
-   `.gitignore` entry), or just `rm -rf "<TARGET>/.codegraph"`.
+   daemon to stop. To fully remove wiregraph from the project, use
+   `/wiregraph-remove` (it deletes that folder, the directive block, and the
+   `.gitignore` entry), or just `rm -rf "<TARGET>/.wiregraph"`.
 
 Confirm what was removed and what was intentionally left.

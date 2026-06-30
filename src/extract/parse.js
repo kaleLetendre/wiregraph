@@ -246,30 +246,128 @@ function ktCall(node) {
   return null;
 }
 
+// --- HTTP route detection (for contract inference) --------------------------
+// Recognizes server route DEFINITIONS and client route CALLS so wiregraph can
+// infer cross-service wire contracts from code. Returns { method, path, side }
+// where side is 'server' | 'client' | 'unknown'. Requiring a leading-'/' path
+// (after stripping scheme+host from a full URL) filters out the bulk of non-route
+// .get()/.post() calls (e.g. map.get('x')). Direction (side) is a best-effort
+// guess from the receiver name; the shared PATH is the real cross-repo seam, so
+// an 'unknown' side is still recorded and the inference step resolves direction.
+
+const HTTP_VERBS = new Set(['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'all']);
+const NEST_VERBS = new Set(['Get', 'Post', 'Put', 'Patch', 'Delete', 'Options', 'Head', 'All']);
+const PY_SERVER_VERBS = new Set(['get', 'post', 'put', 'patch', 'delete', 'route']);
+const SERVER_OBJECTS = new Set(['app', 'router', 'server', 'route', 'routes', 'fastify', 'express', 'bp', 'blueprint', 'api', 'ns']);
+const CLIENT_OBJECTS = new Set(['axios', 'http', 'https', 'client', 'request', 'requests', 'httpx', 'session', 'got', 'ky', 'superagent']);
+
+// Inner value of a plain string / template literal (one layer of quotes stripped);
+// null if the node isn't a simple string literal.
+function strLiteral(node) {
+  if (!node) return null;
+  const t = node.type;
+  if (t === 'string' || t === 'template_string' || t === 'string_literal') {
+    let s = node.text;
+    if (s.length >= 2 && /^[`'"]/.test(s)) s = s.slice(1, -1);
+    return s;
+  }
+  return null;
+}
+
+// Normalize a candidate to a route path: strip scheme+host from a full URL, drop
+// query/hash, require a leading '/'. Returns null if it isn't path-shaped.
+function routePath(s) {
+  if (!s) return null;
+  const url = /^https?:\/\/[^/]+(\/[^\s?#]*)/.exec(s);
+  if (url) return url[1];
+  if (s.startsWith('/')) return s.split(/[?#]/)[0];
+  return null;
+}
+
+// First positional argument node of a call (TS 'arguments' / Py 'argument_list').
+function firstArg(node) {
+  const args = field(node, 'arguments');
+  return args ? args.namedChild(0) : null;
+}
+
+// Receiver identifier of a member/attribute access (last segment), else null.
+function receiverName(objNode) {
+  if (!objNode) return null;
+  if (objNode.type === 'identifier') return objNode.text;
+  if (objNode.type === 'member_expression') return field(objNode, 'property')?.text || null;
+  if (objNode.type === 'attribute') return field(objNode, 'attribute')?.text || null;
+  return null;
+}
+
+function sideFor(obj) {
+  if (SERVER_OBJECTS.has(obj)) return 'server';
+  if (CLIENT_OBJECTS.has(obj)) return 'client';
+  return 'unknown';
+}
+
+function tsRoute(node) {
+  if (node.type !== 'call_expression') return null;
+  const fn = field(node, 'function');
+  if (!fn) return null;
+  const path = routePath(strLiteral(firstArg(node)));
+  if (!path) return null;
+  if (fn.type === 'identifier') {
+    if (fn.text === 'fetch') return { method: 'get', path, side: 'client' };       // fetch('/x')
+    if (NEST_VERBS.has(fn.text) && node.parent && node.parent.type === 'decorator') // @Get('/x')
+      return { method: fn.text.toLowerCase(), path, side: 'server' };
+    return null;
+  }
+  if (fn.type === 'member_expression') {                                            // app.get / axios.get
+    const verb = (field(fn, 'property')?.text || '').toLowerCase();
+    if (!HTTP_VERBS.has(verb)) return null;
+    return { method: verb, path, side: sideFor(receiverName(field(fn, 'object'))) };
+  }
+  return null;
+}
+
+function pyRoute(node) {
+  if (node.type !== 'call') return null;
+  const fn = field(node, 'function');
+  if (!fn || fn.type !== 'attribute') return null;                                  // @app.get / requests.get
+  const path = routePath(strLiteral(firstArg(node)));
+  if (!path) return null;
+  const verb = (field(fn, 'attribute')?.text || '').toLowerCase();
+  const obj = receiverName(field(fn, 'object'));
+  const method = verb === 'route' ? 'get' : verb;                                   // Flask @app.route default
+  if (PY_SERVER_VERBS.has(verb)) {
+    return { method, path, side: CLIENT_OBJECTS.has(obj) ? 'client' : SERVER_OBJECTS.has(obj) ? 'server' : 'unknown' };
+  }
+  if (HTTP_VERBS.has(verb)) return { method, path, side: sideFor(obj) };
+  return null;
+}
+
 const RULES = {
-  typescript: { def: tsDef, call: tsCall },
+  typescript: { def: tsDef, call: tsCall, route: tsRoute },
   c: { def: cDef, call: cCall },
-  python: { def: pyDef, call: pyCall },
+  python: { def: pyDef, call: pyCall, route: pyRoute },
   java: { def: javaDef, call: javaCall },
   kotlin: { def: ktDef, call: ktCall },
 };
 
-// Parse one file's source. Returns { symbols, calls } where:
+// Parse one file's source. Returns { symbols, calls, routes } where:
 //   symbols: [{ name, kind, startLine, endLine }]
 //   calls:   [{ enclosing, name, line }]  enclosing is the def name path's last
 //            symbol's local index, or null for module-level.
+//   routes:  [{ method, path, side, enclosing, line }]  HTTP routes for contract
+//            inference; empty for languages without a route rule.
 //
 // We return raw symbol descriptors plus calls keyed by a local symbol index so
 // the caller can mint global ids without this module knowing about repos.
 export function parseSource(source, lang, variant) {
   const rules = RULES[lang];
-  if (!rules) return { symbols: [], calls: [] };
+  if (!rules) return { symbols: [], calls: [], routes: [] };
 
   const parser = parserFor(variant);
   const tree = parser.parse(source);
 
   const symbols = [];
   const calls = [];
+  const routes = [];
 
   function walk(node, enclosingIdx) {
     let currentIdx = enclosingIdx;
@@ -291,11 +389,18 @@ export function parseSource(source, lang, variant) {
       calls.push({ enclosing: currentIdx, name: callName, line: node.startPosition.row + 1 });
     }
 
+    if (rules.route) {
+      const r = rules.route(node);
+      if (r && r.path) {
+        routes.push({ method: r.method, path: r.path, side: r.side, enclosing: currentIdx, line: node.startPosition.row + 1 });
+      }
+    }
+
     for (let i = 0; i < node.namedChildCount; i++) {
       walk(node.namedChild(i), currentIdx);
     }
   }
 
   walk(tree.rootNode, null);
-  return { symbols, calls };
+  return { symbols, calls, routes };
 }

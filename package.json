@@ -1,11 +1,11 @@
 {
-  "name": "codegraph",
+  "name": "wiregraph",
   "version": "0.4.2",
   "description": "Cross-repo call/association graph builder + MCP query server, backed by an embedded WASM SQLite file (no daemon, no JVM, no native build)",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "bin": {
-    "codegraph": "./src/build.js"
+    "wiregraph": "./src/build.js"
   },
   "scripts": {
     "build": "node src/build.js",

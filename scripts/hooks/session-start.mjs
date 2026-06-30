@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // SessionStart hook. Two jobs, both cheap and non-blocking:
-//   1. If the project isn't indexed yet, nudge the user to run /codegraph-init
+//   1. If the project isn't indexed yet, nudge the user to run /wiregraph-init
 //      (injected as additionalContext so Claude sees it too).
 //   2. If it is indexed, catch up on any out-of-session changes — files changed
 //      since the last index (git diff + uncommitted) — by spawning the detached
@@ -13,7 +13,7 @@ import { realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readState } from '../lib/state.mjs';
+import { readState, findIndexedRoot } from '../lib/state.mjs';
 import { changedSince } from '../lib/git.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -38,7 +38,9 @@ function emit(ctx) {
 
 function project(payload) {
   const raw = process.env.CLAUDE_PROJECT_DIR || payload?.cwd || process.cwd();
-  try { return realpathSync(raw); } catch { return raw; }
+  // Resolve the indexed workspace root so a session started in a sub-repo still
+  // sees the workspace graph; fall back to the raw dir (→ not-indexed nudge).
+  return findIndexedRoot(raw) || (() => { try { return realpathSync(raw); } catch { return raw; } })();
 }
 
 async function main() {
@@ -52,7 +54,7 @@ async function main() {
   if (!state) {
     // Not initialized. Only nudge if a CLAUDE.md directive isn't already pointing
     // here; keep it to a single short line.
-    emit(`codegraph: this project is not indexed. Run /codegraph-init to build the call graph and navigate code at ~50% fewer tokens.`);
+    emit(`wiregraph: this project is not indexed. Run /wiregraph-init to build the call graph and navigate code at ~50% fewer tokens.`);
   }
 
   // Indexed: spawn the detached catch-up worker.
@@ -63,16 +65,25 @@ async function main() {
   });
   child.unref();
 
+  // A multi-repo workspace with no contracts yet can't trace cross-repo wire
+  // seams — nudge toward inferring them. Cheap: just repo count + the contractsDir
+  // flag from state (no scan here). Appended to whichever note fires below, since
+  // emit() exits.
+  const repoCount = Object.keys(state.reposLastSha || {}).length;
+  const contractsHint = (repoCount > 1 && !state.contractsDir)
+    ? ' Multi-repo workspace with no contracts — run /wiregraph-contracts to infer cross-repo wire links from the code.'
+    : '';
+
   // Tailor a short note from a quick git check (don't block on the refresh).
   let changedCount = 0;
   try { changedCount = changedSince(PROJECT, state.reposLastSha || {}).files.length; } catch { /* ignore */ }
   if (changedCount > 0) {
-    emit(`codegraph: ${changedCount} source file(s) changed since last index — refreshing the graph in the background. Prefer the codegraph MCP tools for code navigation.`);
+    emit(`wiregraph: ${changedCount} source file(s) changed since last index — refreshing the graph in the background. Prefer the wiregraph MCP tools for code navigation.${contractsHint}`);
   }
   // Fresh: re-assert the directive cheaply. The CLAUDE.md block is loaded once
   // and decays as context grows, so a one-line reminder each session keeps the
   // graph top-of-mind without re-stating the whole directive.
-  emit('codegraph: graph is indexed and fresh — prefer its MCP tools (find_symbol, get_source, trace_callers/trace_callees, path_between) over grep/Read for code navigation, at ~50% fewer tokens.');
+  emit('wiregraph: graph is indexed and fresh — prefer its MCP tools (find_symbol, get_source, trace_callers/trace_callees, path_between) over grep/Read for code navigation, at ~50% fewer tokens.' + contractsHint);
 }
 
 main().catch(() => process.exit(0));

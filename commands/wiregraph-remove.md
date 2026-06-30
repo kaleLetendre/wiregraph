@@ -1,23 +1,23 @@
 ---
-description: Hard-uninstall codegraph from a project — delete the graph db, the .codegraph/ folder, the CLAUDE.md directive, and the .gitignore entry; leave everything else untouched
+description: Hard-uninstall wiregraph from a project — delete the graph db, the .wiregraph/ folder, the CLAUDE.md directive, and the .gitignore entry; leave everything else untouched
 argument-hint: "[target-dir] (defaults to the active project)"
 allowed-tools: Bash, Read, AskUserQuestion
 ---
 
-Completely remove codegraph's footprint from a project. Unlike `/codegraph-teardown`
+Completely remove wiregraph's footprint from a project. Unlike `/wiregraph-teardown`
 (which just disables auto-update and keeps the data for a quick re-init), this
-**deletes** everything codegraph created and nothing else.
+**deletes** everything wiregraph created and nothing else.
 
 **Target:** `$1` if provided, else the active project (`${CLAUDE_PROJECT_DIR}` or
 cwd). Call it `<TARGET>`.
 
 What gets removed:
 - the managed directive block in `<TARGET>/CLAUDE.md` (only between the sentinels);
-- the `.codegraph/` entry in `<TARGET>/.gitignore` (only that line + its comment);
-- the `<TARGET>/.codegraph/` folder (the `graph.db` itself, `state.json`, log);
-- a dangling `~/.codegraph` symlink if it pointed at the deleted folder.
+- the `.wiregraph/` entry in `<TARGET>/.gitignore` (only that line + its comment);
+- the `<TARGET>/.wiregraph/` folder (the `graph.db` itself, `state.json`, log);
+- a dangling `~/.wiregraph` symlink if it pointed at the deleted folder.
 
-The whole graph is the one SQLite file inside `.codegraph/`, so there is no daemon
+The whole graph is the one SQLite file inside `.wiregraph/`, so there is no daemon
 to stop and no shared DB to scrub — deleting the folder removes this project's
 graph entirely. Everything else — your source, the rest of `CLAUDE.md`, the rest
 of `.gitignore` — is left untouched.

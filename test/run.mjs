@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// codegraph regression test — locks the SQLite query layer's behavior so a future
+// wiregraph regression test — locks the SQLite query layer's behavior so a future
 // change can't silently diverge (there is no Neo4j to diff against anymore).
 // Runs a committed synthetic fixture through build + every tool, then asserts
 // golden results: symbol resolution, intra/cross-file traces, get_source, an
 // in-repo path_between, query_sql guards, schema versioning + migration, and
 // incremental idempotency. Self-contained — no external workspace needed.
 
-import { mkdtempSync, cpSync, appendFileSync, rmSync, realpathSync, existsSync, writeFileSync, utimesSync, readFileSync } from 'node:fs';
+import { mkdtempSync, cpSync, appendFileSync, rmSync, realpathSync, existsSync, writeFileSync, utimesSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,7 @@ const FIXTURE = join(HERE, 'fixture');
 const FIXTURE_PY = join(HERE, 'fixture-py');
 const FIXTURE_JAVA = join(HERE, 'fixture-java');
 const FIXTURE_KOTLIN = join(HERE, 'fixture-kotlin');
+const FIXTURE_CONTRACTS = join(HERE, 'fixture-contracts');
 const BUILD = join(HERE, '..', 'src', 'build.js');
 
 let pass = 0, fail = 0;
@@ -207,7 +208,7 @@ async function concurrencyTest() {
 
 // A --reset rebuild wipes the project's rows before reloading. If the reload
 // throws, that wipe must roll back — otherwise close() persists the emptied db
-// and a transient failure during /codegraph-rebuild destroys the existing graph.
+// and a transient failure during /wiregraph-rebuild destroys the existing graph.
 // Inject a symbol with an unbindable value to force the insert phase to throw,
 // then assert the prior graph survived (mimicking build.js's connect/try/finally).
 async function rebuildDurabilityTest() {
@@ -320,7 +321,7 @@ async function metricsTests() {
   const src = join(work, 'src');
   cpSync(FIXTURE, src, { recursive: true });
   const project = realpathSync(src);
-  const db = join(project, '.codegraph', 'graph.db');           // where summarize() looks
+  const db = join(project, '.wiregraph', 'graph.db');           // where summarize() looks
   await runBuild({ target: src, project, db, reset: true });
   S.writeState(project, S.defaultState(project));                // balanced posture ⇒ recording enabled
 
@@ -334,9 +335,9 @@ async function metricsTests() {
 
   // gating: the env kill-switch and posture:off are both silent no-ops
   const before = readFileSync(M.metricsPath(project), 'utf8');
-  process.env.CODEGRAPH_METRICS = '0';
+  process.env.WIREGRAPH_METRICS = '0';
   M.record(project, { kind: 'use', tool: 'get_source' });
-  delete process.env.CODEGRAPH_METRICS;
+  delete process.env.WIREGRAPH_METRICS;
   S.updateState(project, { autoUpdate: 'off' });
   M.record(project, { kind: 'use', tool: 'get_source' });
   S.updateState(project, { autoUpdate: 'balanced' });
@@ -362,7 +363,67 @@ async function metricsTests() {
   rmSync(work, { recursive: true, force: true });
 }
 
-console.log('codegraph regression test');
+// Subdirectory resolution: findIndexedRoot walks up to the indexed workspace root
+// so wiregraph works when invoked from inside a sub-repo.
+async function resolutionTests() {
+  const S = await import('../scripts/lib/state.mjs');
+  const ws = mkdtempSync(join(tmpdir(), 'cg-res-'));
+  const deep = join(ws, 'repo-a', 'src', 'deep');
+  mkdirSync(deep, { recursive: true });
+  mkdirSync(join(ws, '.wiregraph'), { recursive: true });
+  writeFileSync(join(ws, '.wiregraph', 'state.json'), '{}');
+  eq(S.findIndexedRoot(deep), realpathSync(ws), 'findIndexedRoot: walks up to the workspace root from a sub-repo');
+  const orphan = mkdtempSync(join(tmpdir(), 'cg-orph-'));
+  eq(S.findIndexedRoot(orphan), null, 'findIndexedRoot: null for an uninitialized tree');
+  rmSync(ws, { recursive: true, force: true });
+  rmSync(orphan, { recursive: true, force: true });
+}
+
+// Contract inference: HTTP routes -> cross-repo seams -> draft AsyncAPI that the
+// EXISTING pipeline turns back into cross-repo REFERENCES edges (the end-to-end
+// thesis). Two repos side-by-side, each its own git repo, no hand-written specs.
+async function contractsTests() {
+  const I = await import('../src/contracts/infer.js');
+  const work = mkdtempSync(join(tmpdir(), 'cg-contracts-'));
+  const svc = join(work, 'svc-api'), app = join(work, 'mobile-app');
+  cpSync(join(FIXTURE_CONTRACTS, 'svc-api'), svc, { recursive: true });
+  cpSync(join(FIXTURE_CONTRACTS, 'mobile-app'), app, { recursive: true });
+  mkdirSync(join(svc, '.git'), { recursive: true });   // distinct git repos => cross-repo attribution
+  mkdirSync(join(app, '.git'), { recursive: true });
+  const project = realpathSync(work);
+
+  const routes = I.extractRoutes(project);
+  ok(routes.some((r) => r.side === 'server' && r.path === '/api/register'), 'contracts: server route detected');
+  ok(routes.some((r) => r.side === 'client' && r.path === '/api/register'), 'contracts: client call detected');
+
+  eq(I.toAsyncApiPath('/api/users/:id'), '/api/users/{id}', 'contracts: path normalized to AsyncAPI {param} form');
+
+  const seams = I.clusterSeams(routes);
+  eq(seams.length, 1, 'contracts: exactly one cross-repo seam (server-only /api/users/:id excluded)');
+  has(seams[0].path, '/api/register', 'contracts: seam path is /api/register');
+  eq(seams[0].repos.length, 2, 'contracts: seam spans both repos');
+  ok(seams[0].serverRepos.includes('svc-api'), 'contracts: server side learned (svc-api defines the route)');
+
+  // round-trip: generated YAML must re-extract through loadContracts/matchContracts
+  const yaml = I.synthesizeAsyncApi(seams);
+  has(yaml, 'address: /api/register', 'contracts: generated spec emits the channel address key');
+  const cdir = join(project, 'contracts');
+  mkdirSync(cdir, { recursive: true });
+  writeFileSync(join(cdir, 'wiregraph-inferred.asyncapi.yaml'), yaml);
+  const db = join(project, '.wiregraph', 'graph.db');
+  await runBuild({ target: project, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+  const repos = new Set(
+    conn.prepare("SELECT DISTINCT s.repo repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES'")
+      .all(project).map((r) => r.repo),
+  );
+  ok(repos.has('svc-api') && repos.has('mobile-app'),
+    `contracts: round-trip yields cross-repo REFERENCES from both repos (got ${[...repos].join(', ') || 'none'})`);
+  conn.close();
+  rmSync(work, { recursive: true, force: true });
+}
+
+console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
 await jvmLangTests('java', FIXTURE_JAVA, 'App.java');
@@ -371,5 +432,7 @@ await freshnessTests();
 await concurrencyTest();
 await rebuildDurabilityTest();
 await metricsTests();
+await resolutionTests();
+await contractsTests();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

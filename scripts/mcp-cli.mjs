@@ -1,4 +1,4 @@
-// Thin CLI over the codegraph MCP server, so an agent without the MCP
+// Thin CLI over the wiregraph MCP server, so an agent without the MCP
 // registered can still call its tools:
 //   node scripts/mcp-cli.mjs <tool> '<json-args>'
 // e.g. node scripts/mcp-cli.mjs trace_callers '{"name":"parse_request","repo":"api-server"}'

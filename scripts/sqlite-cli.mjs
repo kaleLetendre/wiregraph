@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Offline query CLI: run a codegraph read-only tool straight against a .db file,
+// Offline query CLI: run a wiregraph read-only tool straight against a .db file,
 // without starting the MCP server or setting CLAUDE_PROJECT_DIR. Handy for
 // debugging a graph in isolation. The project tag is read from the db itself.
 //   node sqlite-cli.mjs <db> <tool> '<json-args>'

@@ -1,7 +1,7 @@
-// Local, append-only impact metrics for codegraph. One JSON line per event to
-// <project>/.codegraph/metrics.jsonl, so /codegraph-status can show real usage
+// Local, append-only impact metrics for wiregraph. One JSON line per event to
+// <project>/.wiregraph/metrics.jsonl, so /wiregraph-status can show real usage
 // and an estimate of the tokens the graph saved. Everything stays local (the file
-// lives under the gitignored .codegraph/ dir) — consistent with codegraph never
+// lives under the gitignored .wiregraph/ dir) — consistent with wiregraph never
 // uploading anything.
 //
 // HONESTY — "tokens saved" is a COUNTERFACTUAL, never billed tokens. You can't
@@ -15,7 +15,7 @@
 //     into the get_source total.
 //   - adoption gap: a grep whose pattern is a name the graph already knows —
 //     get_source/find_symbol would have answered. Measures leakage, the actual
-//     "codegraph isn't being used" complaint.
+//     "wiregraph isn't being used" complaint.
 //
 // CRITICAL: this module must stay cheap to IMPORT — the PreToolUse hook imports it
 // on every grep. So it must NOT statically import the sql.js-backed store
@@ -27,7 +27,7 @@
 
 import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, renameSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { readState, codegraphDir } from './state.mjs';
+import { readState, wiregraphDir } from './state.mjs';
 
 // Approximate chars-per-token for source code. Good for trend/relative tracking,
 // not for billing. Configurable here if we ever calibrate against a tokenizer.
@@ -45,13 +45,13 @@ export function estTokens(s) {
 }
 
 export function metricsPath(project) {
-  return join(codegraphDir(project), 'metrics.jsonl');
+  return join(wiregraphDir(project), 'metrics.jsonl');
 }
 
 // Record only on an active posture (reuse the existing opt-out: 'off' or no state
-// means the user turned codegraph off), with a hard env kill-switch.
+// means the user turned wiregraph off), with a hard env kill-switch.
 function enabled(project) {
-  if (process.env.CODEGRAPH_METRICS === '0') return false;
+  if (process.env.WIREGRAPH_METRICS === '0') return false;
   const state = readState(project);
   return !!state && state.autoUpdate !== 'off';
 }
@@ -111,7 +111,7 @@ export async function summarize(project, { sessionId = null } = {}) {
   if (grepPatterns.length) {
     try {
       const { connect } = await import('../../src/store/sqlite.js');
-      const dbp = join(codegraphDir(project), 'graph.db');
+      const dbp = join(wiregraphDir(project), 'graph.db');
       if (existsSync(dbp)) {
         const db = connect(dbp, { readonly: true });
         try {
@@ -145,11 +145,11 @@ export async function summarize(project, { sessionId = null } = {}) {
 }
 
 export function formatSummary(agg) {
-  if (!agg.events) return 'No codegraph metrics recorded yet.';
+  if (!agg.events) return 'No wiregraph metrics recorded yet.';
   const usedTotal = agg.getSourceCalls + agg.traceCalls + agg.otherUses;
   const modeled = agg.traceNodes * ASSUMED_PER_NODE_TOKENS;
   return [
-    `codegraph measured impact — LOCAL ESTIMATE (counterfactual, not billed tokens; chars/${DIV} proxy):`,
+    `wiregraph measured impact — LOCAL ESTIMATE (counterfactual, not billed tokens; chars/${DIV} proxy):`,
     ``,
     `  Graph-tool calls: ${usedTotal}`,
     `  • get_source: ${agg.getSourceCalls} call(s) → est. ~${agg.savedTokens} tokens saved`,

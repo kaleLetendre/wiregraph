@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// codegraph export-gexf — write a GEXF file for Gephi. Nodes carry repo/kind/
+// wiregraph export-gexf — write a GEXF file for Gephi. Nodes carry repo/kind/
 // file/line attributes and a viz:color matching the repo palette; edges are
 // DIRECTED (a CALLS b; publisher WIRE consumer) with type/token/contract/
 // direction attributes. Open in Gephi, run ForceAtlas2, partition-color by
@@ -11,7 +11,7 @@
 //                         that reach each endpoint (callers --up, callees --down)
 //   --all                 every symbol + CALLS + WIRE
 //
-// Reads the project's embedded SQLite graph (<project>/.codegraph/graph.db, or
+// Reads the project's embedded SQLite graph (<project>/.wiregraph/graph.db, or
 // --db <path>). Target project defaults to --project or the cwd.
 
 import { writeFileSync, existsSync, realpathSync } from 'node:fs';
@@ -37,7 +37,7 @@ function parseArgs(argv) {
     else if (a === '--db') o.db = argv[++i];
     else rest.push(a);
   }
-  o.out = rest[0] ? resolve(rest[0]) : join(PLUGIN_DIR, 'codegraph.gexf');
+  o.out = rest[0] ? resolve(rest[0]) : join(PLUGIN_DIR, 'wiregraph.gexf');
   return o;
 }
 
@@ -60,7 +60,7 @@ function renderGexf(nodes, links, repoColor) {
   const out = [];
   out.push('<?xml version="1.0" encoding="UTF-8"?>');
   out.push('<gexf xmlns="http://gexf.net/1.3" xmlns:viz="http://gexf.net/1.3/viz" version="1.3">');
-  out.push('  <meta><creator>codegraph</creator><description>cross-repo call + wire graph</description></meta>');
+  out.push('  <meta><creator>wiregraph</creator><description>cross-repo call + wire graph</description></meta>');
   out.push('  <graph defaultedgetype="directed" mode="static">');
   out.push('    <attributes class="node"><attribute id="0" title="repo" type="string"/><attribute id="1" title="kind" type="string"/><attribute id="2" title="file" type="string"/><attribute id="3" title="line" type="integer"/></attributes>');
   out.push('    <attributes class="edge"><attribute id="0" title="type" type="string"/><attribute id="1" title="tokens" type="string"/><attribute id="2" title="contract" type="string"/><attribute id="3" title="direction" type="string"/></attributes>');
@@ -92,8 +92,8 @@ function resolveProject(opts) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const project = resolveProject(opts);
-  const dbPath = opts.db || process.env.CODEGRAPH_DB || join(project, '.codegraph', 'graph.db');
-  if (!existsSync(dbPath)) { process.stderr.write(`No graph db at ${dbPath}. Run /codegraph-init or build first.\n`); process.exit(1); }
+  const dbPath = opts.db || process.env.WIREGRAPH_DB || join(project, '.wiregraph', 'graph.db');
+  if (!existsSync(dbPath)) { process.stderr.write(`No graph db at ${dbPath}. Run /wiregraph-init or build first.\n`); process.exit(1); }
   const db = connect(dbPath, { readonly: true });
   let built;
   try {

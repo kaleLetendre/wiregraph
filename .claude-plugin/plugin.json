@@ -1,18 +1,19 @@
 {
-  "name": "codegraph",
+  "name": "wiregraph",
   "description": "Cross-repo call/association graph in an embedded SQLite file (no daemon, no JVM), exposed to Claude as MCP tools. Index a project once; navigate/audit/refactor code at ~40-60% fewer tokens than grep+Read. Project-scoped, balanced auto-update, self-refresh via update_graph.",
   "author": { "name": "Kale Letendre", "email": "kaleletendre@gmail.com" },
   "commands": [
-    "./commands/codegraph-init.md",
-    "./commands/codegraph-update.md",
-    "./commands/codegraph-rebuild.md",
-    "./commands/codegraph-status.md",
-    "./commands/codegraph-teardown.md",
-    "./commands/codegraph-remove.md",
-    "./commands/codegraph-build.md"
+    "./commands/wiregraph-init.md",
+    "./commands/wiregraph-update.md",
+    "./commands/wiregraph-rebuild.md",
+    "./commands/wiregraph-status.md",
+    "./commands/wiregraph-contracts.md",
+    "./commands/wiregraph-teardown.md",
+    "./commands/wiregraph-remove.md",
+    "./commands/wiregraph-build.md"
   ],
   "mcpServers": {
-    "codegraph": {
+    "wiregraph": {
       "command": "node",
       "args": ["${CLAUDE_PLUGIN_ROOT}/src/mcp/server.js"]
     }

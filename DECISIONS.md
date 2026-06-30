@@ -1,4 +1,4 @@
-# codegraph — decision log
+# wiregraph — decision log
 
 Architecture decisions for the storage backend, newest first. Each entry: the
 decision, why, and what it costs. (The detailed evaluation logs that led here —
@@ -15,7 +15,7 @@ not *the working tree differs from the last committed git sha*. The read tools
 before answering they re-index any file that changed on disk, bounded by a short
 in-process TTL so a burst of queries pays the git+stat probe at most once.
 
-**Why.** Users reported codegraph going unused after they made edits: it "wasn't
+**Why.** Users reported wiregraph going unused after they made edits: it "wasn't
 updated," so Claude fell back to grep. Root cause was a logic bug — staleness was
 computed purely from git (`git status --porcelain` + committed diff), so an
 *uncommitted* edit showed as changed **forever**, even right after `update_graph`
@@ -38,7 +38,7 @@ and a manual `update_graph` remain the backstops).
 
 **Decision.** Extend self-heal-on-read to cover a schema-version mismatch: when a
 read tool opens a db on an older schema, the server runs a full reset rebuild
-(migrating v1 → v2) and then serves, instead of returning "run /codegraph-rebuild".
+(migrating v1 → v2) and then serves, instead of returning "run /wiregraph-rebuild".
 The rebuild is deduped within the process (`schemaHealPromise`) and awaited by every
 caller, and `update_graph`'s incremental path migrates first too.
 
@@ -47,14 +47,14 @@ staleness probe bails on a schema mismatch, and `withDb` returned the rebuild pr
 so a read on a v1 graph still fell back to grep. A user hit exactly this in daily
 use: a verifier subagent saw the v1/v2 mismatch and grepped instead of rebuilding.
 Making the migration transparent closes the last "graph looks broken → abandon it"
-path, so a plugin update with a schema change needs no manual `/codegraph-rebuild`.
+path, so a plugin update with a schema change needs no manual `/wiregraph-rebuild`.
 
 **Cost.** The first read after a schema-changing update pays a one-time full rebuild
 inline (seconds on a real project); on a very large graph that single call could
 approach an MCP timeout, after which the rebuild still completes in the background
 and the next call succeeds. If several plugin processes each run their own MCP
 server, each may trigger one redundant rebuild (serialized by the db lock); they
-converge. `/codegraph-rebuild` remains the explicit backstop.
+converge. `/wiregraph-rebuild` remains the explicit backstop.
 
 ## D9 — WASM SQLite (`sql.js`) is the store, not `better-sqlite3` — 2026-06-15
 
@@ -87,22 +87,22 @@ compiled). Install is therefore toolchain-free on any mainstream platform.
 (~8 ms at a few-thousand-node scale). Leave it; add a code note.
 
 **Why.** Negligible cost at our size; caching adds state/invalidation complexity
-for no user-visible win. Revisit only if codegraph targets much larger graphs.
+for no user-visible win. Revisit only if wiregraph targets much larger graphs.
 
 ## D7 — One db file per project, not a shared multi-project file — 2026-06-15
 
-**Decision.** Each project's graph lives at `<project>/.codegraph/graph.db`; the
+**Decision.** Each project's graph lives at `<project>/.wiregraph/graph.db`; the
 server resolves it from `CLAUDE_PROJECT_DIR`.
 
 **Why.** Clean isolation, trivial teardown (delete the folder), no cross-project
 bleed risk. The `project` column still scopes every query (the schema supports
 multiple projects in one file), but per-project files are simpler and match how
-Neo4j was used in practice. `$CODEGRAPH_DB` overrides the path.
+Neo4j was used in practice. `$WIREGRAPH_DB` overrides the path.
 
 ## D6 — Stamp a schema version + migrate on rebuild — 2026-06-15
 
 **Decision.** Store `schema_version` in a `meta` table. The server refuses to query
-a db whose version differs (prompts `/codegraph-rebuild`); a `--reset` build
+a db whose version differs (prompts `/wiregraph-rebuild`); a `--reset` build
 migrates by dropping + recreating the tables.
 
 **Why.** A future schema change must not silently return wrong answers against an
@@ -118,7 +118,7 @@ hatch for novel structural questions costs ~20 lines and avoids shipping new cod
 for one-off queries. Read-only by construction (regex guard + the db is opened
 read-only in the server).
 
-## D4 — Full replacement of Neo4j, no `CODEGRAPH_BACKEND` switch — 2026-06-15
+## D4 — Full replacement of Neo4j, no `WIREGRAPH_BACKEND` switch — 2026-06-15
 
 **Decision.** Delete the Neo4j backend entirely rather than keep both behind a
 runtime switch.

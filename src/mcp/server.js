@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// codegraph MCP server — exposes the call/association graph to Claude as a set of
+// wiregraph MCP server — exposes the call/association graph to Claude as a set of
 // question-shaped tools (not raw SQL, except as an escape hatch).
 //
 // The graph lives in an embedded SQLite file (no daemon, no JVM): one .db per
-// project at <project>/.codegraph/graph.db (override with $CODEGRAPH_DB). Every
+// project at <project>/.wiregraph/graph.db (override with $WIREGRAPH_DB). Every
 // row is tagged with its project, and the active project is CLAUDE_PROJECT_DIR
 // (set by Claude Code) or the cwd.
 //
@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import { connect, schemaVersion, SCHEMA_VERSION } from '../store/sqlite.js';
 import * as Q from '../store/sqlite-query.js';
 import { runBuild } from '../build.js';
-import { readState, updateState } from '../../scripts/lib/state.mjs';
+import { readState, updateState, findIndexedRoot, wiregraphDir } from '../../scripts/lib/state.mjs';
 import { changedSince, projectRepos, upstreamDivergence } from '../../scripts/lib/git.mjs';
 import { record, estTokens } from '../../scripts/lib/metrics.mjs';
 
@@ -35,14 +35,19 @@ const VERSION = '0.4.2';
 // (build.js tags nodes with realpathSync of the init root).
 function resolveProject() {
   const raw = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  // Prefer the indexed workspace root so the server answers from the right graph
+  // even when launched inside a sub-repo; fall back to the raw dir when nothing
+  // up the tree is indexed (withDb then surfaces NOT_BUILT / the init nudge).
+  const indexed = findIndexedRoot(raw);
+  if (indexed) return indexed;
   try { return realpathSync(raw); } catch { return raw; }
 }
 const PROJECT = resolveProject();
 const SESSION = process.env.CLAUDE_SESSION_ID || null; // best-effort; MCP servers may not get it
-const NOT_BUILT = `No codegraph for this project (${PROJECT}). Run /codegraph-init here to build it.`;
+const NOT_BUILT = `No wiregraph for this project (${PROJECT}). Run /wiregraph-init here to build it.`;
 
 function dbPath() {
-  return process.env.CODEGRAPH_DB || join(PROJECT, '.codegraph', 'graph.db');
+  return process.env.WIREGRAPH_DB || join(wiregraphDir(PROJECT), 'graph.db');
 }
 
 function text(s) {
@@ -62,7 +67,7 @@ function withDb(fn, { requireIndexed = true } = {}) {
   try {
     const v = schemaVersion(db);
     if (v !== SCHEMA_VERSION) {
-      return text(`codegraph DB schema is v${v} but this version expects v${SCHEMA_VERSION}. Run /codegraph-rebuild to refresh it.`);
+      return text(`wiregraph DB schema is v${v} but this version expects v${SCHEMA_VERSION}. Run /wiregraph-rebuild to refresh it.`);
     }
     if (requireIndexed) {
       const n = db.prepare('SELECT count(*) AS c FROM symbols WHERE project = ?').get(PROJECT).c;
@@ -87,7 +92,7 @@ let schemaConfirmed = false;   // set once the on-disk db is known to be on the 
 let schemaHealPromise = null;  // dedups a concurrent schema-migration rebuild
 
 // A schema bump (e.g. v1 -> v2) leaves an existing graph on the OLD schema. Until
-// now the read tools returned "run /codegraph-rebuild" and the model fell back to
+// now the read tools returned "run /wiregraph-rebuild" and the model fell back to
 // grep — the exact failure users hit after an update. Migrate transparently
 // instead: a full reset rebuild recreates the tables at the current schema (the
 // loader's migrate-on-reset path). It's deduped within the process and AWAITED by
@@ -153,7 +158,7 @@ function upstreamCaveatLine() {
   if (!behind.length) return null;
   const parts = behind.map((d) =>
     `${d.name}: on '${d.branch}', ${d.behind} behind${d.ahead ? `/${d.ahead} ahead` : ''} of ${d.upstream}`);
-  return `⚠ codegraph reflects your CHECKOUT, which is behind upstream — ${parts.join('; ')}. `
+  return `⚠ wiregraph reflects your CHECKOUT, which is behind upstream — ${parts.join('; ')}. `
     + `Pull or switch branches if you expect upstream's code; the graph isn't wrong, it's indexing an old branch.`;
 }
 
@@ -178,7 +183,7 @@ async function freshRead(fn, opts) {
 }
 
 // --- impact metrics ---------------------------------------------------------
-// Record graph-tool usage + an estimate of tokens saved to .codegraph/metrics.jsonl
+// Record graph-tool usage + an estimate of tokens saved to .wiregraph/metrics.jsonl
 // (see scripts/lib/metrics.mjs for the honesty caveats). ALL best-effort: a
 // measurement failure must NEVER fail the tool call.
 const GS_HEADER = /^([^:\n]+):([^:\n]+):(\d+)-(\d+)\s/; // "repo:file:start-end name" header (sqlite-query.js:94)
@@ -215,7 +220,7 @@ function recordUse(tool, out) {
   catch { /* best-effort */ }
 }
 
-const server = new McpServer({ name: 'codegraph', version: VERSION });
+const server = new McpServer({ name: 'wiregraph', version: VERSION });
 
 // --- graph_stats ------------------------------------------------------------
 server.registerTool('graph_stats', {
@@ -324,11 +329,11 @@ server.registerTool('path_between', {
 // A cheap "is the graph healthy and fresh for this project?" check Claude calls
 // to decide whether to update before trusting a trace.
 server.registerTool('graph_status', {
-  description: 'Health + freshness of the codegraph for THIS project: is the project indexed (counts), when was the last full build, is the graph STALE (any file whose on-disk content differs from what was indexed), and whether the checkout is BEHIND its upstream branch (the graph mirrors your working tree, so a stale branch serves stale code while still reporting fresh). The read tools already self-heal — they re-index changed files before answering — so you rarely need this; use it to confirm freshness, check you are not on a stale branch, or before a full rebuild after a big refactor.',
+  description: 'Health + freshness of the wiregraph for THIS project: is the project indexed (counts), when was the last full build, is the graph STALE (any file whose on-disk content differs from what was indexed), and whether the checkout is BEHIND its upstream branch (the graph mirrors your working tree, so a stale branch serves stale code while still reporting fresh). The read tools already self-heal — they re-index changed files before answering — so you rarely need this; use it to confirm freshness, check you are not on a stale branch, or before a full rebuild after a big refactor.',
   inputSchema: {},
 }, async () => withDb((db) => {
   const stats = Q.graphStats(db, PROJECT);
-  if (stats.startsWith('No codegraph')) return text(NOT_BUILT);
+  if (stats.startsWith('No wiregraph')) return text(NOT_BUILT);
   const state = readState(PROJECT);
   const lines = [
     stats.split('\n').slice(0, 3).join('\n'), // Project / Nodes / Edges lines
@@ -369,7 +374,7 @@ server.registerTool('graph_status', {
 // --- update_graph -----------------------------------------------------------
 // Lets Claude refresh the active project's graph mid-session without a shell.
 server.registerTool('update_graph', {
-  description: 'Refresh THIS project\'s codegraph in place. With no args it does an INCREMENTAL update of files changed since the last index (git diff + uncommitted edits) — cheap; call it after you edit code or when graph_status reports stale. Pass files:[...] to re-index specific paths, or full:true for a from-scratch project-scoped rebuild (the correctness backstop after big refactors/renames).',
+  description: 'Refresh THIS project\'s wiregraph in place. With no args it does an INCREMENTAL update of files changed since the last index (git diff + uncommitted edits) — cheap; call it after you edit code or when graph_status reports stale. Pass files:[...] to re-index specific paths, or full:true for a from-scratch project-scoped rebuild (the correctness backstop after big refactors/renames).',
   inputSchema: {
     files: z.array(z.string()).optional().describe('Specific files to re-index (project-relative or absolute). Omit to auto-detect changed files.'),
     full: z.boolean().optional().describe('Full project-scoped rebuild instead of incremental (default false).'),

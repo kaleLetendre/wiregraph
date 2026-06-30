@@ -2,13 +2,13 @@
 // PreToolUse hook on Grep|Glob|Read. The token win is gated on Claude actually
 // reaching for the graph, and the CLAUDE.md directive (loaded once at session
 // start) decays as context grows — so on an indexed project the model drifts
-// back to its grep/Read priors and codegraph goes unused until asked.
+// back to its grep/Read priors and wiregraph goes unused until asked.
 //
 // This puts the nudge at the decision point: when Claude is about to search or
 // open a source file, inject a one-line reminder (additionalContext) to prefer
 // the graph. It NEVER blocks — it just reminds, and Claude still chooses. To stay
-// true to codegraph's "fewer tokens" promise it is rate-limited to NUDGE_CAP
-// times per session (counter under .codegraph/nudges/) and silent unless the
+// true to wiregraph's "fewer tokens" promise it is rate-limited to NUDGE_CAP
+// times per session (counter under .wiregraph/nudges/) and silent unless the
 // project is indexed with a non-'off' posture.
 //
 // Grep/Glob always qualify — they're inherently code search. Read is gated: only
@@ -19,7 +19,7 @@
 
 import { realpathSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { readState, codegraphDir } from '../lib/state.mjs';
+import { readState, wiregraphDir, findIndexedRoot } from '../lib/state.mjs';
 import { record } from '../lib/metrics.mjs';
 import { langForFile } from '../../src/extract/lang.js';
 
@@ -51,13 +51,14 @@ function nudge(ctx) {
 
 function project(payload) {
   const raw = process.env.CLAUDE_PROJECT_DIR || payload?.cwd || process.cwd();
-  try { return realpathSync(raw); } catch { return raw; }
+  // Indexed workspace root (so nudges/metrics work from a sub-repo), else raw dir.
+  return findIndexedRoot(raw) || (() => { try { return realpathSync(raw); } catch { return raw; } })();
 }
 
-// Per-session nudge counter under .codegraph/nudges/<session>. Returns the count
+// Per-session nudge counter under .wiregraph/nudges/<session>. Returns the count
 // BEFORE this call (0 on first grep of the session); bumps it on the way out.
 function bumpCount(proj, sessionId) {
-  const dir = join(codegraphDir(proj), 'nudges');
+  const dir = join(wiregraphDir(proj), 'nudges');
   const safe = String(sessionId || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
   const file = join(dir, safe);
   let n = 0;
@@ -106,11 +107,11 @@ async function main() {
   if (seen >= NUDGE_CAP) quiet();
 
   const msg = tool === 'Read'
-    ? 'codegraph is indexed for this project — before reading a whole source file, ' +
+    ? 'wiregraph is indexed for this project — before reading a whole source file, ' +
       'prefer get_source (returns just one function/symbol\'s body) or ' +
       'trace_callers/trace_callees/path_between (whole call chains in one call). ' +
       'They cost ~50% fewer tokens; open the full file only when you need broad context.'
-    : 'codegraph is indexed for this project — prefer its MCP tools over grep for ' +
+    : 'wiregraph is indexed for this project — prefer its MCP tools over grep for ' +
       'code navigation: find_symbol (locate a symbol), get_source (read one ' +
       "function's body), trace_callers/trace_callees/path_between (whole call chains " +
       'in one call). They cost ~50% fewer tokens. Fall back to grep for string ' +

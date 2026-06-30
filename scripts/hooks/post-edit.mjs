@@ -5,13 +5,13 @@
 // refresh.mjs and exits; it never touches the graph db itself.
 //
 // Gated on the project's autoUpdate posture: only 'balanced' and 'aggressive'
-// re-index on every edit. Posture lives in <project>/.codegraph/state.json.
+// re-index on every edit. Posture lives in <project>/.wiregraph/state.json.
 
 import { realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readState } from '../lib/state.mjs';
+import { readState, findIndexedRoot } from '../lib/state.mjs';
 import { langForFile } from '../../src/extract/lang.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -27,7 +27,8 @@ function readStdin() {
 
 function project() {
   const raw = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  try { return realpathSync(raw); } catch { return raw; }
+  // Indexed workspace root so an edit in a sub-repo re-indexes the workspace graph.
+  return findIndexedRoot(raw) || (() => { try { return realpathSync(raw); } catch { return raw; } })();
 }
 
 async function main() {

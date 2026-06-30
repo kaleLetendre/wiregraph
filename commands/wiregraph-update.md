@@ -1,10 +1,10 @@
 ---
-description: Incrementally refresh the codegraph for this project (re-index files changed since the last index)
+description: Incrementally refresh the wiregraph for this project (re-index files changed since the last index)
 argument-hint: "(no args — refreshes the active project)"
 allowed-tools: Bash
 ---
 
-Bring the codegraph up to date with the current code, cheaply. This re-indexes
+Bring the wiregraph up to date with the current code, cheaply. This re-indexes
 only the source files that changed since the last index (git diff + uncommitted
 edits) — it does not rebuild the whole graph.
 
@@ -19,6 +19,6 @@ active project:
 node ${CLAUDE_PLUGIN_ROOT}/scripts/hooks/refresh.mjs
 ```
 
-When to use this vs `/codegraph-rebuild`: incremental update is right after normal
+When to use this vs `/wiregraph-rebuild`: incremental update is right after normal
 edits. After large refactors or renames (where incoming call edges to a renamed
-symbol may dangle), use `/codegraph-rebuild` for a clean from-scratch graph.
+symbol may dangle), use `/wiregraph-rebuild` for a clean from-scratch graph.

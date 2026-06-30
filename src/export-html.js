@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// codegraph export-html — render the graph as a standalone HTML file using a
+// wiregraph export-html — render the graph as a standalone HTML file using a
 // d3 clustered-force layout: each repo has its own gravity center (same color
 // attracts), every node repels (charge), repo centers are spread apart
 // (different colors separate), contracts sit in the middle as bridges. Sliders
@@ -14,7 +14,7 @@
 //                          per symbol (no per-token fan-out).
 //
 // Parallel REFERENCES edges are always collapsed to one weighted edge. Reads the
-// project's embedded SQLite graph (<project>/.codegraph/graph.db, or --db <path>);
+// project's embedded SQLite graph (<project>/.wiregraph/graph.db, or --db <path>);
 // target project defaults to --project or cwd. No Neo4j needed to build or view.
 
 import { writeFileSync, existsSync, realpathSync } from 'node:fs';
@@ -42,7 +42,7 @@ function parseArgs(argv) {
     else if (a === '--db') o.db = argv[++i];
     else rest.push(a);
   }
-  o.out = rest[0] ? resolve(rest[0]) : join(PLUGIN_DIR, 'codegraph-graph.html');
+  o.out = rest[0] ? resolve(rest[0]) : join(PLUGIN_DIR, 'wiregraph-graph.html');
   return o;
 }
 
@@ -74,8 +74,8 @@ function resolveProject(opts) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const project = resolveProject(opts);
-  const dbPath = opts.db || process.env.CODEGRAPH_DB || join(project, '.codegraph', 'graph.db');
-  if (!existsSync(dbPath)) { process.stderr.write(`No graph db at ${dbPath}. Run /codegraph-init or build first.\n`); process.exit(1); }
+  const dbPath = opts.db || process.env.WIREGRAPH_DB || join(project, '.wiregraph', 'graph.db');
+  if (!existsSync(dbPath)) { process.stderr.write(`No graph db at ${dbPath}. Run /wiregraph-init or build first.\n`); process.exit(1); }
   const db = connect(dbPath, { readonly: true });
 
   let built;
@@ -102,7 +102,7 @@ function renderHtml(data) {
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>codegraph — ${data.title}</title>
+<title>wiregraph — ${data.title}</title>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
   html,body { margin:0; height:100%; background:#1b1d23; color:#e6e6e6; font:13px/1.4 system-ui,sans-serif; overflow:hidden; }

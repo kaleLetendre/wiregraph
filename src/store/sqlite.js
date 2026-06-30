@@ -31,7 +31,7 @@ const require = createRequire(import.meta.url);
 const SQL = await initSqlJs({ locateFile: () => require.resolve('sql.js/dist/sql-wasm.wasm') });
 
 // Bump when the on-disk schema changes shape. A .db stamped with an older version
-// is reported stale (server turns this into "run /codegraph-rebuild") rather than
+// is reported stale (server turns this into "run /wiregraph-rebuild") rather than
 // queried with the wrong assumptions.
 // v2 adds files.mtime/size so staleness is "differs from what was indexed" (disk
 // mtime/size vs recorded), not "differs from the last committed git sha" — the
@@ -88,7 +88,7 @@ function acquireLock(lockPath) {
       try {
         if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) { rmSync(lockPath, { force: true }); continue; }
       } catch { continue; /* lock vanished between open and stat — retry immediately */ }
-      if (Date.now() > deadline) throw new Error(`codegraph: timed out waiting for db lock ${lockPath}`);
+      if (Date.now() > deadline) throw new Error(`wiregraph: timed out waiting for db lock ${lockPath}`);
       sleepSync(50);
     }
   }
@@ -175,7 +175,7 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
   // If an existing db was written by a different schema version, a full --reset
   // build migrates it by dropping + recreating the tables (the db is per-project,
   // so this is the rebuild path; incremental against a stale schema is refused by
-  // the server, which prompts /codegraph-rebuild). A fresh file reports version 0
+  // the server, which prompts /wiregraph-rebuild). A fresh file reports version 0
   // and is harmlessly (re)created here too.
   const priorVersion = schemaVersion(db);
   if (reset && priorVersion !== SCHEMA_VERSION) {
@@ -195,7 +195,7 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
     // The reset wipe runs in the SAME transaction as the reload, so a failure
     // mid-insert rolls the wipe back too. Otherwise a crashed --reset would leave
     // the project's rows deleted and close() would persist the emptied db over a
-    // good file — i.e. a transient error during /codegraph-rebuild could destroy
+    // good file — i.e. a transient error during /wiregraph-rebuild could destroy
     // the existing graph, the opposite of the backstop it's meant to be. (The
     // separate schema-migration DROP path above is exempt: that data is an
     // already-incompatible old schema the server refuses to query anyway.)

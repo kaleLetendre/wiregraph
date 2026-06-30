@@ -1,18 +1,18 @@
 {
-  "name": "codegraph",
+  "name": "wiregraph",
   "owner": {
     "name": "Kale Letendre",
     "email": "kaleletendre@gmail.com"
   },
   "metadata": {
-    "description": "codegraph — cross-repo call graph in an embedded SQLite file (no daemon), exposed to Claude as MCP tools.",
+    "description": "wiregraph — cross-repo call graph in an embedded SQLite file (no daemon), exposed to Claude as MCP tools.",
     "version": "0.4.2"
   },
   "plugins": [
     {
-      "name": "codegraph",
+      "name": "wiregraph",
       "source": ".",
-      "description": "Index a project into a cross-repo call graph (embedded SQLite, no daemon or JVM) exposed as MCP tools, so Claude navigates/audits/refactors code at ~40-60% fewer tokens than grep+Read. Project-scoped, balanced auto-update, self-refresh via update_graph. /codegraph-init to start.",
+      "description": "Index a project into a cross-repo call graph (embedded SQLite, no daemon or JVM) exposed as MCP tools, so Claude navigates/audits/refactors code at ~40-60% fewer tokens than grep+Read. Project-scoped, balanced auto-update, self-refresh via update_graph. /wiregraph-init to start.",
       "category": "development",
       "keywords": ["graph", "sqlite", "mcp", "call-graph", "cross-repo", "contracts", "tokens", "code-navigation"]
     }
