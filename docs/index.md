@@ -1,3 +1,8 @@
+---
+layout: default
+title: wiregraph
+---
+
 # wiregraph
 
 **A cross-repo call + contract graph for AI coding agents.** wiregraph indexes your

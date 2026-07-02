@@ -1,3 +1,8 @@
+---
+layout: default
+title: Architecture
+---
+
 # Architecture
 
 How wiregraph turns a workspace of repos into a queryable graph — and how it links

@@ -1,3 +1,8 @@
+---
+layout: default
+title: Contracts
+---
+
 # Contracts: connecting two compartments
 
 *See also: [Architecture](architecture.md) for how detection + matching work internally · [docs home](index.md).*
