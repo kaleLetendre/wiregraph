@@ -10,6 +10,7 @@
     div.textContent = el.textContent;
     el.replaceWith(div);
   });
-  mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'strict' });
+  // 'loose' so <br/> line breaks in labels render (content is our own, not user input)
+  mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' });
   await mermaid.run();
 </script>
