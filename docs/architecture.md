@@ -9,30 +9,26 @@ How wiregraph turns a workspace of repos into a queryable graph — and how it l
 code *across* repos through contracts. The pipeline is one pass: walk → parse →
 resolve → (contracts) → load into SQLite, then serve via MCP tools.
 
-```
-  source files (C · TS/JS · Python · Java · Kotlin)
-        │
-        │  walk.js — per-repo discovery (.git roots), skip IGNORE_DIRS
-        ▼
-  parse.js (tree-sitter)
-        ├─► symbols       (functions, methods, classes, the module node)
-        ├─► calls         (callee name + enclosing symbol)
-        └─► candidates    contract signals:  wire · message · state · import
-        │
-        │  resolve.js — name-based, same-file then same-repo (never cross-repo)
-        ▼
-     CALLS edges
-        │
-        │  contracts:  cluster candidates shared by ≥2 repos  ─► draft AsyncAPI
-        │              loadContracts → matchContracts → buildWireEdges
-        ▼
-  ┌──────────────────────────  graph.db (SQLite)  ──────────────────────────┐
-  │  nodes:  repos · files · symbols · contracts                            │
-  │  edges:  IN_REPO · DEFINED_IN · CALLS · REFERENCES · WIRE · IMPORTS      │
-  └─────────────────────────────────┬───────────────────────────────────────┘
-                                     ▼
-        MCP tools — find_symbol · get_source · trace_callers/callees ·
-                    trace_contract · path_between · query_sql · graph_status
+```mermaid
+flowchart TD
+  SRC["source files<br/>C · TS/JS · Python · Java · Kotlin"] --> WALK["walk.js<br/>per-repo (.git), skip IGNORE_DIRS"]
+  WALK --> PARSE["parse.js · tree-sitter"]
+  PARSE --> SYM["symbols"]
+  PARSE --> CALLS["calls"]
+  PARSE --> CAND["candidates<br/>wire · message · state · import"]
+  CALLS --> RES["resolve.js<br/>same-file → same-repo"] --> CE["CALLS edges"]
+  CAND -->|token kinds| CL["cluster tokens<br/>shared by ≥2 repos"] --> SPEC["draft AsyncAPI"]
+  SPEC --> MATCH["loadContracts → matchContracts → buildWireEdges"] --> REF["REFERENCES · WIRE"]
+  CAND -->|import kind| IMPR["resolve cross-repo imports"] --> IE["IMPORTS edges"]
+  SYM --> DB[("graph.db · SQLite")]
+  CE --> DB
+  REF --> DB
+  IE --> DB
+  DB --> MCP(["MCP tools<br/>find_symbol · get_source · trace_* · path_between"])
+  classDef store fill:#fef3c7,stroke:#f59e0b,color:#78350f,font-weight:bold
+  classDef ai fill:#dcfce7,stroke:#22c55e,color:#14532d,font-weight:bold
+  class DB store
+  class MCP ai
 ```
 
 ## Stages
@@ -71,6 +67,17 @@ A **contract** is the defined communication between two compartments (see
 reduces to *a distinctive token that 2+ repos both reference* — so the contract
 layer is a set of **detectors** that each harvest one kind of cross-repo signal,
 all feeding the same cluster → synthesize → match pipeline:
+
+```mermaid
+flowchart LR
+  W["wire<br/>routes"] --> TOK
+  M["message<br/>topics/queues"] --> TOK
+  S["state<br/>env vars"] --> TOK
+  TOK["distinctive token<br/>shared by ≥2 repos"] --> CN{{"Contract node<br/>REFERENCES / WIRE"}}
+  I["import<br/>cross-repo deps"] --> IE["IMPORTS edge<br/>(direct, structural)"]
+  classDef c fill:#fef3c7,stroke:#f59e0b,color:#78350f,font-weight:bold
+  class CN c
+```
 
 | Detector | Signal | Token | Edge |
 |---|---|---|---|

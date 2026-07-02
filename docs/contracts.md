@@ -17,6 +17,15 @@ connections in a real system are the ones that **aren't a code-level call at all
 where two compartments only agree on a shape. Those are exactly what a contract
 captures, and what `trace_contract` / `path_between` let you walk.
 
+```mermaid
+flowchart LR
+  A["compartment A<br/>(repo · service · library)"] -- mentions token --> C{{"Contract"}}
+  B["compartment B<br/>(another repo)"] -- mentions token --> C
+  A -. "producer → consumer" .-> B
+  classDef c fill:#fef3c7,stroke:#f59e0b,color:#78350f,font-weight:bold
+  class C c
+```
+
 ## The variety of situations a contract covers
 
 - **Service ↔ service over the wire.** A producer in one repo sends an HTTP request
@@ -31,6 +40,13 @@ captures, and what `trace_contract` / `path_between` let you walk.
 - **Program ↔ program via shared state.** One program reads another's state — a
   shared database table, a status file, a memory-mapped region, an environment
   contract. The contract is the shape and keys of that shared state.
+
+```mermaid
+flowchart TD
+  C{{"a contract =<br/>comms between two compartments"}} --> W["service ↔ service<br/>HTTP route · queue topic"]
+  C --> L["library / SDK ↔ consumer<br/>exported API surface"]
+  C --> S["program ↔ program<br/>shared state (env · table · file)"]
+```
 
 In every case the model is the same: a **Contract** node that both sides
 **REFERENCE**, joined into a directed edge. Only the *source* of the contract — a

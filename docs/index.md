@@ -12,6 +12,17 @@ Claude as MCP tools. Claude navigates, audits, and refactors from the full pictu
 fewer tokens** than grep + Read. Everything stays local: the graph is a single
 SQLite file in your workspace, nothing is uploaded.
 
+```mermaid
+flowchart LR
+  R["📁 related repos<br/>side by side"] --> WG["🔗 wiregraph<br/>index once"]
+  WG --> G[("graph.db<br/>symbols · calls · contracts")]
+  G --> T["🔧 MCP tools"] --> C(["🤖 Claude works from the<br/>full picture · ~half the tokens"])
+  classDef store fill:#fef3c7,stroke:#f59e0b,color:#78350f,font-weight:bold
+  classDef ai fill:#dcfce7,stroke:#22c55e,color:#14532d,font-weight:bold
+  class G store
+  class C ai
+```
+
 ## Start here
 
 - **[Contracts: connecting two compartments](contracts.md)** — what a contract is
