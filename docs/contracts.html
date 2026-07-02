@@ -296,27 +296,27 @@
   <section id="def" aria-label="Contract as compartment boundary" style="padding-top:0">
     <div class="def-viz reveal">
       <svg id="defSvg" viewBox="0 0 820 260" role="img" aria-label="Two sealed compartments side by side. Neither reaches into the other. Between them sits a single contract token; each compartment references only that token, and the pulse of communication travels compartment A to contract to compartment B.">
-        <!-- compartment A -->
+        <!-- compartment boxes (background) -->
         <rect x="30" y="46" width="240" height="168" rx="16" fill="rgba(155,140,255,.05)" stroke="var(--violet)" stroke-opacity=".5" stroke-dasharray="6 6"/>
         <text x="150" y="76" text-anchor="middle" class="node-label" fill="var(--violet)" style="letter-spacing:.12em">COMPARTMENT A</text>
+        <rect x="550" y="46" width="240" height="168" rx="16" fill="rgba(92,240,138,.05)" stroke="var(--green)" stroke-opacity=".5" stroke-dasharray="6 6"/>
+        <text x="670" y="76" text-anchor="middle" class="node-label" fill="var(--green)" style="letter-spacing:.12em">COMPARTMENT B</text>
+
+        <!-- edges FIRST so nodes paint on top of them -->
+        <line class="edge" x1="95" y1="130" x2="205" y2="122"/>
+        <line class="edge" x1="150" y1="170" x2="205" y2="122"/>
+        <line class="edge" x1="615" y1="122" x2="725" y2="130"/>
+        <line class="edge" x1="615" y1="122" x2="670" y2="170"/>
+        <path id="defEdgeA" class="edge" d="M221,122 L370,130" stroke-dasharray="6 6"/>
+        <path id="defEdgeB" class="edge" d="M599,122 L450,130" stroke-dasharray="6 6"/>
+
+        <!-- nodes ON TOP -->
         <g class="node"><circle class="node-body" cx="95" cy="130" r="16" stroke="var(--violet)"/></g>
         <g class="node"><circle class="node-body" cx="150" cy="170" r="13" stroke="var(--violet)"/></g>
         <g class="node" id="defProd"><circle class="node-body" cx="205" cy="122" r="16" stroke="var(--violet)"/><text class="node-label" x="205" y="156" text-anchor="middle" fill="var(--ink)" style="font-size:9px">writes</text></g>
-        <line class="edge" x1="95" y1="130" x2="205" y2="122"/>
-        <line class="edge" x1="150" y1="170" x2="205" y2="122"/>
-
-        <!-- compartment B -->
-        <rect x="550" y="46" width="240" height="168" rx="16" fill="rgba(92,240,138,.05)" stroke="var(--green)" stroke-opacity=".5" stroke-dasharray="6 6"/>
-        <text x="670" y="76" text-anchor="middle" class="node-label" fill="var(--green)" style="letter-spacing:.12em">COMPARTMENT B</text>
         <g class="node" id="defCons"><circle class="node-body" cx="615" cy="122" r="16" stroke="var(--green)"/><text class="node-label" x="615" y="156" text-anchor="middle" fill="var(--ink)" style="font-size:9px">reads</text></g>
         <g class="node"><circle class="node-body" cx="670" cy="170" r="13" stroke="var(--green)"/></g>
         <g class="node"><circle class="node-body" cx="725" cy="130" r="16" stroke="var(--green)"/></g>
-        <line class="edge" x1="615" y1="122" x2="725" y2="130"/>
-        <line class="edge" x1="615" y1="122" x2="670" y2="170"/>
-
-        <!-- the contract in the seam -->
-        <path id="defEdgeA" class="edge" d="M221,122 L370,130" stroke-dasharray="6 6"/>
-        <path id="defEdgeB" class="edge" d="M599,122 L450,130" stroke-dasharray="6 6"/>
         <g id="defContract" class="node" transform="translate(410,130)">
           <polygon class="node-body contract-shape" points="-42,-24 42,-24 52,0 42,24 -42,24 -52,0" fill="rgba(255,207,107,.07)" stroke="var(--amber)" stroke-opacity=".7"/>
           <text class="node-label" x="0" y="-3" text-anchor="middle" fill="var(--amber)" style="font-size:11px">contract</text>
