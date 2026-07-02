@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wiregraph — cross-repo call + contract graph for AI coding agents</title>
+<meta name="description" content="A cross-repo call + contract graph for AI coding agents — ~half the tokens, 100% local. Index your repos once; Claude traces producer → contract → consumer across the repo boundary a call graph can't see.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔗</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#05070a;
+    --bg2:#080b11;
+    --panel:#0b0f16;
+    --panel2:#0e131c;
+    --line:#18202c;
+    --line2:#232e3d;
+    --ink:#e7edf5;
+    --muted:#8a97a9;
+    --dim:#5d6a7d;
+    --cyan:#22e3c9;
+    --cyan-soft:#0fd6c0;
+    --green:#5cf08a;
+    --amber:#ffcf6b;
+    --violet:#9b8cff;
+    --red:#ff6b6b;
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    --glow:0 0 22px rgba(34,227,201,.35);
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  html,body{margin:0;overflow-x:hidden;max-width:100%}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font-family:var(--sans);
+    line-height:1.6;
+    font-size:16px;
+    -webkit-font-smoothing:antialiased;
+    position:relative;
+  }
+  body::before{
+    content:"";
+    position:fixed;
+    inset:0;
+    z-index:0;
+    pointer-events:none;
+    background-image:
+      linear-gradient(rgba(34,227,201,.045) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(34,227,201,.045) 1px,transparent 1px),
+      radial-gradient(1200px 700px at 78% -8%,rgba(34,227,201,.10),transparent 60%),
+      radial-gradient(900px 600px at 8% 12%,rgba(155,140,255,.08),transparent 60%);
+    background-size:34px 34px,34px 34px,100% 100%,100% 100%;
+    -webkit-mask-image:radial-gradient(circle at 50% 30%,#000 0%,rgba(0,0,0,.7) 55%,rgba(0,0,0,.35) 100%);
+    mask-image:radial-gradient(circle at 50% 30%,#000 0%,rgba(0,0,0,.7) 55%,rgba(0,0,0,.35) 100%);
+  }
+  main,header{position:relative;z-index:1}
+  a{color:var(--cyan);text-decoration:none}
+  a:hover{text-decoration:underline}
+  ::selection{background:rgba(34,227,201,.3);color:#fff}
+
+  /* ---------- NAV ---------- */
+  header.nav{
+    position:sticky;top:0;z-index:50;
+    backdrop-filter:blur(12px);
+    background:linear-gradient(180deg,rgba(5,7,10,.92),rgba(5,7,10,.72));
+    border-bottom:1px solid var(--line);
+  }
+  .nav-inner{
+    max-width:1180px;margin:0 auto;padding:12px 22px;
+    display:flex;align-items:center;gap:18px;
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.02em;font-size:18px;white-space:nowrap}
+  .brand .mark{width:22px;height:22px;flex:0 0 auto}
+  .brand .mark circle,.brand .mark line{stroke:var(--cyan)}
+  .nav-links{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap}
+  .nav-links a{
+    font-family:var(--mono);font-size:12.5px;color:var(--muted);
+    padding:7px 11px;border-radius:8px;position:relative;letter-spacing:.02em;
+  }
+  .nav-links a:hover{color:var(--ink);text-decoration:none;background:rgba(255,255,255,.03)}
+  .nav-links a.active{color:var(--cyan)}
+  .nav-links a.active::after{
+    content:"";position:absolute;left:11px;right:11px;bottom:1px;height:2px;
+    background:var(--cyan);border-radius:2px;box-shadow:var(--glow);
+  }
+  .nav-cta{
+    font-family:var(--mono);font-size:12.5px;font-weight:700;
+    padding:8px 14px;border-radius:9px;
+    color:var(--bg);background:var(--cyan);
+    box-shadow:var(--glow);white-space:nowrap;
+  }
+  .nav-cta:hover{text-decoration:none;background:#3af0d8}
+  .menu-toggle{display:none}
+
+  /* ---------- LAYOUT ---------- */
+  section{max-width:1180px;margin:0 auto;padding:92px 22px;scroll-margin-top:70px}
+  .eyebrow{
+    font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--cyan);margin:0 0 14px;font-weight:500;
+    display:inline-flex;align-items:center;gap:9px;
+  }
+  .eyebrow::before{content:"";width:26px;height:1px;background:var(--cyan);opacity:.6}
+  h1,h2,h3{letter-spacing:-.025em;line-height:1.1;margin:0}
+  h2{font-size:clamp(28px,4.6vw,42px);font-weight:800}
+  h2 .accent{color:var(--cyan)}
+  .lead{color:var(--muted);font-size:clamp(16px,2.1vw,19px);max-width:56ch;margin:16px 0 0}
+
+  .card{
+    background:linear-gradient(180deg,var(--panel),var(--panel2));
+    border:1px solid var(--line);border-radius:var(--radius);
+    padding:22px;position:relative;transition:border-color .25s,transform .25s,box-shadow .25s;
+  }
+  .card:hover{border-color:var(--line2);transform:translateY(-3px);box-shadow:0 14px 40px rgba(0,0,0,.4)}
+
+  /* reveal on scroll */
+  .reveal{opacity:0;transform:translateY(26px);transition:opacity .7s ease,transform .7s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  .reveal.d1{transition-delay:.08s}.reveal.d2{transition-delay:.16s}
+  .reveal.d3{transition-delay:.24s}.reveal.d4{transition-delay:.32s}
+
+  /* ---------- HERO ---------- */
+  #hero{padding-top:64px;padding-bottom:70px}
+  .hero-grid{display:grid;grid-template-columns:1.02fr 1.05fr;gap:48px;align-items:center}
+  .hero-title{font-size:clamp(46px,8.6vw,88px);font-weight:800;line-height:.98;letter-spacing:-.045em}
+  .hero-title .w{color:var(--ink)}
+  .hero-title .g{
+    background:linear-gradient(100deg,var(--cyan),var(--green) 55%,var(--cyan));
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .hero-tag{font-size:clamp(17px,2.5vw,21px);color:var(--muted);max-width:44ch;margin:22px 0 0;line-height:1.5}
+  .hero-tag b{color:var(--ink);font-weight:600}
+  .hero-tag .hi{color:var(--cyan);font-weight:600}
+  .cta-row{display:flex;gap:14px;flex-wrap:wrap;margin-top:34px}
+  .btn{
+    font-family:var(--mono);font-weight:700;font-size:14px;border:0;cursor:pointer;
+    padding:14px 24px;border-radius:11px;display:inline-flex;align-items:center;gap:10px;
+    transition:transform .2s,box-shadow .2s,background .2s;
+  }
+  .btn-primary{background:var(--cyan);color:var(--bg);box-shadow:var(--glow)}
+  .btn-primary:hover{text-decoration:none;transform:translateY(-2px);background:#3af0d8;box-shadow:0 0 30px rgba(34,227,201,.55)}
+  .btn-ghost{background:transparent;color:var(--ink);border:1px solid var(--line2)}
+  .btn-ghost:hover{text-decoration:none;border-color:var(--cyan);color:var(--cyan)}
+  .hero-stats{display:flex;gap:28px;margin-top:34px;flex-wrap:wrap}
+  .stat .n{font-family:var(--mono);font-size:26px;font-weight:700;color:var(--cyan);line-height:1}
+  .stat .l{font-size:12.5px;color:var(--dim);margin-top:6px;letter-spacing:.02em}
+
+  .hero-viz{
+    background:radial-gradient(120% 120% at 50% 0%,rgba(34,227,201,.07),transparent 60%),linear-gradient(180deg,var(--panel),var(--bg2));
+    border:1px solid var(--line);border-radius:20px;padding:14px;position:relative;overflow:hidden;
+    box-shadow:0 30px 80px rgba(0,0,0,.5);
+  }
+  .hero-viz .tag{position:absolute;top:14px;left:16px;font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:.15em;z-index:2}
+  .hero-viz .dots{position:absolute;top:15px;right:16px;display:flex;gap:6px;z-index:2}
+  .hero-viz .dots i{width:9px;height:9px;border-radius:50%;display:block;background:var(--line2)}
+  .hero-viz .dots i:nth-child(1){background:#ff5f57}.hero-viz .dots i:nth-child(2){background:#febc2e}.hero-viz .dots i:nth-child(3){background:#28c840}
+
+  /* SVG shared */
+  svg{display:block;width:100%;height:auto}
+  .node-body{fill:var(--panel2);stroke:var(--line2);stroke-width:1.4}
+  .node-lit .node-body{stroke:var(--cyan);filter:drop-shadow(0 0 6px rgba(34,227,201,.6))}
+  .node-label{font-family:var(--mono);font-size:11px;fill:var(--ink)}
+  .edge{stroke:var(--line2);stroke-width:1.6;fill:none}
+  .edge-active{stroke:rgba(34,227,201,.55)}
+  .pulse{fill:var(--cyan);filter:drop-shadow(0 0 5px var(--cyan))}
+
+  /* repo cluster tint boxes in hero */
+  .repo-box{fill:rgba(155,140,255,.035);stroke:var(--line);stroke-dasharray:5 5}
+  .repo-box.b{fill:rgba(92,240,138,.035)}
+  .repo-tag{font-family:var(--mono);fill:var(--dim);font-size:9.5px;letter-spacing:.14em}
+
+  /* ---------- PROBLEM/FIX ---------- */
+  .pf-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:40px}
+  .pf-col{padding:26px}
+  .pf-col.bad{border-color:rgba(255,107,107,.22)}
+  .pf-col.good{border-color:rgba(92,240,138,.22)}
+  .pf-head{display:flex;align-items:center;gap:12px;font-family:var(--mono);font-weight:700;font-size:15px;margin-bottom:4px}
+  .pf-col.bad .pf-head{color:var(--red)}
+  .pf-col.good .pf-head{color:var(--green)}
+  .pf-steps{list-style:none;padding:0;margin:18px 0 0;display:flex;flex-direction:column;gap:10px}
+  .pf-steps li{
+    font-family:var(--mono);font-size:13px;color:var(--muted);
+    padding:11px 14px;border-radius:9px;background:rgba(255,255,255,.02);border:1px solid var(--line);
+    display:flex;align-items:center;gap:10px;
+  }
+  .pf-steps li .k{color:var(--dim);flex:0 0 auto}
+  .pf-col.good .pf-steps li{border-color:rgba(92,240,138,.12)}
+  /* token meter */
+  .meter-wrap{margin-top:22px}
+  .meter-label{display:flex;justify-content:space-between;font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:8px}
+  .meter{height:26px;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid var(--line);overflow:hidden;position:relative}
+  .meter .fill{height:100%;border-radius:7px;width:0;transition:width 1.4s cubic-bezier(.2,.7,.2,1)}
+  .meter.bad .fill{background:linear-gradient(90deg,#7f1d1d,var(--red))}
+  .meter.good .fill{background:linear-gradient(90deg,#166534,var(--green))}
+  .meter .pct{position:absolute;top:50%;transform:translateY(-50%);right:10px;font-family:var(--mono);font-size:12px;font-weight:700;color:#fff}
+  .in .meter.bad .fill{width:100%}
+  .in .meter.good .fill{width:47%}
+
+  /* ---------- CONTRACT PROMO ---------- */
+  .promo-grid{display:grid;grid-template-columns:1fr 1.1fr;gap:44px;align-items:center;margin-top:40px}
+  .promo-viz{
+    background:radial-gradient(120% 120% at 50% 0%,rgba(255,207,107,.06),transparent 60%),linear-gradient(180deg,var(--panel),var(--bg2));
+    border:1px solid var(--line);border-radius:18px;padding:14px;position:relative;overflow:hidden;
+    box-shadow:0 24px 60px rgba(0,0,0,.45);
+  }
+  .promo-points{list-style:none;padding:0;margin:24px 0 0;display:flex;flex-direction:column;gap:14px}
+  .promo-points li{display:flex;gap:12px;align-items:flex-start;color:var(--muted);font-size:15px}
+  .promo-points li b{color:var(--ink);font-weight:600}
+  .promo-points .dot{width:8px;height:8px;border-radius:50%;background:var(--amber);flex:0 0 auto;margin-top:8px;box-shadow:0 0 8px rgba(255,207,107,.6)}
+  .promo-cta{margin-top:30px}
+
+  /* ---------- TOOLS ---------- */
+  .tools-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:38px}
+  .tool{padding:18px 20px;display:flex;align-items:flex-start;gap:16px}
+  .tool .glyph{
+    width:42px;height:42px;flex:0 0 auto;border-radius:10px;
+    background:rgba(34,227,201,.08);border:1px solid rgba(34,227,201,.2);
+    display:grid;place-items:center;
+  }
+  .tool code{font-family:var(--mono);font-size:14.5px;font-weight:700;color:var(--cyan)}
+  .tool .ans{color:var(--muted);font-size:13.5px;margin-top:3px}
+  .tools-note{font-family:var(--mono);font-size:12.5px;color:var(--dim);margin-top:22px;text-align:center}
+
+  /* ---------- INSTALL ---------- */
+  .term{
+    margin-top:38px;max-width:760px;background:#070a0f;border:1px solid var(--line2);
+    border-radius:14px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.5);
+  }
+  .term-bar{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.02)}
+  .term-bar i{width:11px;height:11px;border-radius:50%;display:block}
+  .term-bar i:nth-child(1){background:#ff5f57}.term-bar i:nth-child(2){background:#febc2e}.term-bar i:nth-child(3){background:#28c840}
+  .term-bar .t{margin-left:8px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .term-body{padding:20px 20px 22px;font-family:var(--mono);font-size:13.5px;line-height:1.9}
+  .cmd-line{display:flex;align-items:center;gap:12px}
+  .cmd-line .code{color:var(--ink)}
+  .cmd-line .prompt{color:var(--cyan);user-select:none}
+  .cmd-line .prompt::after{content:"$"}
+  .cmd-line .copy{
+    margin-left:auto;font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;
+    color:var(--dim);background:transparent;border:1px solid var(--line2);border-radius:6px;
+    padding:3px 9px;cursor:pointer;transition:all .18s;opacity:0;text-transform:uppercase;
+  }
+  .cmd-line:hover .copy{opacity:1}
+  .cmd-line .copy:hover{color:var(--cyan);border-color:var(--cyan)}
+  .cmd-line .copy.done{color:var(--green);border-color:var(--green);opacity:1}
+  .term-comment{color:var(--dim)}
+  .term-comment .arrow{color:var(--cyan)}
+  .install-caption{color:var(--muted);margin-top:22px;font-size:14.5px;max-width:60ch}
+  .install-caption code{font-family:var(--mono);color:var(--cyan);font-size:13px}
+
+  /* ---------- FOOTER ---------- */
+  footer{border-top:1px solid var(--line);margin-top:40px;background:var(--bg2)}
+  .foot-inner{max-width:1180px;margin:0 auto;padding:44px 22px;display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+  .foot-brand{display:flex;align-items:center;gap:12px;font-weight:800;font-size:20px}
+  .foot-right{display:flex;flex-direction:column;gap:6px;text-align:right}
+  .foot-gh{font-family:var(--mono);font-size:14px;display:inline-flex;align-items:center;gap:9px}
+  .foot-meta{font-size:12.5px;color:var(--dim)}
+
+  /* ---------- RESPONSIVE ---------- */
+  @media(max-width:900px){
+    .hero-grid{grid-template-columns:1fr;gap:38px}
+    .pf-grid{grid-template-columns:1fr}
+    .promo-grid{grid-template-columns:1fr;gap:32px}
+    .tools-grid{grid-template-columns:1fr}
+    section{padding:70px 20px}
+    .menu-toggle{
+      display:inline-grid;place-items:center;margin-left:auto;width:40px;height:40px;
+      border:1px solid var(--line2);border-radius:9px;background:transparent;cursor:pointer;
+    }
+    .menu-toggle span{width:18px;height:2px;background:var(--ink);position:relative;display:block}
+    .menu-toggle span::before,.menu-toggle span::after{content:"";position:absolute;left:0;width:18px;height:2px;background:var(--ink)}
+    .menu-toggle span::before{top:-6px}.menu-toggle span::after{top:6px}
+    .nav-links{
+      margin-left:0;position:absolute;top:100%;left:0;right:0;
+      flex-direction:column;gap:2px;padding:12px 16px 16px;
+      background:rgba(5,7,10,.98);border-bottom:1px solid var(--line);
+      display:none;
+    }
+    .nav-links.open{display:flex}
+    .nav-links a{padding:11px 12px}
+    .nav-links a.active::after{display:none}
+    .nav-cta{display:none}
+    .foot-right{text-align:left}
+  }
+  @media(max-width:520px){
+    .hero-stats{gap:20px}
+  }
+
+  @media(prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    .reveal{opacity:1;transform:none;transition:none}
+    .anim-pulse,.anim-flow,.anim-dash,.anim-breathe{animation:none!important;display:none}
+    .meter .fill{transition:none}
+    *{transition-duration:.001ms!important}
+  }
+</style>
+
+<header class="nav">
+  <div class="nav-inner">
+    <a href="#hero" class="brand" aria-label="wiregraph home">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <line x1="6" y1="6" x2="18" y2="18" stroke-width="1.6"/>
+        <line x1="6" y1="6" x2="18" y2="7" stroke-width="1.6"/>
+        <circle cx="6" cy="6" r="3" fill="var(--bg)" stroke-width="1.6"/>
+        <circle cx="18" cy="18" r="3" fill="var(--bg)" stroke-width="1.6"/>
+        <circle cx="18" cy="7" r="2.4" fill="var(--bg)" stroke-width="1.6"/>
+      </svg>
+      wiregraph
+    </a>
+    <nav class="nav-links" id="navlinks" aria-label="Sections">
+      <a href="#problem">problem → fix</a>
+      <a href="#contracts">contract arch</a>
+      <a href="#tools">tools</a>
+      <a href="#install">install</a>
+      <a href="c1.html">deep-dive ↗</a>
+    </nav>
+    <a href="#install" class="nav-cta">Install</a>
+    <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu" aria-expanded="false"><span></span></button>
+  </div>
+</header>
+
+<main>
+
+  <!-- ============ HERO ============ -->
+  <section id="hero" aria-label="Introduction">
+    <div class="hero-grid">
+      <div>
+        <p class="eyebrow">100% local · SQLite · MCP</p>
+        <h1 class="hero-title"><span class="w">wire</span><span class="g">graph</span></h1>
+        <p class="hero-tag">A cross-repo <b>call + contract graph</b> for AI coding agents — <span class="hi">~half the tokens</span>, <b>100% local</b>.</p>
+        <div class="cta-row">
+          <a href="#install" class="btn btn-primary">Install &nbsp;→</a>
+          <a href="#contracts" class="btn btn-ghost">See the seam</a>
+        </div>
+        <div class="hero-stats">
+          <div class="stat"><div class="n">40–60%</div><div class="l">fewer tokens read</div></div>
+          <div class="stat"><div class="n">2+ repos</div><div class="l">linked by contract</div></div>
+          <div class="stat"><div class="n">0</div><div class="l">bytes uploaded</div></div>
+        </div>
+      </div>
+
+      <div class="hero-viz" aria-label="Animated cross-repo contract diagram">
+        <span class="tag">GRAPH.DB · THE SEAM</span>
+        <span class="dots"><i></i><i></i><i></i></span>
+        <svg id="heroGraph" viewBox="0 0 480 360" role="img" aria-label="Two repositories side by side. A producer symbol in repo A and a consumer symbol in repo B share the same topic token 'device.heartbeat'. They never call each other; instead a contract node forms between them and links producer to contract to consumer across the repo boundary.">
+          <defs>
+            <radialGradient id="nodeGlow" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="rgba(34,227,201,.25)"/>
+              <stop offset="100%" stop-color="rgba(34,227,201,0)"/>
+            </radialGradient>
+          </defs>
+
+          <!-- repo cluster boxes -->
+          <rect class="repo-box" x="18" y="58" width="150" height="256" rx="14"/>
+          <text class="repo-tag" x="34" y="82" fill="var(--violet)">REPO&nbsp;A · service</text>
+          <rect class="repo-box b" x="312" y="58" width="150" height="256" rx="14"/>
+          <text class="repo-tag" x="328" y="82" fill="var(--green)">REPO&nbsp;B · worker</text>
+
+          <!-- intra-repo edges (resolve by name, within a repo) -->
+          <g id="heroEdges" stroke-linecap="round">
+            <!-- repo A internal -->
+            <path class="edge" d="M62,140 L62,232"/>
+            <!-- repo B internal -->
+            <path class="edge" d="M418,140 L418,232"/>
+            <!-- the cross-repo seam: producer -> contract -> consumer -->
+            <path class="edge edge-active" id="seamA" d="M96,140 L214,180"/>
+            <path class="edge edge-active" id="seamB" d="M384,140 L266,180"/>
+          </g>
+
+          <!-- the (missing) direct call across the boundary -->
+          <path class="edge" d="M96,158 Q240,300 384,158" stroke="var(--red)" stroke-dasharray="4 6" opacity=".45"/>
+          <text x="240" y="300" text-anchor="middle" class="node-label" fill="var(--red)" style="font-size:9px" opacity=".7">no direct call — linked by a shared contract</text>
+
+          <!-- repo A: producer + one neighbor -->
+          <g class="node" id="hProd" transform="translate(62,140)">
+            <circle cx="0" cy="0" r="26" fill="url(#nodeGlow)"/>
+            <circle class="node-body" cx="0" cy="0" r="18" stroke="var(--violet)"/>
+            <text class="node-label" x="0" y="4" text-anchor="middle" fill="var(--ink)" style="font-size:9px">publish()</text>
+            <text class="node-label" x="0" y="40" text-anchor="middle" fill="var(--muted)" style="font-size:9px">producer</text>
+          </g>
+          <g class="node" data-node transform="translate(62,232)">
+            <circle class="node-body" cx="0" cy="0" r="13"/>
+            <text class="node-label" x="0" y="30" text-anchor="middle" fill="var(--dim)" style="font-size:8.5px">main()</text>
+          </g>
+
+          <!-- repo B: consumer + one neighbor -->
+          <g class="node" id="hCons" transform="translate(418,140)">
+            <circle cx="0" cy="0" r="26" fill="url(#nodeGlow)"/>
+            <circle class="node-body" cx="0" cy="0" r="18" stroke="var(--green)"/>
+            <text class="node-label" x="0" y="4" text-anchor="middle" fill="var(--ink)" style="font-size:9px">onBeat()</text>
+            <text class="node-label" x="0" y="40" text-anchor="middle" fill="var(--muted)" style="font-size:9px">consumer</text>
+          </g>
+          <g class="node" data-node transform="translate(418,232)">
+            <circle class="node-body" cx="0" cy="0" r="13"/>
+            <text class="node-label" x="0" y="30" text-anchor="middle" fill="var(--dim)" style="font-size:8.5px">run()</text>
+          </g>
+
+          <!-- CONTRACT node in the middle -->
+          <g class="node node-lit" id="hContract" transform="translate(240,180)">
+            <polygon class="node-body contract-shape" points="-52,-24 52,-24 62,0 52,24 -52,24 -62,0" fill="rgba(255,207,107,.08)" stroke="var(--amber)" style="filter:drop-shadow(0 0 9px rgba(255,207,107,.5))"/>
+            <text class="node-label" x="0" y="-4" text-anchor="middle" fill="var(--amber)" style="font-size:10px">CONTRACT</text>
+            <text class="node-label" x="0" y="11" text-anchor="middle" fill="var(--dim)" style="font-size:9px">device.heartbeat</text>
+          </g>
+
+          <!-- REFERENCES edge labels -->
+          <text x="150" y="150" text-anchor="middle" class="node-label" fill="var(--dim)" style="font-size:8px" transform="rotate(19 150 150)">REFERENCES</text>
+          <text x="330" y="150" text-anchor="middle" class="node-label" fill="var(--dim)" style="font-size:8px" transform="rotate(-19 330 150)">REFERENCES</text>
+
+          <g id="heroPulses"></g>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ PROBLEM / FIX ============ -->
+  <section id="problem" aria-label="The problem and the fix">
+    <p class="eyebrow reveal">The problem → the fix</p>
+    <h2 class="reveal">Stop paying to <span class="accent">re-read the whole tree.</span></h2>
+    <p class="lead reveal d1">A code task shouldn't cost a full grep-and-read of your repos. wiregraph turns "search everything" into "ask the graph" — and reads only the symbols that matter.</p>
+
+    <div class="pf-grid">
+      <div class="card pf-col bad reveal d1">
+        <div class="pf-head"><span>🐢</span> Without wiregraph</div>
+        <ol class="pf-steps">
+          <li><span class="k">01</span> grep the whole tree</li>
+          <li><span class="k">02</span> read whole files, top to bottom</li>
+          <li><span class="k">03</span> change it — <b>full token cost</b></li>
+        </ol>
+        <div class="meter-wrap">
+          <div class="meter-label"><span>tokens read</span><span>baseline</span></div>
+          <div class="meter bad"><div class="fill"></div><span class="pct">100%</span></div>
+        </div>
+      </div>
+
+      <div class="card pf-col good reveal d2">
+        <div class="pf-head"><span>⚡</span> With wiregraph</div>
+        <ol class="pf-steps">
+          <li><span class="k">01</span> query the graph for the exact symbols</li>
+          <li><span class="k">02</span> read <b>just those bodies</b>, not files</li>
+          <li><span class="k">03</span> change it from the full picture — <b>~half the cost</b></li>
+        </ol>
+        <div class="meter-wrap">
+          <div class="meter-label"><span>tokens read</span><span>~40–60% less</span></div>
+          <div class="meter good"><div class="fill"></div><span class="pct">~47%</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ WORKS WITH YOUR CONTRACT ARCHITECTURE ============ -->
+  <section id="contracts" aria-label="Works with your contract architecture">
+    <p class="eyebrow reveal">Works with your contract architecture</p>
+    <h2 class="reveal">It sees the <span class="accent">seams between your repos.</span></h2>
+    <p class="lead reveal d1">Within a repo, calls resolve by name. Across repos there's usually no direct call at all — services and libraries talk through a <b style="color:var(--ink)">shared shape</b>: a route, a topic, an env var, an import.</p>
+
+    <div class="promo-grid">
+      <div class="promo-viz reveal d1" aria-label="Compact cross-repo contract diagram">
+        <svg id="promoSvg" viewBox="0 0 440 220" role="img" aria-label="A producer in repo A and a consumer in repo B both reference the same route contract; wiregraph links them producer to contract to consumer.">
+          <!-- repo boxes -->
+          <rect class="repo-box" x="12" y="30" width="120" height="160" rx="12"/>
+          <text class="repo-tag" x="26" y="52" fill="var(--violet)">repo A</text>
+          <rect class="repo-box b" x="308" y="30" width="120" height="160" rx="12"/>
+          <text class="repo-tag" x="322" y="52" fill="var(--green)">repo B</text>
+
+          <path id="pEdgeA" class="edge" d="M100,110 L178,110"/>
+          <path id="pEdgeB" class="edge" d="M340,110 L262,110"/>
+
+          <g class="node" id="pProd" transform="translate(72,110)">
+            <circle class="node-body" cx="0" cy="0" r="24" stroke="var(--violet)"/>
+            <text class="node-label" x="0" y="3" text-anchor="middle" fill="var(--ink)" style="font-size:9px">fetch</text>
+            <text class="node-label" x="0" y="14" text-anchor="middle" fill="var(--ink)" style="font-size:9px">User()</text>
+          </g>
+          <g class="node" id="pCons" transform="translate(368,110)">
+            <circle class="node-body" cx="0" cy="0" r="24" stroke="var(--green)"/>
+            <text class="node-label" x="0" y="3" text-anchor="middle" fill="var(--ink)" style="font-size:9px">GET</text>
+            <text class="node-label" x="0" y="14" text-anchor="middle" fill="var(--ink)" style="font-size:9px">/users</text>
+          </g>
+          <g class="node node-lit" id="pContract" transform="translate(220,110)">
+            <polygon class="node-body contract-shape" points="-42,-22 42,-22 52,0 42,22 -42,22 -52,0" fill="rgba(255,207,107,.08)" stroke="var(--amber)" style="filter:drop-shadow(0 0 9px rgba(255,207,107,.5))"/>
+            <text class="node-label" x="0" y="-3" text-anchor="middle" fill="var(--amber)" style="font-size:9px">contract</text>
+            <text class="node-label" x="0" y="11" text-anchor="middle" fill="var(--dim)" style="font-size:8.5px">/api/users</text>
+          </g>
+          <g id="pPulses"></g>
+        </svg>
+      </div>
+
+      <div class="reveal d2">
+        <ul class="promo-points">
+          <li><span class="dot"></span><div>Same token in <b>2+ repos</b> → wiregraph mints a <b>Contract</b> node and links the referencing symbols to it.</div></li>
+          <li><span class="dot"></span><div>Claude traces <b>producer → contract → consumer</b> across the boundary a plain call graph can't see.</div></li>
+          <li><span class="dot"></span><div>Rename a route or topic on one side, and the silent break on the other side becomes <b>visible</b>.</div></li>
+        </ul>
+        <div class="promo-cta">
+          <a href="c1.html" class="btn btn-primary">What is contract architecture? &nbsp;→</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ WHAT CLAUDE CAN DO ============ -->
+  <section id="tools" aria-label="What Claude can do">
+    <p class="eyebrow reveal">What Claude can do</p>
+    <h2 class="reveal">Seven tools. <span class="accent">One graph.</span></h2>
+    <p class="lead reveal d1">You don't call these — Claude does, automatically, on every task.</p>
+
+    <div class="tools-grid">
+      <div class="card tool reveal d1">
+        <span class="glyph">🔍</span>
+        <div><code>find_symbol</code><div class="ans">locate where something is defined, across every repo.</div></div>
+      </div>
+      <div class="card tool reveal d1">
+        <span class="glyph">📄</span>
+        <div><code>get_source</code><div class="ans">read one symbol's body — not the whole file.</div></div>
+      </div>
+      <div class="card tool reveal d2">
+        <span class="glyph">⬆️</span>
+        <div><code>trace_callers</code><div class="ans">who calls it — the whole caller tree, one query.</div></div>
+      </div>
+      <div class="card tool reveal d2">
+        <span class="glyph">⬇️</span>
+        <div><code>trace_callees</code><div class="ans">what it calls — the whole callee tree, one query.</div></div>
+      </div>
+      <div class="card tool reveal d3">
+        <span class="glyph">🔗</span>
+        <div><code>trace_contract</code><div class="ans">follow producer → contract → consumer across repos.</div></div>
+      </div>
+      <div class="card tool reveal d3">
+        <span class="glyph">🧭</span>
+        <div><code>path_between</code><div class="ans">the wiring between any two symbols.</div></div>
+      </div>
+      <div class="card tool reveal d4">
+        <span class="glyph">🗄️</span>
+        <div><code>query_sql</code><div class="ans">anything else — read-only SQL over the graph.</div></div>
+      </div>
+      <div class="card tool reveal d4" style="align-items:center">
+        <span class="glyph" style="background:none;border:none;font-size:22px">✨</span>
+        <div><code style="color:var(--muted)">graph_status · update_graph</code><div class="ans">keep it fresh — automatically.</div></div>
+      </div>
+    </div>
+    <p class="tools-note reveal">// set it up once and forget it — the graph stays fresh as you edit.</p>
+  </section>
+
+  <!-- ============ INSTALL ============ -->
+  <section id="install" aria-label="Install">
+    <p class="eyebrow reveal">Install</p>
+    <h2 class="reveal">A few lines. <span class="accent">No build step.</span></h2>
+    <p class="lead reveal d1">Public repo, install straight from Claude Code. Native bits are prebuilt and vendored for Linux / macOS / Windows.</p>
+
+    <div class="term reveal d1" role="group" aria-label="Install commands">
+      <div class="term-bar"><i></i><i></i><i></i><span class="t">claude-code</span></div>
+      <div class="term-body">
+        <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/plugin marketplace add kaleLetendre/wiregraph</span><button class="copy" aria-label="Copy command">copy</button></div>
+        <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/plugin install wiregraph@wiregraph</span><button class="copy" aria-label="Copy command">copy</button></div>
+        <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/reload-plugins</span><button class="copy" aria-label="Copy command">copy</button></div>
+        <div class="cmd-line" style="margin-top:10px"><span class="prompt"></span><span class="code" data-cmd>/wiregraph-init</span><button class="copy" aria-label="Copy command">copy</button></div>
+        <div class="term-comment"># <span class="arrow">→</span> indexes every repo under this workspace, then keeps itself fresh</div>
+      </div>
+    </div>
+    <p class="install-caption reveal d2">Run <code>/wiregraph-init</code> once per workspace. It finds every repo under the root, indexes them into one local graph, links the contracts between them, and re-indexes as you edit. Then just put Claude to work.</p>
+  </section>
+</main>
+
+<!-- ============ FOOTER ============ -->
+<footer>
+  <div class="foot-inner">
+    <div class="foot-brand">
+      <svg class="mark" style="width:26px;height:26px" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <line x1="6" y1="6" x2="18" y2="18" stroke="var(--cyan)" stroke-width="1.6"/>
+        <line x1="6" y1="6" x2="18" y2="7" stroke="var(--cyan)" stroke-width="1.6"/>
+        <circle cx="6" cy="6" r="3" fill="var(--bg)" stroke="var(--cyan)" stroke-width="1.6"/>
+        <circle cx="18" cy="18" r="3" fill="var(--bg)" stroke="var(--cyan)" stroke-width="1.6"/>
+        <circle cx="18" cy="7" r="2.4" fill="var(--bg)" stroke="var(--cyan)" stroke-width="1.6"/>
+      </svg>
+      wiregraph
+    </div>
+    <div class="foot-right">
+      <a class="foot-gh" href="https://github.com/kaleLetendre/wiregraph">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        github.com/kaleLetendre/wiregraph
+      </a>
+      <span class="foot-meta">AGPL-3.0 · 100% local · nothing uploaded · <a href="c1.html">contract architecture →</a></span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- mobile menu ---------- */
+  var toggle = document.getElementById('menuToggle');
+  var links = document.getElementById('navlinks');
+  if(toggle){
+    toggle.addEventListener('click', function(){
+      var open = links.classList.toggle('open');
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    links.addEventListener('click', function(e){
+      if(e.target.tagName === 'A'){ links.classList.remove('open'); toggle.setAttribute('aria-expanded','false'); }
+    });
+  }
+
+  /* ---------- reveal on scroll ---------- */
+  var reveals = document.querySelectorAll('.reveal');
+  if(reduce){
+    reveals.forEach(function(r){ r.classList.add('in'); });
+  } else if('IntersectionObserver' in window){
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); }
+      });
+    }, {threshold:.16, rootMargin:'0px 0px -8% 0px'});
+    reveals.forEach(function(r){ io.observe(r); });
+  } else {
+    reveals.forEach(function(r){ r.classList.add('in'); });
+  }
+
+  /* ---------- active section in nav ---------- */
+  var navAnchors = Array.prototype.slice.call(document.querySelectorAll('.nav-links a')).filter(function(a){ return a.getAttribute('href').charAt(0)==='#'; });
+  var sections = navAnchors.map(function(a){ return document.querySelector(a.getAttribute('href')); });
+  if('IntersectionObserver' in window){
+    var so = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(en.isIntersecting){
+          var id = '#'+en.target.id;
+          navAnchors.forEach(function(a){ a.classList.toggle('active', a.getAttribute('href')===id); });
+        }
+      });
+    }, {rootMargin:'-45% 0px -50% 0px', threshold:0});
+    sections.forEach(function(s){ if(s) so.observe(s); });
+  }
+
+  /* ---------- copy buttons ---------- */
+  document.querySelectorAll('.cmd-line').forEach(function(line){
+    var btn = line.querySelector('.copy');
+    var cmd = line.querySelector('[data-cmd]');
+    if(!btn || !cmd) return;
+    btn.addEventListener('click', function(){
+      var text = cmd.textContent.trim();
+      var done = function(){ btn.textContent='copied'; btn.classList.add('done'); setTimeout(function(){ btn.textContent='copy'; btn.classList.remove('done'); },1400); };
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select();
+        try{ document.execCommand('copy'); }catch(e){} document.body.removeChild(ta); done();
+      }
+    });
+  });
+
+  if(reduce) return; /* no animated pulses under reduced motion */
+
+  /* ---------- pulse engine ---------- */
+  var SVGNS='http://www.w3.org/2000/svg';
+  function makePulse(parent, r){
+    var c=document.createElementNS(SVGNS,'circle');
+    c.setAttribute('r', r||3.2); c.setAttribute('class','pulse');
+    parent.appendChild(c); return c;
+  }
+  function animateAlong(pathEl, dot, dur, delay, loop){
+    var len=pathEl.getTotalLength();
+    var start=null;
+    function frame(ts){
+      if(start===null) start=ts+ (delay||0);
+      var t=(ts-start)/dur;
+      if(t<0){ dot.setAttribute('opacity','0'); requestAnimationFrame(frame); return; }
+      if(t>1){
+        if(loop){ start=ts; t=0; } else { dot.setAttribute('opacity','0'); return; }
+      }
+      dot.setAttribute('opacity', (t<.08? t/.08 : t>.9? (1-t)/.1 : 1).toFixed(2));
+      var p=pathEl.getPointAtLength(t*len);
+      dot.setAttribute('cx',p.x); dot.setAttribute('cy',p.y);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  /* ---------- HERO: the seam ---------- */
+  var heroPulses=document.getElementById('heroPulses');
+  if(heroPulses){
+    var seamA=document.getElementById('seamA'), seamB=document.getElementById('seamB');
+    /* producer -> contract, then contract -> consumer, looping */
+    var hp1=makePulse(heroPulses,3.8); hp1.setAttribute('fill','var(--violet)');
+    var hp2=makePulse(heroPulses,3.8); hp2.setAttribute('fill','var(--green)');
+    animateAlong(seamA, hp1, 1500, 0, true);
+    animateAlong(seamB, hp2, 1500, 750, true);
+    /* breathe the contract node */
+    var hContract=document.getElementById('hContract');
+    var shape=hContract.querySelector('.contract-shape');
+    var t0=performance.now();
+    (function breathe(){
+      var e=(performance.now()-t0)/1000;
+      var g=9+5*(0.5+0.5*Math.sin(e*2.2));
+      shape.style.filter='drop-shadow(0 0 '+g.toFixed(1)+'px rgba(255,207,107,.6))';
+      requestAnimationFrame(breathe);
+    })();
+    /* alternate lighting producer / consumer */
+    var hProd=document.getElementById('hProd'), hCons=document.getElementById('hCons');
+    var flip=false;
+    setInterval(function(){
+      flip=!flip;
+      hProd.classList.toggle('node-lit', flip);
+      hCons.classList.toggle('node-lit', !flip);
+    }, 1500);
+  }
+
+  /* ---------- CONTRACT PROMO: light up + pulse on scroll ---------- */
+  var promoSvg=document.getElementById('promoSvg');
+  if(promoSvg && 'IntersectionObserver' in window){
+    var started=false;
+    var cio=new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(en.isIntersecting && !started){
+          started=true;
+          var eA=document.getElementById('pEdgeA'), eB=document.getElementById('pEdgeB');
+          var cp=document.getElementById('pPulses');
+          setTimeout(function(){
+            eA.classList.add('edge-active'); eB.classList.add('edge-active');
+            document.getElementById('pProd').classList.add('node-lit');
+            document.getElementById('pCons').classList.add('node-lit');
+          }, 350);
+          var p1=makePulse(cp,3.6); p1.setAttribute('fill','var(--violet)');
+          var p2=makePulse(cp,3.6); p2.setAttribute('fill','var(--green)');
+          setTimeout(function(){
+            animateAlong(eA, p1, 1500, 0, true);
+            animateAlong(eB, p2, 1500, 750, true);
+          }, 650);
+        }
+      });
+    }, {threshold:.4});
+    cio.observe(promoSvg);
+  }
+})();
+</script>
