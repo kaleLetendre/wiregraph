@@ -260,7 +260,7 @@
 
 <header class="nav">
   <div class="nav-inner">
-    <a href="m3.html" class="brand" aria-label="wiregraph home">
+    <a href="index.html" class="brand" aria-label="wiregraph home">
       <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <line x1="6" y1="6" x2="18" y2="18" stroke-width="1.6"/>
         <line x1="6" y1="6" x2="18" y2="7" stroke-width="1.6"/>
@@ -276,9 +276,9 @@
       <a href="#bug">the bug class</a>
       <a href="#detect">detection</a>
       <a href="#sources">sources</a>
-      <a href="m3.html">← main</a>
+      <a href="index.html">← main</a>
     </nav>
-    <a href="m3.html#install" class="nav-cta">Install</a>
+    <a href="index.html#install" class="nav-cta">Install</a>
     <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu" aria-expanded="false"><span></span></button>
   </div>
 </header>
@@ -287,7 +287,7 @@
 
   <!-- ============ HERO / DEFINITION ============ -->
   <section id="hero" aria-label="What a contract is">
-    <a href="m3.html" class="backlink">← wiregraph</a>
+    <a href="index.html" class="backlink">← wiregraph</a>
     <p class="eyebrow" style="margin-top:20px">Deep dive</p>
     <h1 class="hero-title">A contract is a <span class="g">defined communication</span> between two compartments.</h1>
     <p class="lead">Not just microservices. Any two <b style="color:var(--ink)">compartments</b> — two services, a library and its consumer, two programs sharing a table — agree on a shape and talk through it. That agreed shape is the contract. It's the seam a call graph never records, because no function ever calls across it.</p>
@@ -301,22 +301,22 @@
         <text x="150" y="76" text-anchor="middle" class="node-label" fill="var(--violet)" style="letter-spacing:.12em">COMPARTMENT A</text>
         <g class="node"><circle class="node-body" cx="95" cy="130" r="16" stroke="var(--violet)"/></g>
         <g class="node"><circle class="node-body" cx="150" cy="170" r="13" stroke="var(--violet)"/></g>
-        <g class="node" id="defProd"><circle class="node-body" cx="205" cy="125" r="20" stroke="var(--violet)"/><text class="node-label" x="205" y="129" text-anchor="middle" fill="var(--ink)" style="font-size:9px">writes</text></g>
-        <line class="edge" x1="95" y1="130" x2="205" y2="125"/>
-        <line class="edge" x1="150" y1="170" x2="205" y2="125"/>
+        <g class="node" id="defProd"><circle class="node-body" cx="205" cy="122" r="16" stroke="var(--violet)"/><text class="node-label" x="205" y="156" text-anchor="middle" fill="var(--ink)" style="font-size:9px">writes</text></g>
+        <line class="edge" x1="95" y1="130" x2="205" y2="122"/>
+        <line class="edge" x1="150" y1="170" x2="205" y2="122"/>
 
         <!-- compartment B -->
         <rect x="550" y="46" width="240" height="168" rx="16" fill="rgba(92,240,138,.05)" stroke="var(--green)" stroke-opacity=".5" stroke-dasharray="6 6"/>
         <text x="670" y="76" text-anchor="middle" class="node-label" fill="var(--green)" style="letter-spacing:.12em">COMPARTMENT B</text>
-        <g class="node" id="defCons"><circle class="node-body" cx="615" cy="125" r="20" stroke="var(--green)"/><text class="node-label" x="615" y="129" text-anchor="middle" fill="var(--ink)" style="font-size:9px">reads</text></g>
+        <g class="node" id="defCons"><circle class="node-body" cx="615" cy="122" r="16" stroke="var(--green)"/><text class="node-label" x="615" y="156" text-anchor="middle" fill="var(--ink)" style="font-size:9px">reads</text></g>
         <g class="node"><circle class="node-body" cx="670" cy="170" r="13" stroke="var(--green)"/></g>
         <g class="node"><circle class="node-body" cx="725" cy="130" r="16" stroke="var(--green)"/></g>
-        <line class="edge" x1="615" y1="125" x2="725" y2="130"/>
-        <line class="edge" x1="615" y1="125" x2="670" y2="170"/>
+        <line class="edge" x1="615" y1="122" x2="725" y2="130"/>
+        <line class="edge" x1="615" y1="122" x2="670" y2="170"/>
 
         <!-- the contract in the seam -->
-        <path id="defEdgeA" class="edge" d="M225,125 L370,130" stroke-dasharray="6 6"/>
-        <path id="defEdgeB" class="edge" d="M595,125 L450,130" stroke-dasharray="6 6"/>
+        <path id="defEdgeA" class="edge" d="M221,122 L370,130" stroke-dasharray="6 6"/>
+        <path id="defEdgeB" class="edge" d="M599,122 L450,130" stroke-dasharray="6 6"/>
         <g id="defContract" class="node" transform="translate(410,130)">
           <polygon class="node-body contract-shape" points="-42,-24 42,-24 52,0 42,24 -42,24 -52,0" fill="rgba(255,207,107,.07)" stroke="var(--amber)" stroke-opacity=".7"/>
           <text class="node-label" x="0" y="-3" text-anchor="middle" fill="var(--amber)" style="font-size:11px">contract</text>
@@ -397,22 +397,22 @@
         <!-- repo A -->
         <rect x="20" y="30" width="200" height="150" rx="13" fill="rgba(155,140,255,.04)" stroke="var(--line)" stroke-dasharray="5 5"/>
         <text x="120" y="52" text-anchor="middle" class="node-label" fill="var(--violet)" style="font-size:9.5px;letter-spacing:.1em">REPO A</text>
-        <g class="node"><circle class="node-body" cx="120" cy="112" r="30" stroke="var(--violet)"/>
-          <text class="node-label" x="120" y="108" text-anchor="middle" fill="var(--ink)" style="font-size:9px">emits</text>
-          <text id="bugProdRoute" class="node-label" x="120" y="122" text-anchor="middle" fill="var(--violet)" style="font-size:8.5px">/api/register</text>
+        <g class="node"><circle class="node-body" cx="120" cy="105" r="22" stroke="var(--violet)"/>
+          <text class="node-label" x="120" y="109" text-anchor="middle" fill="var(--ink)" style="font-size:9px">emits</text>
+          <text id="bugProdRoute" class="node-label" x="120" y="152" text-anchor="middle" fill="var(--violet)" style="font-size:9px">/api/register</text>
         </g>
         <!-- repo B -->
         <rect x="680" y="30" width="200" height="150" rx="13" fill="rgba(92,240,138,.04)" stroke="var(--line)" stroke-dasharray="5 5"/>
         <text x="780" y="52" text-anchor="middle" class="node-label" fill="var(--green)" style="font-size:9.5px;letter-spacing:.1em">REPO B</text>
-        <g class="node"><circle class="node-body" cx="780" cy="112" r="30" stroke="var(--green)"/>
-          <text class="node-label" x="780" y="108" text-anchor="middle" fill="var(--ink)" style="font-size:9px">handles</text>
-          <text class="node-label" x="780" y="122" text-anchor="middle" fill="var(--green)" style="font-size:8.5px">/api/register</text>
+        <g class="node"><circle class="node-body" cx="780" cy="105" r="22" stroke="var(--green)"/>
+          <text class="node-label" x="780" y="109" text-anchor="middle" fill="var(--ink)" style="font-size:9px">handles</text>
+          <text class="node-label" x="780" y="152" text-anchor="middle" fill="var(--green)" style="font-size:9px">/api/register</text>
         </g>
 
         <!-- contract token -->
-        <path id="bugEdgeA" class="edge edge-active" d="M150,112 L400,112" stroke="var(--cyan)" style="filter:drop-shadow(0 0 4px var(--cyan))"/>
-        <path id="bugEdgeB" class="edge edge-active" d="M750,112 L500,112" stroke="var(--cyan)" style="filter:drop-shadow(0 0 4px var(--cyan))"/>
-        <g class="node" transform="translate(450,112)">
+        <path id="bugEdgeA" class="edge edge-active" d="M142,105 L392,105" stroke="var(--cyan)" style="filter:drop-shadow(0 0 4px var(--cyan))"/>
+        <path id="bugEdgeB" class="edge edge-active" d="M758,105 L508,105" stroke="var(--cyan)" style="filter:drop-shadow(0 0 4px var(--cyan))"/>
+        <g class="node" transform="translate(450,105)">
           <polygon class="node-body contract-shape" points="-48,-24 48,-24 58,0 48,24 -48,24 -58,0" fill="rgba(255,207,107,.08)" stroke="var(--amber)"/>
           <text class="node-label" x="0" y="-3" text-anchor="middle" fill="var(--amber)" style="font-size:9.5px">contract</text>
           <text class="node-label" x="0" y="10" text-anchor="middle" fill="var(--dim)" style="font-size:8.5px">/api/register</text>
@@ -528,7 +528,7 @@
     <p class="eyebrow" style="justify-content:center">Ready</p>
     <h2>Give Claude the <span class="accent">whole picture.</span></h2>
     <p class="body" style="margin-left:auto;margin-right:auto;text-align:center">Index once, and Claude traces producer → contract → consumer across every seam — at about half the tokens.</p>
-    <a href="m3.html#install" class="btn btn-primary">Install wiregraph &nbsp;→</a>
+    <a href="index.html#install" class="btn btn-primary">Install wiregraph &nbsp;→</a>
   </div>
 </div>
 

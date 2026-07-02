@@ -9,7 +9,7 @@ half as much** (≈40–60% fewer tokens in internal A/B testing), which also me
 **faster, cheaper** turns. Everything stays local — the graph is just a file in your
 workspace, nothing is uploaded. **Set it up once and forget it.**
 
-📖 **Docs:** <https://kaleletendre.github.io/wiregraph/> — [contracts (the concept)](docs/contracts.md) · [architecture](docs/architecture.md)
+📖 **Docs:** <https://kaleletendre.github.io/wiregraph/> — and [what contract architecture is](https://kaleletendre.github.io/wiregraph/contracts.html)
 
 ```mermaid
 flowchart LR
@@ -40,7 +40,7 @@ flowchart LR
 - [Index a workspace (once)](#index-a-workspace-once)
 - [What Claude can do](#what-claude-can-do)
 - [Measuring impact](#measuring-impact)
-- [Cross-repo connections](#cross-repo-connections) — [contracts in depth](docs/contracts.md)
+- [Cross-repo connections](#cross-repo-connections) — [contracts in depth](https://kaleletendre.github.io/wiregraph/contracts.html)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -239,7 +239,7 @@ draft AsyncAPI spec wiring them together — review it, and on confirmation it's
 into your contracts dir as a committable artifact. So the cross-repo graph works out of
 the box, without hand-writing anything. A contract is really just **defined
 communication between two compartments** (services over the wire, a library/SDK's API
-surface, or one program reading another's state) — see **[docs/contracts.md](docs/contracts.md)**
+surface, or one program reading another's state) — see **[the contract-architecture page](https://kaleletendre.github.io/wiregraph/contracts.html)**
 for the full model, the inference flow, and how to author contracts by hand.
 
 ### Packages that import each other in-process

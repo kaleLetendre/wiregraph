@@ -1,6 +1,0 @@
-title: wiregraph
-description: >-
-  A cross-repo call + contract graph for AI coding agents — navigate, audit, and
-  refactor code at ~40–60% fewer tokens than grep + Read. 100% local, no daemon.
-theme: jekyll-theme-cayman
-# Served from /docs on the main branch (Settings → Pages → Deploy from a branch).

@@ -3,7 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>wiregraph — cross-repo call + contract graph for AI coding agents</title>
-<meta name="description" content="A cross-repo call + contract graph for AI coding agents. Index your repos once; Claude works from the full picture while reading about half the tokens. 100% local.">
+<meta name="description" content="A cross-repo call + contract graph for AI coding agents — ~half the tokens, 100% local. Solid edges are calls within a repo; glowing dashed edges are the contracts across repos that grep and ordinary call graphs can't see.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔗</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -158,6 +158,14 @@
   .hero-viz .dots{position:absolute;top:15px;right:16px;display:flex;gap:6px;z-index:2}
   .hero-viz .dots i{width:9px;height:9px;border-radius:50%;display:block;background:var(--line2)}
   .hero-viz .dots i:nth-child(1){background:#ff5f57}.hero-viz .dots i:nth-child(2){background:#febc2e}.hero-viz .dots i:nth-child(3){background:#28c840}
+  .hero-legend{
+    display:flex;gap:18px;flex-wrap:wrap;justify-content:center;
+    padding:10px 8px 4px;font-family:var(--mono);font-size:11px;color:var(--muted);
+  }
+  .hero-legend span{display:inline-flex;align-items:center;gap:7px}
+  .hero-legend .swatch{width:22px;height:0;border-top-width:2px;border-top-style:solid;display:inline-block}
+  .hero-legend .solid{border-color:var(--line2)}
+  .hero-legend .dashed{border-top-style:dashed;border-color:var(--cyan);filter:drop-shadow(0 0 3px var(--cyan))}
 
   /* SVG shared */
   svg{display:block;width:100%;height:auto}
@@ -195,18 +203,15 @@
   .in .meter.bad .fill{width:100%}
   .in .meter.good .fill{width:47%}
 
-  /* ---------- HOW IT WORKS pipeline ---------- */
-  .pipe-viz{margin-top:40px}
-
-  /* ---------- CONTRACTS ---------- */
+  /* ---------- CONTRACTS promo ---------- */
   .contract-viz{margin-top:38px}
-  .det-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-top:34px}
-  .det{padding:20px}
-  .det .ic{width:46px;height:46px;margin-bottom:14px}
-  .det h3{font-family:var(--mono);font-size:15px;margin-bottom:6px}
-  .det .k{font-family:var(--mono);font-size:11px;color:var(--cyan);letter-spacing:.06em;text-transform:uppercase}
-  .det p{color:var(--muted);font-size:13.5px;margin:6px 0 0}
-  .det .ex{font-family:var(--mono);font-size:11.5px;color:var(--dim);margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+  .ca-grid{display:grid;grid-template-columns:1fr 1fr;gap:34px;align-items:center;margin-top:38px}
+  .ca-points{list-style:none;padding:0;margin:0 0 26px;display:flex;flex-direction:column;gap:14px}
+  .ca-points li{display:flex;gap:12px;align-items:flex-start;color:var(--muted);font-size:14.5px}
+  .ca-points li .b{color:var(--cyan);font-family:var(--mono);flex:0 0 auto;margin-top:2px}
+  .ca-points li b{color:var(--ink);font-weight:600}
+  .btn-contract{background:rgba(255,207,107,.1);color:var(--amber);border:1px solid rgba(255,207,107,.32)}
+  .btn-contract:hover{text-decoration:none;border-color:var(--amber);background:rgba(255,207,107,.16);transform:translateY(-2px)}
 
   /* ---------- TOOLS ---------- */
   .tools-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:38px}
@@ -261,7 +266,7 @@
   @media(max-width:900px){
     .hero-grid{grid-template-columns:1fr;gap:38px}
     .pf-grid{grid-template-columns:1fr}
-    .det-grid{grid-template-columns:repeat(2,1fr)}
+    .ca-grid{grid-template-columns:1fr;gap:28px}
     .tools-grid{grid-template-columns:1fr}
     section{padding:70px 20px}
     .menu-toggle{
@@ -284,7 +289,6 @@
     .foot-right{text-align:left}
   }
   @media(max-width:520px){
-    .det-grid{grid-template-columns:1fr}
     .hero-stats{gap:20px}
   }
 
@@ -311,10 +315,10 @@
     </a>
     <nav class="nav-links" id="navlinks" aria-label="Sections">
       <a href="#problem">problem</a>
-      <a href="#how">how it works</a>
       <a href="#contracts">contracts</a>
       <a href="#tools">tools</a>
       <a href="#install">install</a>
+      <a href="contracts.html">contract&nbsp;architecture&nbsp;↗</a>
     </nav>
     <a href="#install" class="nav-cta">Install</a>
     <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu" aria-expanded="false"><span></span></button>
@@ -332,7 +336,7 @@
         <p class="hero-tag">A cross-repo <b>call + contract graph</b> for AI coding agents — <span class="hi">~half the tokens</span>, <b>100% local</b>.</p>
         <div class="cta-row">
           <a href="#install" class="btn btn-primary">Install &nbsp;→</a>
-          <a href="#how" class="btn btn-ghost">See how it works</a>
+          <a href="#contracts" class="btn btn-ghost">See the differentiator</a>
         </div>
         <div class="hero-stats">
           <div class="stat"><div class="n">40–60%</div><div class="l">fewer tokens read</div></div>
@@ -344,56 +348,73 @@
       <div class="hero-viz" aria-label="Animated cross-repo graph">
         <span class="tag">GRAPH.DB</span>
         <span class="dots"><i></i><i></i><i></i></span>
-        <svg id="heroGraph" viewBox="0 0 440 340" role="img" aria-label="A node-and-edge graph with light pulsing along edges, linking symbols across two repositories through a contract node.">
+        <svg id="heroGraph" viewBox="0 0 440 340" role="img" aria-label="Two repositories. Inside each, solid edges connect functions that call each other — an ordinary call graph. Across the two repos there is no call; instead glowing dashed contract edges light up, linking a producer in repo A to a consumer in repo B through a shared contract token that grep and call graphs cannot see.">
           <defs>
             <radialGradient id="nodeGlow" cx="50%" cy="50%" r="50%">
               <stop offset="0%" stop-color="rgba(34,227,201,.25)"/>
               <stop offset="100%" stop-color="rgba(34,227,201,0)"/>
             </radialGradient>
           </defs>
-          <!-- edges (drawn first) -->
-          <g id="heroEdges" stroke-linecap="round">
-            <path class="edge" d="M92,96 L92,196"/>
-            <path class="edge" d="M92,96 L220,64"/>
-            <path class="edge" d="M92,196 L220,64"/>
-            <path class="edge edge-active" d="M92,196 L220,170"/>
-            <path class="edge edge-active" d="M348,120 L220,170"/>
-            <path class="edge" d="M348,120 L348,240"/>
-            <path class="edge" d="M348,240 L220,170"/>
-            <path class="edge" d="M220,64 L348,120"/>
+
+          <!-- repo boundary boxes -->
+          <rect x="18" y="40" width="150" height="270" rx="13" fill="rgba(155,140,255,.035)" stroke="var(--line)" stroke-dasharray="5 5"/>
+          <text x="93" y="60" text-anchor="middle" class="node-label" fill="var(--violet)" style="font-size:9.5px;letter-spacing:.12em">REPO A</text>
+          <rect x="272" y="40" width="150" height="270" rx="13" fill="rgba(92,240,138,.035)" stroke="var(--line)" stroke-dasharray="5 5"/>
+          <text x="347" y="60" text-anchor="middle" class="node-label" fill="var(--green)" style="font-size:9.5px;letter-spacing:.12em">REPO B</text>
+
+          <!-- ===== solid CALL edges INSIDE each repo (call graph) ===== -->
+          <g id="heroCallEdges" stroke-linecap="round">
+            <path class="edge" d="M62,110 L118,150"/>
+            <path class="edge" d="M118,150 L70,205"/>
+            <path class="edge" d="M118,150 L120,255"/>
+            <path class="edge" d="M378,110 L322,150"/>
+            <path class="edge" d="M322,150 L376,205"/>
+            <path class="edge" d="M322,150 L320,255"/>
           </g>
-          <!-- contract node -->
-          <g class="node node-lit" transform="translate(220,170)">
-            <rect class="node-body" x="-46" y="-20" width="92" height="40" rx="9" fill="rgba(255,207,107,.08)" stroke="var(--amber)" style="filter:drop-shadow(0 0 8px rgba(255,207,107,.5))"/>
-            <text class="node-label" x="0" y="-2" text-anchor="middle" fill="var(--amber)">contract</text>
-            <text class="node-label" x="0" y="12" text-anchor="middle" fill="var(--dim)" style="font-size:9px">/api/register</text>
+
+          <!-- ===== dashed CONTRACT edges ACROSS repos (through contract node) ===== -->
+          <g id="heroContractEdges" stroke-linecap="round">
+            <path id="hcA" class="edge" d="M118,150 L200,180" stroke-dasharray="5 6"/>
+            <path id="hcB" class="edge" d="M322,150 L240,180" stroke-dasharray="5 6"/>
           </g>
+          <!-- the (missing) direct call across repos -->
+          <path class="edge" d="M118,150 Q220,300 322,150" stroke="var(--red)" stroke-dasharray="3 6" opacity=".4"/>
+          <text x="220" y="298" text-anchor="middle" class="node-label" fill="var(--red)" style="font-size:8.5px" opacity=".65">no code-level call ✕</text>
+
+          <!-- contract node in the seam -->
+          <g id="hContract" class="node" transform="translate(220,180)">
+            <rect class="node-body contract-shape" x="-40" y="-17" width="80" height="34" rx="8" fill="rgba(255,207,107,.06)" stroke="var(--line2)"/>
+            <text class="node-label" x="0" y="-3" text-anchor="middle" fill="var(--muted)" style="font-size:9px">contract</text>
+            <text class="node-label" x="0" y="9" text-anchor="middle" fill="var(--dim)" style="font-size:8px">/api/register</text>
+          </g>
+
           <!-- repo A nodes -->
-          <g class="node" data-node transform="translate(92,96)">
-            <circle cx="0" cy="0" r="24" fill="url(#nodeGlow)"/>
-            <circle class="node-body" cx="0" cy="0" r="18"/>
-            <text class="node-label" x="0" y="34" text-anchor="middle" fill="var(--muted)" style="font-size:9.5px">emit()</text>
+          <g class="node node-lit" data-node transform="translate(118,150)">
+            <circle cx="0" cy="0" r="22" fill="url(#nodeGlow)"/>
+            <circle class="node-body" cx="0" cy="0" r="16" stroke="var(--violet)"/>
+            <text class="node-label" x="0" y="3" text-anchor="middle" fill="var(--ink)" style="font-size:8.5px">emit()</text>
           </g>
-          <g class="node" data-node transform="translate(92,196)">
-            <circle class="node-body" cx="0" cy="0" r="16"/>
-            <text class="node-label" x="0" y="32" text-anchor="middle" fill="var(--dim)" style="font-size:9px">repo A</text>
-          </g>
-          <g class="node" data-node transform="translate(220,64)">
-            <circle class="node-body" cx="0" cy="0" r="14"/>
-          </g>
+          <g class="node" data-node transform="translate(62,110)"><circle class="node-body" cx="0" cy="0" r="11"/></g>
+          <g class="node" data-node transform="translate(70,205)"><circle class="node-body" cx="0" cy="0" r="11"/></g>
+          <g class="node" data-node transform="translate(120,255)"><circle class="node-body" cx="0" cy="0" r="11"/></g>
+
           <!-- repo B nodes -->
-          <g class="node" data-node transform="translate(348,120)">
-            <circle cx="0" cy="0" r="24" fill="url(#nodeGlow)"/>
-            <circle class="node-body" cx="0" cy="0" r="18"/>
-            <text class="node-label" x="0" y="34" text-anchor="middle" fill="var(--muted)" style="font-size:9.5px">handle()</text>
+          <g class="node node-lit" data-node transform="translate(322,150)">
+            <circle cx="0" cy="0" r="22" fill="url(#nodeGlow)"/>
+            <circle class="node-body" cx="0" cy="0" r="16" stroke="var(--green)"/>
+            <text class="node-label" x="0" y="3" text-anchor="middle" fill="var(--ink)" style="font-size:8px">handle()</text>
           </g>
-          <g class="node" data-node transform="translate(348,240)">
-            <circle class="node-body" cx="0" cy="0" r="16"/>
-            <text class="node-label" x="0" y="32" text-anchor="middle" fill="var(--dim)" style="font-size:9px">repo B</text>
-          </g>
+          <g class="node" data-node transform="translate(378,110)"><circle class="node-body" cx="0" cy="0" r="11"/></g>
+          <g class="node" data-node transform="translate(376,205)"><circle class="node-body" cx="0" cy="0" r="11"/></g>
+          <g class="node" data-node transform="translate(320,255)"><circle class="node-body" cx="0" cy="0" r="11"/></g>
+
           <!-- traveling pulses injected by JS -->
           <g id="heroPulses"></g>
         </svg>
+        <div class="hero-legend">
+          <span><i class="swatch solid"></i> call · within a repo</span>
+          <span><i class="swatch dashed"></i> contract · across repos</span>
+        </div>
       </div>
     </div>
   </section>
@@ -433,155 +454,57 @@
     </div>
   </section>
 
-  <!-- ============ HOW IT WORKS ============ -->
-  <section id="how" aria-label="How it works">
-    <p class="eyebrow reveal">How it works</p>
-    <h2 class="reveal">Source in. <span class="accent">A queryable graph out.</span></h2>
-    <p class="lead reveal d1">tree-sitter parses your files into symbols, calls, and candidates. wiregraph resolves them, links contracts, and stores it all in one local SQLite file that Claude reads through MCP tools.</p>
-
-    <div class="pipe-viz reveal d1">
-      <svg id="pipeSvg" viewBox="0 0 1160 220" role="img" aria-label="Pipeline: source files walk into tree-sitter parsing, which extracts symbols, calls and candidates, then resolve and contracts feed graph.db, which serves MCP tools; edits auto re-index back into the graph.">
-        <defs>
-          <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="var(--line2)"/>
-          </marker>
-        </defs>
-        <!-- connecting flow line -->
-        <g class="edge" stroke-linecap="round">
-          <line class="flow-track" x1="150" y1="90" x2="248" y2="90" marker-end="url(#arr)"/>
-          <line class="flow-track" x1="392" y1="90" x2="490" y2="90" marker-end="url(#arr)"/>
-          <line class="flow-track" x1="620" y1="90" x2="718" y2="90" marker-end="url(#arr)"/>
-          <line class="flow-track" x1="852" y1="90" x2="950" y2="90" marker-end="url(#arr)"/>
-        </g>
-        <!-- animated flow dash overlay -->
-        <path id="flowPath" class="anim-flow" d="M150,90 H248 M392,90 H490 M620,90 H718 M852,90 H950"
-              fill="none" stroke="var(--cyan)" stroke-width="2" stroke-dasharray="8 210"
-              style="filter:drop-shadow(0 0 4px var(--cyan))"/>
-
-        <!-- step 1: source -->
-        <g class="pstep">
-          <rect x="18" y="56" width="132" height="68" rx="11" class="node-body"/>
-          <text x="84" y="86" text-anchor="middle" class="node-label" style="font-size:12px" fill="var(--ink)">source files</text>
-          <text x="84" y="104" text-anchor="middle" class="node-label" fill="var(--dim)" style="font-size:9px">C · TS · PY · Java · Kt</text>
-        </g>
-        <!-- step 2: parse -->
-        <g class="pstep">
-          <rect x="250" y="46" width="142" height="88" rx="11" class="node-body" stroke="var(--violet)"/>
-          <text x="321" y="72" text-anchor="middle" class="node-label" fill="var(--violet)">🌳 tree-sitter</text>
-          <text x="321" y="90" text-anchor="middle" class="node-label" fill="var(--muted)" style="font-size:9px">symbols · calls</text>
-          <text x="321" y="104" text-anchor="middle" class="node-label" fill="var(--muted)" style="font-size:9px">candidates</text>
-        </g>
-        <!-- step 3: resolve/contracts -->
-        <g class="pstep">
-          <rect x="492" y="46" width="128" height="88" rx="11" class="node-body" stroke="var(--amber)"/>
-          <text x="556" y="80" text-anchor="middle" class="node-label" fill="var(--amber)">resolve</text>
-          <text x="556" y="100" text-anchor="middle" class="node-label" fill="var(--amber)">+ contracts</text>
-        </g>
-        <!-- step 4: db -->
-        <g class="pstep node-lit">
-          <rect x="720" y="46" width="132" height="88" rx="11" class="node-body" fill="rgba(34,227,201,.06)" stroke="var(--cyan)" style="filter:drop-shadow(0 0 8px rgba(34,227,201,.4))"/>
-          <text x="786" y="80" text-anchor="middle" class="node-label" fill="var(--cyan)" style="font-size:13px;font-weight:700">🗄️ graph.db</text>
-          <text x="786" y="100" text-anchor="middle" class="node-label" fill="var(--muted)" style="font-size:9px">SQLite · local</text>
-        </g>
-        <!-- step 5: mcp -->
-        <g class="pstep">
-          <rect x="952" y="46" width="132" height="88" rx="11" class="node-body" stroke="var(--green)"/>
-          <text x="1018" y="80" text-anchor="middle" class="node-label" fill="var(--green)">🔧 MCP tools</text>
-          <text x="1018" y="100" text-anchor="middle" class="node-label" fill="var(--muted)" style="font-size:9px">→ Claude</text>
-        </g>
-        <!-- auto re-index loop -->
-        <path class="edge" d="M84,124 Q84,190 786,190 Q820,190 820,134" fill="none" stroke-dasharray="4 5" marker-end="url(#arr)"/>
-        <text x="440" y="205" text-anchor="middle" class="node-label" fill="var(--dim)" style="font-size:9.5px">✏️ you edit code · auto re-index, one file at a time</text>
-      </svg>
-    </div>
-  </section>
-
-  <!-- ============ CROSS-REPO CONTRACTS ============ -->
-  <section id="contracts" aria-label="Cross-repo contracts">
+  <!-- ============ WORKS WITH YOUR CONTRACT ARCHITECTURE ============ -->
+  <section id="contracts" aria-label="Works with your contract architecture">
     <p class="eyebrow reveal">The differentiator</p>
-    <h2 class="reveal">Links code <span class="accent">across repos</span> — through contracts.</h2>
-    <p class="lead reveal d1">Two repos never call each other in code. They share only a token — a route, a topic, an env var, an import. The instant they do, wiregraph draws the seam.</p>
+    <h2 class="reveal">Works with your <span class="accent">contract architecture.</span></h2>
+    <p class="lead reveal d1">Within a repo, calls resolve by name. Across repos there's usually <b>no call at all</b> — code communicates through a shared shape. wiregraph detects that shape and draws the seam a call graph can't see.</p>
 
-    <div class="contract-viz reveal d1">
-      <svg id="contractSvg" viewBox="0 0 900 260" role="img" aria-label="A producer symbol in repo A and a consumer symbol in repo B, with no direct call between them, both reference the same contract token, which lights up and links them producer to consumer.">
-        <!-- repo A box -->
-        <rect x="20" y="40" width="220" height="180" rx="14" fill="rgba(155,140,255,.04)" stroke="var(--line)" stroke-dasharray="5 5"/>
-        <text x="130" y="66" text-anchor="middle" class="node-label" fill="var(--violet)" style="letter-spacing:.1em">REPO A · producer</text>
-        <!-- repo B box -->
-        <rect x="660" y="40" width="220" height="180" rx="14" fill="rgba(92,240,138,.04)" stroke="var(--line)" stroke-dasharray="5 5"/>
-        <text x="770" y="66" text-anchor="middle" class="node-label" fill="var(--green)" style="letter-spacing:.1em">REPO B · consumer</text>
-
-        <!-- producer node -->
-        <g id="cProd" class="node" transform="translate(130,140)">
-          <circle class="node-body" cx="0" cy="0" r="30" stroke="var(--violet)"/>
-          <text class="node-label" x="0" y="4" text-anchor="middle" fill="var(--ink)" style="font-size:10px">emit_</text>
-          <text class="node-label" x="0" y="16" text-anchor="middle" fill="var(--ink)" style="font-size:10px">register()</text>
-        </g>
-        <!-- consumer node -->
-        <g id="cCons" class="node" transform="translate(770,140)">
-          <circle class="node-body" cx="0" cy="0" r="30" stroke="var(--green)"/>
-          <text class="node-label" x="0" y="4" text-anchor="middle" fill="var(--ink)" style="font-size:10px">handle</text>
-          <text class="node-label" x="0" y="16" text-anchor="middle" fill="var(--ink)" style="font-size:10px">Register()</text>
-        </g>
-
-        <!-- edges to contract -->
-        <path id="cEdgeA" class="edge" d="M160,140 L400,140"/>
-        <path id="cEdgeB" class="edge" d="M740,140 L500,140"/>
-        <!-- the (missing) direct call -->
-        <path class="edge" d="M160,182 Q450,250 740,182" stroke="var(--red)" stroke-dasharray="4 6" opacity=".5"/>
-        <text x="450" y="242" text-anchor="middle" class="node-label" fill="var(--red)" style="font-size:9.5px" opacity=".7">no code-level call ✕</text>
-
-        <!-- contract node -->
-        <g id="cContract" class="node" transform="translate(450,140)">
-          <polygon class="node-body contract-shape" points="-52,-26 52,-26 62,0 52,26 -52,26 -62,0" fill="rgba(255,207,107,.06)" stroke="var(--line2)"/>
-          <text class="node-label" x="0" y="-4" text-anchor="middle" fill="var(--muted)" style="font-size:10px">contract</text>
-          <text class="node-label" x="0" y="10" text-anchor="middle" fill="var(--dim)" style="font-size:9px">/api/register</text>
-        </g>
-        <g id="cPulses"></g>
-      </svg>
-    </div>
-
-    <div class="det-grid">
-      <div class="card det reveal d1">
-        <svg class="ic" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-          <path d="M10 24h10M28 24h10" stroke="var(--cyan)" stroke-width="2.4" stroke-linecap="round"/>
-          <circle cx="24" cy="24" r="6" stroke="var(--cyan)" stroke-width="2.4"/>
-          <circle cx="10" cy="24" r="3" fill="var(--cyan)"/><circle cx="38" cy="24" r="3" fill="var(--cyan)"/>
-        </svg>
-        <div class="k">wire</div>
-        <h3>HTTP routes</h3>
-        <p>A route one repo serves and another calls.</p>
-        <div class="ex">/api/register</div>
+    <div class="ca-grid">
+      <div class="reveal d1">
+        <ul class="ca-points">
+          <li><span class="b">→</span><div>A route, a queue topic, an env var, or an imported package — when a token appears in <b>2+ repos</b>, wiregraph mints a <b>Contract node</b>.</div></li>
+          <li><span class="b">→</span><div>Producer and consumer both link to it with <b>REFERENCES</b> edges, so Claude can trace <b>producer → contract → consumer</b> across the boundary.</div></li>
+          <li><span class="b">→</span><div>Rename one side and the seam is right there — no grep, no guessing which of your services just broke.</div></li>
+        </ul>
+        <a href="contracts.html" class="btn btn-contract">What is contract architecture? &nbsp;→</a>
       </div>
-      <div class="card det reveal d2">
-        <svg class="ic" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-          <rect x="8" y="18" width="12" height="12" rx="2" stroke="var(--violet)" stroke-width="2.4"/>
-          <rect x="28" y="18" width="12" height="12" rx="2" stroke="var(--violet)" stroke-width="2.4"/>
-          <path d="M20 24h8" stroke="var(--violet)" stroke-width="2.4" stroke-dasharray="2 3"/>
+
+      <div class="contract-viz reveal d2">
+        <svg id="contractSvg" viewBox="0 0 460 300" role="img" aria-label="A producer symbol in repo A and a consumer symbol in repo B, with no direct call between them, both reference the same contract token, which lights up and links them producer to consumer.">
+          <!-- repo A box -->
+          <rect x="14" y="30" width="150" height="200" rx="13" fill="rgba(155,140,255,.04)" stroke="var(--line)" stroke-dasharray="5 5"/>
+          <text x="89" y="52" text-anchor="middle" class="node-label" fill="var(--violet)" style="font-size:9.5px;letter-spacing:.1em">REPO A · producer</text>
+          <!-- repo B box -->
+          <rect x="296" y="30" width="150" height="200" rx="13" fill="rgba(92,240,138,.04)" stroke="var(--line)" stroke-dasharray="5 5"/>
+          <text x="371" y="52" text-anchor="middle" class="node-label" fill="var(--green)" style="font-size:9.5px;letter-spacing:.1em">REPO B · consumer</text>
+
+          <!-- producer node -->
+          <g id="cProd" class="node" transform="translate(89,130)">
+            <circle class="node-body" cx="0" cy="0" r="22" stroke="var(--violet)"/>
+            <text class="node-label" x="0" y="41" text-anchor="middle" fill="var(--ink)" style="font-size:9px">emit_register()</text>
+          </g>
+          <!-- consumer node -->
+          <g id="cCons" class="node" transform="translate(371,130)">
+            <circle class="node-body" cx="0" cy="0" r="22" stroke="var(--green)"/>
+            <text class="node-label" x="0" y="41" text-anchor="middle" fill="var(--ink)" style="font-size:9px">handleRegister()</text>
+          </g>
+
+          <!-- edges to contract -->
+          <path id="cEdgeA" class="edge" d="M111,130 L200,130" stroke-dasharray="5 6"/>
+          <path id="cEdgeB" class="edge" d="M349,130 L260,130" stroke-dasharray="5 6"/>
+          <!-- the (missing) direct call -->
+          <path class="edge" d="M111,170 Q230,250 349,170" stroke="var(--red)" stroke-dasharray="4 6" opacity=".5"/>
+          <text x="230" y="244" text-anchor="middle" class="node-label" fill="var(--red)" style="font-size:9px" opacity=".7">no code-level call ✕</text>
+
+          <!-- contract node -->
+          <g id="cContract" class="node" transform="translate(230,130)">
+            <polygon class="node-body contract-shape" points="-42,-22 42,-22 52,0 42,22 -42,22 -52,0" fill="rgba(255,207,107,.06)" stroke="var(--line2)"/>
+            <text class="node-label" x="0" y="-3" text-anchor="middle" fill="var(--muted)" style="font-size:9.5px">contract</text>
+            <text class="node-label" x="0" y="10" text-anchor="middle" fill="var(--dim)" style="font-size:8.5px">/api/register</text>
+          </g>
+          <g id="cPulses"></g>
         </svg>
-        <div class="k">message</div>
-        <h3>Queues / topics</h3>
-        <p>A topic name a producer emits and a consumer handles.</p>
-        <div class="ex">orders.created</div>
-      </div>
-      <div class="card det reveal d3">
-        <svg class="ic" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-          <path d="M24 10v28M14 18l10-8 10 8" stroke="var(--amber)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-          <circle cx="24" cy="34" r="4" fill="var(--amber)"/>
-        </svg>
-        <div class="k">state</div>
-        <h3>Shared state</h3>
-        <p>An env var or key two services both read or write.</p>
-        <div class="ex">DATABASE_URL</div>
-      </div>
-      <div class="card det reveal d4">
-        <svg class="ic" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-          <path d="M18 14l-8 10 8 10M30 14l8 10-8 10" stroke="var(--green)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <div class="k">import</div>
-        <h3>Library / SDK</h3>
-        <p>An API surface one package exposes and another imports.</p>
-        <div class="ex">import @acme/sdk</div>
       </div>
     </div>
   </section>
@@ -700,13 +623,12 @@
       });
     }, {threshold:.16, rootMargin:'0px 0px -8% 0px'});
     reveals.forEach(function(r){ io.observe(r); });
-    /* meters live inside their card; add 'in' to the card triggers the fill via CSS */
   } else {
     reveals.forEach(function(r){ r.classList.add('in'); });
   }
 
   /* ---------- active section in nav ---------- */
-  var navAnchors = Array.prototype.slice.call(document.querySelectorAll('.nav-links a'));
+  var navAnchors = Array.prototype.slice.call(document.querySelectorAll('.nav-links a[href^="#"]'));
   var sections = navAnchors.map(function(a){ return document.querySelector(a.getAttribute('href')); });
   if('IntersectionObserver' in window){
     var so = new IntersectionObserver(function(entries){
@@ -764,35 +686,51 @@
     requestAnimationFrame(frame);
   }
 
-  /* hero graph: pulse along the active (contract) edges continuously, plus light up nodes */
+  /* ---------- HERO: solid call pulses within repos + glowing dashed contract seam ---------- */
   var heroPulses=document.getElementById('heroPulses');
-  var heroEdges=document.querySelectorAll('#heroEdges path');
-  if(heroPulses && heroEdges.length){
-    heroEdges.forEach(function(edge, i){
-      var active = edge.classList.contains('edge-active');
-      var dot=makePulse(heroPulses, active?3.6:2.6);
-      if(active) dot.setAttribute('fill','var(--cyan)');
-      else dot.setAttribute('fill','var(--violet)');
-      animateAlong(edge, dot, active?2200:3400, i*380, true);
+  if(heroPulses){
+    /* subtle violet/green pulses along the in-repo CALL edges */
+    document.querySelectorAll('#heroCallEdges path').forEach(function(edge, i){
+      var isB = i >= 3;
+      var dot=makePulse(heroPulses, 2.4);
+      dot.setAttribute('fill', isB ? 'var(--green)' : 'var(--violet)');
+      dot.style.filter='none';
+      animateAlong(edge, dot, 3200, i*300, true);
     });
-    /* rhythmic node light-up */
-    var heroNodes=document.querySelectorAll('#heroGraph .node[data-node]');
-    var ni=0;
+
+    /* the star of the show: the dashed CONTRACT edges light up, then loop bright pulses */
+    var hcA=document.getElementById('hcA'), hcB=document.getElementById('hcB');
+    var hContract=document.getElementById('hContract');
+    function litSeam(){
+      hcA.classList.add('edge-active'); hcB.classList.add('edge-active');
+      hcA.setAttribute('stroke','var(--cyan)'); hcB.setAttribute('stroke','var(--cyan)');
+      hcA.setAttribute('stroke-width','2'); hcB.setAttribute('stroke-width','2');
+      hcA.style.filter='drop-shadow(0 0 5px var(--cyan))'; hcB.style.filter='drop-shadow(0 0 5px var(--cyan))';
+      var shape=hContract.querySelector('.contract-shape');
+      shape.setAttribute('stroke','var(--amber)');
+      shape.setAttribute('fill','rgba(255,207,107,.14)');
+      shape.style.filter='drop-shadow(0 0 10px rgba(255,207,107,.6))';
+    }
+    setTimeout(litSeam, 600);
+    /* bright cyan pulses running the seam producer -> contract -> consumer */
+    var s1=makePulse(heroPulses,4), s2=makePulse(heroPulses,4);
+    setTimeout(function(){
+      animateAlong(hcA, s1, 1700, 0, true);
+      animateAlong(hcB, s2, 1700, 850, true);
+    }, 900);
+
+    /* the two boundary functions breathe together */
+    var lit=document.querySelectorAll('#heroGraph .node-lit');
+    var on=true;
     setInterval(function(){
-      heroNodes.forEach(function(n){ n.classList.remove('node-lit'); });
-      var n=heroNodes[ni % heroNodes.length]; if(n) n.classList.add('node-lit');
-      ni++;
+      lit.forEach(function(n){
+        n.querySelector('.node-body').style.filter = on ? 'drop-shadow(0 0 8px rgba(34,227,201,.7))' : 'drop-shadow(0 0 3px rgba(34,227,201,.3))';
+      });
+      on=!on;
     }, 1100);
   }
 
-  /* pipeline flow: animate the dash offset */
-  var flow=document.getElementById('flowPath');
-  if(flow){
-    var off=0;
-    (function tick(){ off-=1.4; flow.setAttribute('stroke-dashoffset', off); requestAnimationFrame(tick); })();
-  }
-
-  /* contract section: light up on scroll into view, then loop pulses */
+  /* ---------- CONTRACT promo: light up on scroll into view, then loop pulses ---------- */
   var contractSvg=document.getElementById('contractSvg');
   if(contractSvg && 'IntersectionObserver' in window){
     var started=false;
@@ -803,9 +741,10 @@
           var contract=document.getElementById('cContract');
           var eA=document.getElementById('cEdgeA'), eB=document.getElementById('cEdgeB');
           var cp=document.getElementById('cPulses');
-          /* light the seam */
           setTimeout(function(){
             eA.classList.add('edge-active'); eB.classList.add('edge-active');
+            eA.setAttribute('stroke','var(--cyan)'); eB.setAttribute('stroke','var(--cyan)');
+            eA.style.filter='drop-shadow(0 0 4px var(--cyan))'; eB.style.filter='drop-shadow(0 0 4px var(--cyan))';
             var shape=contract.querySelector('.contract-shape');
             shape.setAttribute('stroke','var(--amber)');
             shape.setAttribute('fill','rgba(255,207,107,.14)');
@@ -813,7 +752,6 @@
             document.getElementById('cProd').classList.add('node-lit');
             document.getElementById('cCons').classList.add('node-lit');
           }, 400);
-          /* looping pulses producer -> contract -> consumer */
           var p1=makePulse(cp,4); p1.setAttribute('fill','var(--violet)');
           var p2=makePulse(cp,4); p2.setAttribute('fill','var(--green)');
           setTimeout(function(){
