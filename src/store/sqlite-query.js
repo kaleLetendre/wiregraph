@@ -147,12 +147,18 @@ function trace(db, project, name, repo, file, depth, direction, includeTests) {
   const out = [];
   const shown = new Set([seed.id]);
   const arrow = direction === 'callers' ? '◄ ' : '→ ';
+  // Count EVERY ambiguous edge encountered (even ones whose subtree is collapsed as
+  // "already shown"), so the trace-level caveat below reflects the true uncertainty
+  // — the per-line "~ambiguous" marker is dropped on a second visit, and the model
+  // is told to trust results, so uncertainty must also travel as a header.
+  let ambCount = 0;
   function walk(id, prefix, depthN) {
     const kids = (childrenOf.get(id) || []).slice().sort((x, y) => (y.count || 0) - (x.count || 0));
     for (const k of kids) {
       const m = meta.get(k.id) || {};
-      const amb = k.resolution === 'ambiguous' ? ' ~ambiguous' : '';
-      out.push(`${prefix}${arrow}${m.file}:${m.startLine} ${m.name}${amb}`);
+      const isAmb = k.resolution === 'ambiguous';
+      if (isAmb) ambCount++;
+      out.push(`${prefix}${arrow}${m.file}:${m.startLine} ${m.name}${isAmb ? ' ~ambiguous' : ''}`);
       if (!shown.has(k.id) && depthN < 12) { shown.add(k.id); walk(k.id, prefix + '   ', depthN + 1); }
       else if (childrenOf.has(k.id)) out.push(`${prefix}   … (already shown)`);
     }
@@ -160,8 +166,14 @@ function trace(db, project, name, repo, file, depth, direction, includeTests) {
   const head = `${seed.repo}:${seed.file}:${seed.startLine} ${seed.name}`;
   walk(seed.id, '', 0);
   const note = includeTests ? '' : '\n(test files excluded; includeTests=true to show)';
+  // Data-triggered caveat: only when the tree actually holds ambiguous edges, so a
+  // clean trace pays nothing. Calls resolve by NAME, so a collision fans one call to
+  // several same-named symbols — those branches are possibilities, not facts.
+  const ambNote = ambCount
+    ? `\n⚠ ${ambCount} branch(es) marked ~ambiguous: the call resolves by name and collided with several same-named symbols — treat those as one-of-several, not certainty. (Also blind to callback/function-pointer and string-literal dispatch.)`
+    : '';
   if (!out.length) return { seeds, text: `${loc(seed)}\n  (${direction === 'callers' ? 'no resolvable callers' : 'calls nothing resolvable'} within its repo)` };
-  return { seeds, text: head + '\n' + out.join('\n') + note };
+  return { seeds, text: head + '\n' + out.join('\n') + note + ambNote };
 }
 
 export function traceCallers(db, project, name, repo, file, depth, includeTests) {

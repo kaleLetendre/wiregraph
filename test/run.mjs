@@ -554,6 +554,15 @@ async function exportHtmlTests() {
   const html = readFileSync(out, 'utf8');
   ok(!html.includes('cdn.jsdelivr'), 'export-html: d3 is inlined, no CDN reference (offline)');
   ok(html.includes('forceSimulation') && html.includes('const DATA ='), 'export-html: embeds a d3 force graph with data');
+
+  // Missing d3 bundle must FAIL LOUD, not silently swap in a CDN <script> (that
+  // would break "100% local"). --allow-cdn is the explicit opt-out.
+  const { d3ScriptTag } = await import('../src/export-html.js');
+  let threw = false;
+  try { d3ScriptTag(false, '/no/such/d3.min.js'); } catch { threw = true; }
+  ok(threw, 'export-html: missing d3 bundle throws without --allow-cdn');
+  ok(d3ScriptTag(true, '/no/such/d3.min.js').includes('cdn.jsdelivr'), 'export-html: --allow-cdn falls back to CDN explicitly');
+
   rmSync(proj, { recursive: true, force: true });
 }
 

@@ -29,13 +29,19 @@ const PLUGIN_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const D3_BUNDLE = join(PLUGIN_DIR, 'node_modules', 'd3', 'dist', 'd3.min.js');
 
 // Inline the vendored d3 so the page renders with zero network access (the whole
-// point of wiregraph is that nothing leaves the machine). Fall back to the CDN
-// only if the bundle isn't installed — a graceful degrade, not the happy path.
-function d3ScriptTag() {
+// point of wiregraph is that nothing leaves the machine). If the bundle is missing
+// we FAIL LOUD rather than silently emitting a CDN <script> — a quiet CDN swap
+// breaks the "100% local" promise on an air-gapped machine (blank page, no error).
+// --allow-cdn is the explicit, opt-in escape hatch.
+export function d3ScriptTag(allowCdn, bundlePath = D3_BUNDLE) {
   try {
-    return `<script>${readFileSync(D3_BUNDLE, 'utf8')}</script>`;
+    return `<script>${readFileSync(bundlePath, 'utf8')}</script>`;
   } catch {
-    return '<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>';
+    if (allowCdn) return '<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>';
+    throw new Error(
+      `d3 bundle not found at ${D3_BUNDLE}. The offline visualization needs it — run `
+      + `\`npm install\` in the plugin dir, or pass --allow-cdn to load d3 from a CDN `
+      + `(requires network; not "100% local").`);
   }
 }
 
@@ -52,13 +58,14 @@ const PALETTE = ['#E15554', '#4D9DE0', '#3BB273', '#7768AE', '#E67E22', '#1B9AAA
 const CONTRACT_COLOR = '#F2C94C';
 
 function parseArgs(argv) {
-  const o = { out: null, all: false, tests: false, contract: null, up: 3, down: 1, project: null, db: null, open: false, functions: false };
+  const o = { out: null, all: false, tests: false, contract: null, up: 3, down: 1, project: null, db: null, open: false, functions: false, allowCdn: false };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all') o.all = true;
     else if (a === '--include-tests') o.tests = true;
     else if (a === '--functions') o.functions = true;
+    else if (a === '--allow-cdn') o.allowCdn = true;
     else if (a === '--open') o.open = true;
     else if (a === '--contract') o.contract = argv[++i];
     else if (a === '--up') o.up = parseInt(argv[++i], 10);
@@ -148,19 +155,19 @@ async function main() {
 
   const title = opts.contract || (opts.all ? 'full graph' : repoMode ? 'contracts × repos' : 'contract references');
   const data = { nodes: built.nodes, links: built.links, repos, repoColor, contractColor: CONTRACT_COLOR, title, aggregated: repoMode };
-  writeFileSync(opts.out, renderHtml(data));
+  writeFileSync(opts.out, renderHtml(data, { allowCdn: opts.allowCdn }));
   process.stderr.write(`wrote ${data.nodes.length} nodes / ${data.links.length} links -> ${opts.out}\n`);
   process.stderr.write('repos: ' + repos.map((r) => `${r}=${repoColor[r]}`).join(', ') + '\n');
   if (opts.open) { openInBrowser(opts.out); process.stderr.write(`opening ${opts.out} in your default browser…\n`); }
 }
 
-export function renderHtml(data) {
+export function renderHtml(data, { allowCdn = false } = {}) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <title>wiregraph — ${data.title}</title>
-${d3ScriptTag()}
+${d3ScriptTag(allowCdn)}
 <style>
   html,body { margin:0; height:100%; background:#1b1d23; color:#e6e6e6; font:13px/1.4 system-ui,sans-serif; overflow:hidden; }
   #graph { width:100vw; height:100vh; display:block; cursor:grab; }

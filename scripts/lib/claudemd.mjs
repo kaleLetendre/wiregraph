@@ -4,8 +4,8 @@
 // Claude to reach for the graph first and use it economically. A plugin cannot
 // ship an always-on CLAUDE.md, so /wiregraph-init writes this block into the
 // project's CLAUDE.md (consent-gated, idempotent: replace between the sentinels
-// if present, else append). Teardown removes it. The prose below is the proven
-// "economical" directive (validated across Experiments 5–10), adapted to call the
+// if present, else append). Teardown removes it. The prose below is the
+// "economical" directive, kept deliberately tight, adapted to call the
 // registered MCP tools and to mention the auto-update path.
 //
 // Library + thin CLI:

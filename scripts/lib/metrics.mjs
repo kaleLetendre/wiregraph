@@ -28,6 +28,7 @@
 import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, renameSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { readState, wiregraphDir, findIndexedRoot } from './state.mjs';
+import { block } from './claudemd.mjs';
 
 // Approximate chars-per-token for source code. Good for trend/relative tracking,
 // not for billing. Configurable here if we ever calibrate against a tokenizer.
@@ -38,6 +39,13 @@ const ROTATE_BYTES = 5 * 1024 * 1024;
 // Modeled cost of reconstructing one trace node by hand (a grep + a confirming
 // read). Stated as an assumption wherever it is used — never a precise number.
 const ASSUMED_PER_NODE_TOKENS = 120;
+// wiregraph's own recurring context tax, carried EVERY turn regardless of savings:
+// the CLAUDE.md directive (measured live from the installed block) plus the MCP
+// tool schemas the client keeps in context. The savings above are GROSS; a session
+// only nets positive once cumulative savings exceed this tax × turns. Honesty
+// demands showing it — the old dashboard counted only the win side.
+const TOOL_SCHEMA_TOKENS = 720; // ~10 tool defs + params, est. chars/DIV
+function contextTaxPerTurn() { return estTokens(block()) + TOOL_SCHEMA_TOKENS; }
 
 export function estTokens(s) {
   if (!s) return 0;
@@ -202,7 +210,7 @@ export function formatReport(agg, project) {
   const row = (label, n, b) => `     ${label.padEnd(31)}  ~${fmt(n).padStart(7)}  ${b}`;
 
   const L = [top, head, bot, ''];
-  L.push(`   ESTIMATED TOKENS SAVED        ~${fmt(saved)}   (${pct}% less than reading whole files)`);
+  L.push(`   ESTIMATED TOKENS SAVED        ~${fmt(saved)}   (${pct}% vs whole-file reads — upper bound)`);
   L.push('');
   L.push('   get_source — read one symbol instead of the whole file');
   L.push(row('reading whole files would cost', oldWay, bar(oldWay, oldWay, BW)));
@@ -217,11 +225,19 @@ export function formatReport(agg, project) {
   L.push(`     ${agg.gapCount} of ${agg.grepTotal} grep(s) searched for a symbol the graph already had`);
   if (agg.gapCount) L.push(`     (~${fmt(agg.gapTokens)} tokens of files opened the slow way — get_source would answer)`);
   L.push('');
+  const tax = contextTaxPerTurn();
+  L.push('   Context cost (the tax, every turn)');
+  L.push(`     ~${fmt(tax)} tokens/turn carried regardless: CLAUDE.md directive + MCP`);
+  L.push('     tool schemas. Savings above are GROSS — a session nets positive only');
+  L.push(`     once cumulative savings clear this tax × turns (~${fmt(tax)} × turns).`);
+  L.push('');
   L.push('   How this is projected');
-  L.push('     • get_source saved = whole-file tokens − returned-symbol tokens —');
-  L.push('       what a full Read would cost, minus what you actually got back.');
+  L.push('     • get_source saved = whole-file tokens − returned-symbol tokens. This is');
+  L.push('       an UPPER BOUND — a targeted Read (offset/limit) would also skip some.');
   L.push(`     • traces are MODELED: a tree returned in one query vs. walking it by`);
   L.push(`       hand at ~${ASSUMED_PER_NODE_TOKENS} tok/node. Shown apart; never in the headline.`);
+  L.push(`     • the context tax above is NOT subtracted from the headline — compare it`);
+  L.push('       yourself against savings to judge whether the graph paid for itself.');
   L.push(`     • tokens ≈ chars ÷ ${DIV} (a proxy). Local estimate, not billed tokens.`);
   L.push('');
   L.push(`   ${agg.events} events · counterfactual estimate · never leaves your machine`);

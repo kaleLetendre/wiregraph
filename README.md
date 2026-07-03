@@ -4,10 +4,13 @@ wiregraph indexes your codebase into a structured graph of its symbols and how t
 connect. It makes Claude a better **engineer** on your codebase — not just a better
 search box: when it implements a feature, fixes a bug, or refactors, it works from the
 full picture (every caller, the real blast radius, cross-repo wiring) instead of a
-partial grep — so changes land in the right places. And it gets there reading **about
-half as much** (≈40–60% fewer tokens in internal A/B testing), which also means
-**faster, cheaper** turns. Everything stays local — the graph is just a file in your
-workspace, nothing is uploaded. **Set it up once and forget it.**
+partial grep — so changes land in the right places. And it gets there reading **far
+less** — returning one symbol, or a whole call-tree, in a single query instead of
+full-file reads and repeated greps. On navigation-heavy work that's **roughly half
+the file bytes** a grep-and-read would pull; `/wiregraph-stats` measures it locally
+per project as an upper-bound estimate. That means **faster, cheaper** turns.
+Everything stays local — the graph is just a file in your workspace, nothing is
+uploaded. **Set it up once and forget it.**
 
 📖 **Docs:** <https://kaleletendre.github.io/wiregraph/> — and [what contract architecture is](https://kaleletendre.github.io/wiregraph/contracts.html)
 
@@ -184,9 +187,12 @@ Want to see whether it's actually paying off? `/wiregraph-status` ends with a
 
 These are **local estimates under a counterfactual**, on a chars-per-token proxy —
 useful for spotting trends and where the graph is being skipped, **not** billed-token
-accounting (the ≈40–60% figure at the top of this README comes from controlled A/B
-runs, a stronger measurement). Recording is on for any active project and silent when
-the posture is `off`; set `WIREGRAPH_METRICS=0` to turn it off entirely.
+accounting. The "about half" figure is an **upper-bound** estimate against reading
+whole files; it does not yet net out wiregraph's own per-turn context cost (the
+CLAUDE.md directive + MCP tool schemas the model carries each turn), which
+`/wiregraph-stats` now shows alongside it. Treat it as a directional trend, not a
+guarantee. Recording is on for any active project and silent when the posture is
+`off`; set `WIREGRAPH_METRICS=0` to turn it off entirely.
 
 ## Cross-repo connections
 
