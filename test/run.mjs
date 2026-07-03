@@ -375,6 +375,15 @@ async function resolutionTests() {
   eq(S.findIndexedRoot(deep), realpathSync(ws), 'findIndexedRoot: walks up to the workspace root from a sub-repo');
   const orphan = mkdtempSync(join(tmpdir(), 'cg-orph-'));
   eq(S.findIndexedRoot(orphan), null, 'findIndexedRoot: null for an uninitialized tree');
+
+  // `state.mjs check` is the /wiregraph-init reroute detector: it must report an
+  // already-indexed project (from a sub-repo too) so init can steer to rebuild.
+  const STATE = join(HERE, '..', 'scripts', 'lib', 'state.mjs');
+  const fromSub = (await execFileP('node', [STATE, 'check', deep])).stdout;
+  ok(/^indexed: yes$/m.test(fromSub) && /sameDir: no/.test(fromSub), 'check: reports indexed from a sub-repo (sameDir:no)');
+  const fromNone = (await execFileP('node', [STATE, 'check', orphan])).stdout;
+  eq(fromNone.trim(), 'indexed: no', 'check: reports not-indexed for an uninitialized tree');
+
   rmSync(ws, { recursive: true, force: true });
   rmSync(orphan, { recursive: true, force: true });
 }
@@ -531,6 +540,23 @@ async function importsTest() {
   rmSync(work, { recursive: true, force: true });
 }
 
+// HTML visualization export must be a self-contained, offline file: d3 inlined
+// (no CDN), with the graph data + force sim embedded. This is what /wiregraph-visualize
+// generates and opens — a network fetch here would break the 100%-local promise.
+async function exportHtmlTests() {
+  const proj = mkdtempSync(join(tmpdir(), 'cg-html-'));
+  cpSync(FIXTURE, join(proj, 'repo'), { recursive: true });
+  mkdirSync(join(proj, 'repo', '.git'), { recursive: true });
+  await runBuild({ target: proj, project: proj, db: join(proj, '.wiregraph', 'graph.db'), reset: true });
+  const out = join(proj, 'graph.html');
+  const EXPORT = join(HERE, '..', 'src', 'export-html.js');
+  await execFileP('node', [EXPORT, '--all', '--project', proj, out]);
+  const html = readFileSync(out, 'utf8');
+  ok(!html.includes('cdn.jsdelivr'), 'export-html: d3 is inlined, no CDN reference (offline)');
+  ok(html.includes('forceSimulation') && html.includes('const DATA ='), 'export-html: embeds a d3 force graph with data');
+  rmSync(proj, { recursive: true, force: true });
+}
+
 console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -546,5 +572,6 @@ await messagingTest();
 await stateTest();
 await potentialTest();
 await importsTest();
+await exportHtmlTests();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -9,6 +9,7 @@
     "./commands/wiregraph-status.md",
     "./commands/wiregraph-stats.md",
     "./commands/wiregraph-contracts.md",
+    "./commands/wiregraph-visualize.md",
     "./commands/wiregraph-teardown.md",
     "./commands/wiregraph-remove.md",
     "./commands/wiregraph-build.md"

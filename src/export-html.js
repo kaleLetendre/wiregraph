@@ -17,24 +17,48 @@
 // project's embedded SQLite graph (<project>/.wiregraph/graph.db, or --db <path>);
 // target project defaults to --project or cwd. No Neo4j needed to build or view.
 
-import { writeFileSync, existsSync, realpathSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+import { platform } from 'node:os';
 import { connect } from './store/sqlite.js';
 import { gatherHtml } from './store/sqlite-export.js';
 
 const PLUGIN_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
+const D3_BUNDLE = join(PLUGIN_DIR, 'node_modules', 'd3', 'dist', 'd3.min.js');
+
+// Inline the vendored d3 so the page renders with zero network access (the whole
+// point of wiregraph is that nothing leaves the machine). Fall back to the CDN
+// only if the bundle isn't installed — a graceful degrade, not the happy path.
+function d3ScriptTag() {
+  try {
+    return `<script>${readFileSync(D3_BUNDLE, 'utf8')}</script>`;
+  } catch {
+    return '<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>';
+  }
+}
+
+// Open a file in the OS default browser, detached, so this process can exit.
+function openInBrowser(file) {
+  const cmd = platform() === 'darwin' ? 'open' : platform() === 'win32' ? 'cmd' : 'xdg-open';
+  const args = platform() === 'win32' ? ['/c', 'start', '', file] : [file];
+  const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+  child.on('error', (e) => process.stderr.write(`could not open browser (${e.message}); open ${file} yourself.\n`));
+  child.unref();
+}
 // Must match the palette/order in build.js so HTML colors are stable across runs.
 const PALETTE = ['#E15554', '#4D9DE0', '#3BB273', '#7768AE', '#E67E22', '#1B9AAA', '#D81159', '#8F2D56'];
 const CONTRACT_COLOR = '#F2C94C';
 
 function parseArgs(argv) {
-  const o = { out: null, all: false, tests: false, contract: null, up: 3, down: 1, project: null, db: null };
+  const o = { out: null, all: false, tests: false, contract: null, up: 3, down: 1, project: null, db: null, open: false };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all') o.all = true;
     else if (a === '--include-tests') o.tests = true;
+    else if (a === '--open') o.open = true;
     else if (a === '--contract') o.contract = argv[++i];
     else if (a === '--up') o.up = parseInt(argv[++i], 10);
     else if (a === '--down') o.down = parseInt(argv[++i], 10);
@@ -42,7 +66,9 @@ function parseArgs(argv) {
     else if (a === '--db') o.db = argv[++i];
     else rest.push(a);
   }
-  o.out = rest[0] ? resolve(rest[0]) : join(PLUGIN_DIR, 'wiregraph-graph.html');
+  // Explicit path wins; otherwise default into the project's .wiregraph/ (resolved
+  // in main, once we know the project) so the file lives with the graph, not the plugin.
+  o.out = rest[0] ? resolve(rest[0]) : null;
   return o;
 }
 
@@ -74,6 +100,7 @@ function resolveProject(opts) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const project = resolveProject(opts);
+  if (!opts.out) opts.out = join(project, '.wiregraph', 'graph.html');
   const dbPath = opts.db || process.env.WIREGRAPH_DB || join(project, '.wiregraph', 'graph.db');
   if (!existsSync(dbPath)) { process.stderr.write(`No graph db at ${dbPath}. Run /wiregraph-init or build first.\n`); process.exit(1); }
   const db = connect(dbPath, { readonly: true });
@@ -95,6 +122,7 @@ async function main() {
   writeFileSync(opts.out, renderHtml(data));
   process.stderr.write(`wrote ${data.nodes.length} nodes / ${data.links.length} links -> ${opts.out}\n`);
   process.stderr.write('repos: ' + repos.map((r) => `${r}=${repoColor[r]}`).join(', ') + '\n');
+  if (opts.open) { openInBrowser(opts.out); process.stderr.write(`opening ${opts.out} in your default browser…\n`); }
 }
 
 function renderHtml(data) {
@@ -103,7 +131,7 @@ function renderHtml(data) {
 <head>
 <meta charset="utf-8"/>
 <title>wiregraph — ${data.title}</title>
-<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+${d3ScriptTag()}
 <style>
   html,body { margin:0; height:100%; background:#1b1d23; color:#e6e6e6; font:13px/1.4 system-ui,sans-serif; overflow:hidden; }
   #graph { width:100vw; height:100vh; display:block; cursor:grab; }

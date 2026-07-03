@@ -127,7 +127,7 @@ export function updateState(project, patch, pluginVersion = null) {
 async function main(argv) {
   const [cmd, projectArg, extra] = argv;
   if (!cmd || !projectArg) {
-    process.stderr.write('usage: state.mjs <seed|show|posture|gitignore> <project> [posture-value]\n');
+    process.stderr.write('usage: state.mjs <seed|show|check|posture|gitignore> <project> [posture-value]\n');
     process.exit(2);
   }
   let project = projectArg;
@@ -154,6 +154,21 @@ async function main(argv) {
   if (cmd === 'show') {
     const s = readState(project);
     process.stdout.write(s ? JSON.stringify(s, null, 2) + '\n' : `No state at ${stateFilePath(project)}.\n`);
+    return;
+  }
+  if (cmd === 'check') {
+    // Reroute helper for /wiregraph-init: is <project> (or an ancestor) already
+    // indexed? Prints parse-friendly lines so the command can choose fresh-init
+    // vs reroute-to-rebuild instead of blindly re-running the whole setup.
+    const root = findIndexedRoot(project);
+    if (!root) { process.stdout.write('indexed: no\n'); return; }
+    const s = readState(root) || {};
+    const repoCount = s.reposLastSha ? Object.keys(s.reposLastSha).length : 0;
+    process.stdout.write('indexed: yes\n');
+    process.stdout.write(`root: ${root}\n`);
+    process.stdout.write(`sameDir: ${root === project ? 'yes' : 'no'}\n`);
+    process.stdout.write(`lastFullBuild: ${s.lastFullBuild || 'unknown'}\n`);
+    process.stdout.write(`repos: ${repoCount}\n`);
     return;
   }
   if (cmd === 'posture') {

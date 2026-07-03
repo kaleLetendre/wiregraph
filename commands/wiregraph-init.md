@@ -16,6 +16,27 @@ realpath.
 
 Do the steps in order; stop and report if a step fails.
 
+**First — detect an existing setup and reroute if needed.** Before any of the steps
+below, check whether `<TARGET>` (or a parent workspace) is already indexed:
+
+```
+node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
+```
+
+- `indexed: no` → this is a fresh setup; do all the steps below.
+- `indexed: yes` → wiregraph is **already set up** here (the `root:` line shows where;
+  `sameDir: no` means an ancestor workspace is what's indexed, not `<TARGET>` itself).
+  Re-running full init would redundantly re-confirm scope and re-prompt for the
+  CLAUDE.md directive — what's almost always wanted instead is a **rebuild**. Ask with
+  AskUserQuestion how to proceed, and do **not** silently re-run the full setup:
+  - **Rebuild (recommended)** — regenerate the graph from scratch: call the
+    `update_graph` MCP tool with `{ "full": true }` (equivalent to `/wiregraph-rebuild`),
+    report the new stats, and stop. Right after refactors/renames or a stale/wrong graph.
+  - **Update** — incremental catch-up only: call `update_graph` with no args, report,
+    and stop. Cheapest when little has changed.
+  - **Re-initialize anyway** — only if the user wants to change scope or reinstall the
+    directive. Then continue with the steps below.
+
 1. **Install dependencies (idempotent, one-time).** Pulls the WASM SQLite store
    (`sql.js`) and the tree-sitter parsers — toolchain-free (nothing is compiled:
    sql.js is WebAssembly bundled in the package, tree-sitter ships prebuilt
@@ -71,7 +92,38 @@ Do the steps in order; stop and report if a step fails.
    Confirm to the user that `.wiregraph/` was added to `.gitignore` (the command
    prints whether it added it, it was already present, or there's no `.git` here).
 
-4. **Install the navigation directive** into `<TARGET>/CLAUDE.md`. First show the
+4. **Infer cross-repo contracts (multi-repo workspaces only).** If step 2 indexed
+   **more than one git repo**, auto-run the wire-contract inference now so the
+   cross-repo seams light up without a second command — you don't have to invoke
+   `/wiregraph-contracts` separately or remember to rebuild. **Skip this step
+   entirely** for a SINGLE-REPO or NO-GIT target (there are no cross-repo seams to
+   find), and just note that contracts don't apply.
+
+   a. **Scan (no writes)** and show the user the proposed seams + AsyncAPI YAML:
+
+      ```
+      node ${CLAUDE_PLUGIN_ROOT}/scripts/contracts.mjs scan "<TARGET>"
+      ```
+
+   b. **If it found no seams**, say so and move on — nothing to write. (Common when
+      repos are indexed together but don't actually share a route / topic / env var
+      yet.)
+
+   c. **If it found seams**, ask with AskUserQuestion whether to write the draft
+      contract, making clear it's a heuristic starting point the user owns and
+      should review/commit. On decline, move on — the seams are still reported.
+
+   d. **On yes**, write the draft and rebuild so the seams become graph edges:
+
+      ```
+      node ${CLAUDE_PLUGIN_ROOT}/scripts/contracts.mjs apply "<TARGET>"
+      node ${CLAUDE_PLUGIN_ROOT}/src/build.js "<TARGET>" --reset
+      ```
+
+      Then confirm with the `trace_contract` MCP tool (which symbols in which repos
+      reference the contract) and report the cross-repo edge counts now in the graph.
+
+5. **Install the navigation directive** into `<TARGET>/CLAUDE.md`. First show the
    user what would change, then get explicit consent before writing:
 
    ```
@@ -89,7 +141,7 @@ Do the steps in order; stop and report if a step fails.
    If they decline, continue — the MCP tool descriptions still carry the economy
    guidance, but note the win is strongest with the directive installed.
 
-5. **Auto-update / hooks.** The plugin ships `SessionStart`, `PreToolUse`, and
+6. **Auto-update / hooks.** The plugin ships `SessionStart`, `PreToolUse`, and
    `PostToolUse` hooks; they fire automatically whenever the wiregraph plugin is
    enabled. `SessionStart` catches up on out-of-session changes (and re-asserts
    the directive), `PreToolUse` on `Grep`/`Glob`/`Read` reminds Claude to prefer
@@ -106,7 +158,7 @@ Do the steps in order; stop and report if a step fails.
    If the user's Claude Code does not auto-run plugin hooks, they can enable them
    explicitly in `<TARGET>/.claude/settings.json` (offer this only if asked).
 
-6. **Confirm** by calling the `graph_status` MCP tool. Then summarize: graph
+7. **Confirm** by calling the `graph_status` MCP tool. Then summarize: graph
    built (counts), directive installed (or declined), posture, and that the
    wiregraph MCP tools (`find_symbol`, `get_source`, `trace_callers`,
    `trace_callees`, `trace_contract`, `path_between`, `graph_status`,
@@ -114,6 +166,6 @@ Do the steps in order; stop and report if a step fails.
 
 Note: a project may contain several git repos (wiregraph indexes them all under
 this one project); cross-repo links flow through Contract nodes — see
-`trace_contract` / `path_between`. **If you indexed more than one repo, suggest
-running `/wiregraph-contracts`** — it infers the wire contracts between them from
-the code so those cross-repo seams light up without hand-written specs.
+`trace_contract` / `path_between`. Step 4 already infers those wire contracts for a
+multi-repo workspace; the user can re-run `/wiregraph-contracts` any time to
+re-scan and refine the draft after the workspace changes.
