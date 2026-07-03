@@ -566,6 +566,47 @@ async function exportHtmlTests() {
   rmSync(proj, { recursive: true, force: true });
 }
 
+// Schema safety: a db written by a NEWER wiregraph must never be silently
+// downgraded by a reset rebuild (it would drop the newer tables and lose data).
+async function schemaGuardTest() {
+  const proj = mkdtempSync(join(tmpdir(), 'cg-schema-'));
+  cpSync(FIXTURE, join(proj, 'repo'), { recursive: true });
+  const db = join(proj, '.wiregraph', 'graph.db');
+  await runBuild({ target: proj, project: proj, db, reset: true });
+  const conn = connect(db, {});
+  conn.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION + 1));
+  conn.close();
+  let threw = false;
+  try { await runBuild({ target: proj, project: proj, db, reset: true }); } catch { threw = true; }
+  ok(threw, 'schema: refuses to rebuild over a NEWER-schema db (no silent downgrade)');
+  rmSync(proj, { recursive: true, force: true });
+}
+
+// Structural-drift honesty: an incremental update that renames a symbol must flag
+// structuralDriftSinceFullBuild so graph_status stops certifying a flat "fresh";
+// a full rebuild clears it; a body-only edit does not set it.
+async function structuralDriftTest() {
+  const S = await import('../scripts/lib/state.mjs');
+  const proj = mkdtempSync(join(tmpdir(), 'cg-drift-'));
+  const src = join(proj, 'repo');
+  mkdirSync(src, { recursive: true });
+  writeFileSync(join(src, 'a.js'), 'export function foo(){ return 1; }\nexport function bar(){ return foo(); }\n');
+  const db = join(proj, '.wiregraph', 'graph.db');
+  await runBuild({ target: proj, project: proj, db, reset: true });
+  S.updateState(proj, {}); // ensure state file exists with defaults
+  eq(!!S.readState(proj)?.structuralDriftSinceFullBuild, false, 'drift: clear after full build');
+
+  // rename foo -> qux (a name-set change) via incremental
+  writeFileSync(join(src, 'a.js'), 'export function qux(){ return 1; }\nexport function bar(){ return qux(); }\n');
+  await runBuild({ target: proj, project: proj, db, files: [join(src, 'a.js')] });
+  eq(S.readState(proj)?.structuralDriftSinceFullBuild, true, 'drift: set after an incremental rename');
+
+  // full rebuild clears it
+  await runBuild({ target: proj, project: proj, db, reset: true });
+  eq(!!S.readState(proj)?.structuralDriftSinceFullBuild, false, 'drift: cleared by a full rebuild');
+  rmSync(proj, { recursive: true, force: true });
+}
+
 console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -582,5 +623,7 @@ await stateTest();
 await potentialTest();
 await importsTest();
 await exportHtmlTests();
+await schemaGuardTest();
+await structuralDriftTest();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

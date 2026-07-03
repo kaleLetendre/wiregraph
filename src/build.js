@@ -101,7 +101,7 @@ function fullBuild(opts, root, project) {
   // Persist the cross-repo seam count + detected contracts dir so SessionStart and
   // /wiregraph-status nudge toward /wiregraph-contracts only when there's real,
   // *uncovered* potential (seams found AND no contracts dir present).
-  try { updateState(project, { inferredSeams: clusterSeams(candidates).length, contractsDir: contractsDir || null }); }
+  try { updateState(project, { inferredSeams: clusterSeams(candidates).length, contractsDir: contractsDir || null, structuralDriftSinceFullBuild: false }); }
   catch { /* metadata only — never fail a build over it */ }
 
   const stats = graph.stats();
@@ -159,6 +159,7 @@ function incrementalBuild(opts, root, project) {
     const present = changed.filter((c) => c.exists);
     const fileFilter = new Set(present.map((c) => c.abs));
     const graph = new Graph(project);
+    let structuralDrift = false;
     const { calls } = present.length ? extractCode(graph, root, log, fileFilter) : { calls: [] };
 
     // 2. resolve outgoing calls against the rest of the project (read from the db).
@@ -168,13 +169,20 @@ function incrementalBuild(opts, root, project) {
       // twice (fresh + stale-in-db) and same-file calls get falsely tagged
       // ~ambiguous against their own duplicate.
       const changedKeys = new Set(changed.map((c) => `${c.repo}\0${c.relPath}`));
-      const extraDefs = loadProjectSymbols(db, project).filter((s) => !changedKeys.has(`${s.repo}\0${s.file}`));
+      const allPrior = loadProjectSymbols(db, project);
+      const extraDefs = allPrior.filter((s) => !changedKeys.has(`${s.repo}\0${s.file}`));
       resolveCalls(graph, calls, log, extraDefs);
       const contractsDir = resolveContractsDir(opts, root);
       if (contractsDir) {
         const contracts = loadContracts(graph, contractsDir, log);
         matchContracts(graph, root, contracts, log, fileFilter);
       }
+      // Structural drift: did this update change the symbol NAME-set (add / remove /
+      // rename) rather than only edit a body? If so, callers resolved by name in
+      // UNCHANGED files may be approximate until the next full rebuild.
+      const priorNames = new Set(allPrior.filter((s) => changedKeys.has(`${s.repo}\0${s.file}`)).map((s) => `${s.repo}\0${s.file}\0${s.name}`));
+      const freshNames = new Set([...graph.symbols.values()].map((s) => `${s.repo}\0${s.file}\0${s.name}`));
+      structuralDrift = priorNames.size !== freshNames.size || [...freshNames].some((k) => !priorNames.has(k));
     }
 
     // 3. prune each changed file: drop vanished symbols + surviving symbols'
@@ -187,14 +195,21 @@ function incrementalBuild(opts, root, project) {
       pruneFile(db, project, c.repo, c.relPath, keepIds, log);
     }
 
-    if (!present.length) {
+    // 4. load (no reset — survivors INSERT-OR-REPLACE; outgoing edges recreated).
+    if (present.length) {
+      loadGraph(db, graph, { reset: false, log });
+      log('incremental done.');
+    } else {
       log('  all changed files were deletions — nodes removed, nothing to reload.');
-      return;
+      structuralDrift = true; // removing symbols is a structural change
     }
 
-    // 4. load (no reset — survivors INSERT-OR-REPLACE; outgoing edges recreated).
-    loadGraph(db, graph, { reset: false, log });
-    log('incremental done.');
+    // Honesty: record structural drift so graph_status stops reporting a flat
+    // "fresh" when cross-file caller edges may be stale — a full rebuild reconciles.
+    if (structuralDrift) {
+      try { updateState(project, { structuralDriftSinceFullBuild: true }); }
+      catch { /* metadata only — never fail an update over it */ }
+    }
   } finally {
     db.close();
   }

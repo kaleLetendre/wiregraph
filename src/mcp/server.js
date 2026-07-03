@@ -67,7 +67,9 @@ function withDb(fn, { requireIndexed = true } = {}) {
   try {
     const v = schemaVersion(db);
     if (v !== SCHEMA_VERSION) {
-      return text(`wiregraph DB schema is v${v} but this version expects v${SCHEMA_VERSION}. Run /wiregraph-rebuild to refresh it.`);
+      return text(v > SCHEMA_VERSION
+        ? `wiregraph DB schema is v${v}, NEWER than this plugin (v${SCHEMA_VERSION}). Update wiregraph (/plugin) — do NOT rebuild; that would downgrade the graph and lose data.`
+        : `wiregraph DB schema is v${v} but this version expects v${SCHEMA_VERSION}. Run /wiregraph-rebuild to refresh it.`);
     }
     if (requireIndexed) {
       const n = db.prepare('SELECT count(*) AS c FROM symbols WHERE project = ?').get(PROJECT).c;
@@ -107,6 +109,11 @@ async function ensureSchemaCurrent() {
   catch { return; }
   finally { try { db?.close(); } catch { /* */ } }
   if (v === SCHEMA_VERSION) { schemaConfirmed = true; return; }
+  // A NEWER db (written by a later wiregraph) must NOT be auto-rebuilt — a reset
+  // rebuild recreates the tables at THIS (older) schema, silently downgrading and
+  // discarding whatever the newer version stored. Leave it; withDb surfaces the
+  // "update wiregraph" message instead of quietly destroying data.
+  if (v > SCHEMA_VERSION) return;
   if (!schemaHealPromise) {
     schemaHealPromise = runBuild({ target: PROJECT, project: PROJECT, reset: true })
       .then(() => { schemaConfirmed = true; lastFreshAt = Date.now(); }) // just rebuilt → also fresh
@@ -352,6 +359,12 @@ server.registerTool('graph_status', {
     lines.push(`STALE: ${changed.length} changed source file(s) (${preview}${changed.length > 5 ? ', …' : ''}). Run update_graph to refresh.`);
   } else {
     lines.push('Fresh: no source changes detected since last index.');
+  }
+  // Incremental updates that added/removed/renamed symbols can leave cross-file
+  // caller edges (resolved by name) approximate until a full rebuild. Surface it so
+  // "fresh" is not read as "every caller edge is guaranteed correct."
+  if (state?.structuralDriftSinceFullBuild) {
+    lines.push('Note: symbols were added/removed/renamed since the last full build — some cross-file caller edges may be approximate. Run update_graph {full:true} (/wiregraph-rebuild) to reconcile.');
   }
   // Upstream divergence: the graph mirrors the working tree, so "fresh" can still
   // mean "indexing a branch behind origin". Report ahead/behind vs each repo's

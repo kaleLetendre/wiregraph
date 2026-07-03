@@ -68,6 +68,10 @@ export function defaultState(project, pluginVersion = null) {
     autoUpdate: 'balanced',
     inferredSeams: 0,
     contractsDir: null,
+    // Set by an incremental update that added/removed/renamed a symbol: cross-file
+    // callers resolved by name may be approximate until the next full rebuild.
+    // Cleared by every full build. graph_status surfaces it so "fresh" isn't a lie.
+    structuralDriftSinceFullBuild: false,
   };
 }
 

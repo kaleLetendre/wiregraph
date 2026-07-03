@@ -178,6 +178,11 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
   // the server, which prompts /wiregraph-rebuild). A fresh file reports version 0
   // and is harmlessly (re)created here too.
   const priorVersion = schemaVersion(db);
+  // Never downgrade: a db written by a NEWER wiregraph must not be dropped and
+  // recreated at this older schema (silent data loss). Refuse loudly instead.
+  if (priorVersion > SCHEMA_VERSION) {
+    throw new Error(`refusing to write: db schema v${priorVersion} is newer than this wiregraph (v${SCHEMA_VERSION}). Update wiregraph instead of downgrading the graph.`);
+  }
   if (reset && priorVersion !== SCHEMA_VERSION) {
     for (const t of TABLES) db.exec(`DROP TABLE IF EXISTS ${t}`);
     if (priorVersion) log(`  migrating store schema v${priorVersion} -> v${SCHEMA_VERSION} (recreate)`);
