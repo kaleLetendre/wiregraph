@@ -23,8 +23,8 @@ that's off. **Target** = `${CLAUDE_PROJECT_DIR}` or cwd; call it `<TARGET>`.
 
 2. **Directive present?** Check whether the navigation directive is installed in
    `<TARGET>/CLAUDE.md` (look for the `BEGIN wiregraph (managed)` sentinel). If
-   absent, the token win is reduced — suggest re-running `/wiregraph-init` (step 4)
-   to install it.
+   absent, the token win is reduced — suggest re-running `/wiregraph-init` (its
+   directive-install step) to install it.
 
 3. **State + posture.** Show the state file so the user can see posture and shas:
 

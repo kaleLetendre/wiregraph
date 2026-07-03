@@ -11,7 +11,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { findRepoRoots } from '../../src/extract/walk.js';
+import { findGitRepos } from '../../src/extract/walk.js';
 import { langForFile } from '../../src/extract/lang.js';
 
 // Raw git output — NOT trimmed. `git status --porcelain` encodes file state in
@@ -38,7 +38,7 @@ export function headSha(repoRoot) {
 
 // Returns the project's repos as [{ name, root, head }] (root is the key).
 export function projectRepos(project) {
-  return findRepoRoots(project).map((r) => ({ name: r.name, root: r.dir, head: headSha(r.dir) }));
+  return findGitRepos(project).map((r) => ({ name: r.name, root: r.dir, head: headSha(r.dir) }));
 }
 
 // Compute the source files that changed since reposLastSha across every repo,

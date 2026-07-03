@@ -693,6 +693,22 @@ async function wireCrossCompartmentOnlyTest() {
   ok(wires.some((e) => comp(e.from) === 'Y' && comp(e.to) === 'X'), 'wire: real cross-compartment edge Y -> X kept');
 }
 
+// git.mjs must import cleanly and enumerate GIT repos only — NOT compartments. A
+// package inside a repo is a compartment but has no HEAD of its own, so projectRepos
+// (git SHAs / freshness) must return just the git repo. This also guards the import:
+// git.mjs is used only by hooks/seed, so a broken import (e.g. a stale walk.js export
+// name) sails past the rest of the suite — this test is what catches it.
+async function gitReposTest() {
+  const G = await import('../scripts/lib/git.mjs');
+  const work = mkdtempSync(join(tmpdir(), 'cg-git-'));
+  mkdirSync(join(work, '.git'), { recursive: true });
+  mkdirSync(join(work, 'packages', 'pkg'), { recursive: true });
+  writeFileSync(join(work, 'packages', 'pkg', 'package.json'), '{"name":"pkg"}'); // a compartment, not a git repo
+  const repos = G.projectRepos(realpathSync(work));
+  eq(repos.length, 1, `git: projectRepos returns only the git repo, not the package compartment (got ${repos.length})`);
+  rmSync(work, { recursive: true, force: true });
+}
+
 console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -714,5 +730,6 @@ await structuralDriftTest();
 await distinctivenessTest();
 await monorepoCompartmentTest();
 await wireCrossCompartmentOnlyTest();
+await gitReposTest();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

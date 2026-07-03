@@ -45,7 +45,9 @@ function compartmentNameFor(absPath, compartmentRoots, rootName, rootDir) {
   return { name: rootName, root: rootDir };
 }
 
-function findCompartmentRoots(rootDir) {
+// Generic recursive root finder: collect { dir, name } for every directory the
+// predicate accepts, skipping ignored dirs.
+function findRoots(rootDir, accept) {
   const roots = [];
   (function scan(dir) {
     let entries;
@@ -54,14 +56,24 @@ function findCompartmentRoots(rootDir) {
     } catch {
       return;
     }
-    if (isCompartmentBoundary(dir, entries)) {
-      roots.push({ dir, name: basename(dir) });
-    }
+    if (accept(dir, entries)) roots.push({ dir, name: basename(dir) });
     for (const e of entries) {
       if (e.isDirectory() && !IGNORE_DIRS.has(e.name)) scan(join(dir, e.name));
     }
   })(rootDir);
   return roots;
+}
+
+// Compartments (graph attribution): a boundary is a .git OR a module manifest.
+function findCompartmentRoots(rootDir) {
+  return findRoots(rootDir, isCompartmentBoundary);
+}
+
+// GIT repos only (freshness / change-detection): git SHAs, upstream divergence,
+// and reposLastSha are genuinely per-git-repo, NOT per-compartment — a package
+// inside a repo has no HEAD of its own. So this is a distinct, .git-only scan.
+function findGitRepos(rootDir) {
+  return findRoots(rootDir, (dir, entries) => entries.some((e) => e.name === '.git'));
 }
 
 // Yields { abs, compartment, compartmentRoot, relPath, lang, variant }
@@ -100,4 +112,4 @@ export function* walkSources(rootDir) {
   }
 }
 
-export { findCompartmentRoots, compartmentNameFor };
+export { findCompartmentRoots, compartmentNameFor, findGitRepos };
