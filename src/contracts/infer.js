@@ -1,15 +1,15 @@
-// Contract INFERENCE: turn cross-repo communication signals observed in code —
-// HTTP routes and message topics today — into a draft AsyncAPI 3.0 spec, so
-// wiregraph builds the cross-service graph without hand-written contracts. The
+// Contract INFERENCE: turn cross-compartment communication signals observed in
+// code — HTTP routes and message topics today — into a draft AsyncAPI 3.0 spec,
+// so wiregraph builds the cross-service graph without hand-written contracts. The
 // synthesized spec is consumed by the EXISTING pipeline unchanged (loadContracts
 // -> matchContracts -> buildWireEdges in src/extract/contracts.js).
 //
 // Detectors (src/extract/parse.js) emit candidates { kind, token, role, label };
-// here we cluster the distinctive tokens shared by >= 2 repos into seams and
+// here we cluster the distinctive tokens shared by >= 2 compartments into seams and
 // synthesize one AsyncAPI channel per seam. CRITICAL round-trip: the channel
 // `address` is what collectTokens reads back (a path is {param}-trimmed to a
 // prefix; a non-path topic is matched literally), so the inferred spec lights up
-// REFERENCES edges from every repo that mentions the token. Drafts are PROPOSED,
+// REFERENCES edges from every compartment that mentions the token. Drafts are PROPOSED,
 // evidence-tagged, never silently written — direction is heuristic, the shared
 // token is the real signal.
 
@@ -31,13 +31,13 @@ export function extractCandidates(root, fileFilter = null) {
     let parsed;
     try { parsed = parseSource(src, f.lang, f.variant); } catch { continue; }
     for (const c of parsed.candidates || []) {
-      out.push({ kind: c.kind, token: c.token, role: c.role, label: c.label, repo: f.repo, file: f.relPath, line: c.line });
+      out.push({ kind: c.kind, token: c.token, role: c.role, label: c.label, compartment: f.compartment, file: f.relPath, line: c.line });
     }
   }
   return out;
 }
 
-// --- 2. cluster shared tokens into cross-repo seams -------------------------
+// --- 2. cluster shared tokens into cross-compartment seams ------------------
 // HTTP path -> AsyncAPI address form (`:id`/`<id>` -> `{id}`) so variants group
 // and collectTokens' {param}-trim applies; message topics are kept verbatim.
 export function toAsyncApiPath(p) {
@@ -59,35 +59,36 @@ function channelKey(kind, token) {
 }
 
 // Group candidates by (kind, normalized token); keep tokens that are distinctive
-// AND span >= 2 distinct repos (the cross-repo seam — a single-repo token is not
-// a contract). Returns [{ kind, token, repos, inRepos, outRepos, labels }].
+// AND span >= 2 distinct compartments (the cross-compartment seam — a
+// single-compartment token is not a contract). Returns
+// [{ kind, token, compartments, inCompartments, outCompartments, labels }].
 export function clusterSeams(candidates) {
-  const groups = new Map(); // key -> { kind, token, repos: Map(repo->Set(role)), labels: Set }
+  const groups = new Map(); // key -> { kind, token, compartments: Map(compartment->Set(role)), labels: Set }
   for (const c of candidates) {
     if (c.kind === 'import') continue; // imports become IMPORTS edges, not token-matched contracts
     const tok = normToken(c.kind, c.token);
     if (!isDistinctive(tok)) continue;
     const key = `${c.kind}\0${tok}`;
-    if (!groups.has(key)) groups.set(key, { kind: c.kind, token: tok, repos: new Map(), labels: new Set() });
+    if (!groups.has(key)) groups.set(key, { kind: c.kind, token: tok, compartments: new Map(), labels: new Set() });
     const g = groups.get(key);
-    if (!g.repos.has(c.repo)) g.repos.set(c.repo, new Set());
-    g.repos.get(c.repo).add(c.role);
+    if (!g.compartments.has(c.compartment)) g.compartments.set(c.compartment, new Set());
+    g.compartments.get(c.compartment).add(c.role);
     if (c.label) g.labels.add(c.label);
   }
   const seams = [];
   for (const g of groups.values()) {
-    if (g.repos.size < 2) continue;
-    const inRepos = [...g.repos].filter(([, roles]) => roles.has('in')).map(([r]) => r).sort();
-    const outRepos = [...g.repos].filter(([, roles]) => roles.has('out')).map(([r]) => r).sort();
-    seams.push({ kind: g.kind, token: g.token, repos: [...g.repos.keys()].sort(), inRepos, outRepos, labels: [...g.labels].sort() });
+    if (g.compartments.size < 2) continue;
+    const inCompartments = [...g.compartments].filter(([, roles]) => roles.has('in')).map(([r]) => r).sort();
+    const outCompartments = [...g.compartments].filter(([, roles]) => roles.has('out')).map(([r]) => r).sort();
+    seams.push({ kind: g.kind, token: g.token, compartments: [...g.compartments.keys()].sort(), inCompartments, outCompartments, labels: [...g.labels].sort() });
   }
   return seams.sort((a, b) => (a.kind + a.token).localeCompare(b.kind + b.token));
 }
 
 // --- 3. synthesize a draft AsyncAPI 3.0 doc ---------------------------------
 // One channel per seam, address = the token (path or topic). A server-perspective
-// `receive` operation per channel; the cross-repo REFERENCES link the seam creates
-// doesn't depend on exact direction.
+// `receive` operation per channel; the cross-compartment REFERENCES link the seam
+// creates doesn't depend on exact direction.
 export function synthesizeAsyncApi(seams, title = 'wiregraph-inferred') {
   const channels = {};
   const operations = {};
@@ -112,24 +113,24 @@ export function inferSeams(root, fileFilter = null) {
 export function formatSeams(seams) {
   if (!seams.length) {
     return [
-      'No cross-repo contract seams to infer. That is often expected — common reasons:',
+      'No cross-compartment contract seams to infer. That is often expected — common reasons:',
       '  • you already have hand-written AsyncAPI contracts: those are matched directly,',
       '    so there is nothing left to infer (see the contract count in /wiregraph-status);',
       '  • comms use a mechanism the scan does not pair yet (dynamic URLs, in-process',
-      '    calls), rather than a literal route/topic string shared across repos;',
-      '  • the related repos are not indexed together in one workspace.',
+      '    calls), rather than a literal route/topic string shared across compartments;',
+      '  • the related compartments are not indexed together in one workspace.',
     ].join('\n');
   }
-  const lines = [`Found ${seams.length} cross-repo seam(s):`, ''];
+  const lines = [`Found ${seams.length} cross-compartment seam(s):`, ''];
   for (const s of seams) {
     const head = s.kind === 'wire'
       ? `  [wire] ${(s.labels.join('/') || 'http').toUpperCase()} ${s.token}`
       : `  [${s.kind}] ${s.token}`;
     lines.push(head);
     const dir = [];
-    if (s.inRepos.length) dir.push(`in: ${s.inRepos.join(', ')}`);
-    if (s.outRepos.length) dir.push(`out: ${s.outRepos.join(', ')}`);
-    lines.push(`      repos: ${s.repos.join(', ')}${dir.length ? ' — ' + dir.join('; ') : ''}`);
+    if (s.inCompartments.length) dir.push(`in: ${s.inCompartments.join(', ')}`);
+    if (s.outCompartments.length) dir.push(`out: ${s.outCompartments.join(', ')}`);
+    lines.push(`      compartments: ${s.compartments.join(', ')}${dir.length ? ' — ' + dir.join('; ') : ''}`);
   }
   return lines.join('\n');
 }

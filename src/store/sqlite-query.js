@@ -8,23 +8,23 @@ import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const isTest = (f) => f.includes('tests/') || f.includes('/test/') || f.includes('.test.') || f.includes('_test.') || f.includes('/test_');
-const loc = (n) => `${n.repo}:${n.file}:${n.startLine} ${n.name}${n.kind && n.kind !== 'function' ? ` (${n.kind})` : ''}`;
+const loc = (n) => `${n.compartment}:${n.file}:${n.startLine} ${n.name}${n.kind && n.kind !== 'function' ? ` (${n.kind})` : ''}`;
 
-function symbolMatches(db, project, name, repo, file) {
-  let q = `SELECT id,repo,file,name,kind,startLine,endLine FROM symbols
+function symbolMatches(db, project, name, compartment, file) {
+  let q = `SELECT id,compartment,file,name,kind,startLine,endLine FROM symbols
            WHERE project=@project AND name=@name AND kind <> 'module'`;
-  if (repo) q += ' AND repo=@repo';
+  if (compartment) q += ' AND compartment=@compartment';
   if (file) q += ' AND instr(file,@file)>0';
-  return db.prepare(q + ' ORDER BY repo,file,startLine').all({ project, name, repo, file });
+  return db.prepare(q + ' ORDER BY compartment,file,startLine').all({ project, name, compartment, file });
 }
 
 // Absolute path -> {mtime, size} for every indexed file in the project. The abs
-// path is reconstructed from the file's repo root, matching what changedSince and
-// build.js produce, so the keys line up for staleness comparison.
+// path is reconstructed from the file's compartment root, matching what
+// changedSince and build.js produce, so the keys line up for staleness comparison.
 export function indexedFiles(db, project) {
   const rows = db.prepare(
-    `SELECT f.path AS path, f.mtime AS mtime, f.size AS size, r.root AS root
-       FROM files f JOIN repos r ON r.project = f.project AND r.name = f.repo
+    `SELECT f.path AS path, f.mtime AS mtime, f.size AS size, c.root AS root
+       FROM files f JOIN compartments c ON c.project = f.project AND c.name = f.compartment
       WHERE f.project = ?`,
   ).all(project);
   const m = new Map();
@@ -54,16 +54,16 @@ export function staleAmong(db, project, candidates) {
 
 export function graphStats(db, project) {
   const c = (t) => db.prepare(`SELECT count(*) n FROM ${t} WHERE project=?`).get(project).n;
-  const nodes = { Repo: c('repos'), File: c('files'), Symbol: c('symbols'), Contract: c('contracts') };
+  const nodes = { Compartment: c('compartments'), File: c('files'), Symbol: c('symbols'), Contract: c('contracts') };
   const edges = db.prepare('SELECT type, count(*) n FROM edges WHERE project=? GROUP BY type ORDER BY n DESC').all(project);
-  const repos = db.prepare("SELECT repo, count(*) n FROM symbols WHERE project=? AND kind<>'module' GROUP BY repo ORDER BY n DESC").all(project);
+  const compartments = db.prepare("SELECT compartment, count(*) n FROM symbols WHERE project=? AND kind<>'module' GROUP BY compartment ORDER BY n DESC").all(project);
   if (!nodes.Symbol) return `No wiregraph for this project (${project}).`;
   return [
     `Project: ${project}`,
     'Nodes: ' + Object.entries(nodes).filter(([, n]) => n).map(([k, n]) => `${k}=${n}`).join(', '),
     'Edges: ' + edges.map((r) => `${r.type}=${r.n}`).join(', '),
-    'Symbols per repo:',
-    ...repos.map((r) => `  ${r.repo}: ${r.n}`),
+    'Symbols per compartment:',
+    ...compartments.map((r) => `  ${r.compartment}: ${r.n}`),
   ].join('\n');
 }
 
@@ -77,11 +77,11 @@ export function getSource(db, project, name, repo, file, context = 0) {
   const rows = symbolMatches(db, project, name, repo, file).filter((r) => r.endLine >= r.startLine && r.startLine > 0);
   if (!rows.length) return `No symbol named "${name}"${repo ? ` in ${repo}` : ''} with a known line span.`;
   if (rows.length > 1 && !file && !repo) {
-    return `"${name}" is ambiguous (${rows.length}). Narrow with repo/file:\n` +
-      rows.map((r) => `  ${r.repo}:${r.file}:${r.startLine} ${r.name}`).join('\n');
+    return `"${name}" is ambiguous (${rows.length}). Narrow with compartment/file:\n` +
+      rows.map((r) => `  ${r.compartment}:${r.file}:${r.startLine} ${r.name}`).join('\n');
   }
   const r = rows[0];
-  const root = db.prepare('SELECT root FROM repos WHERE project=? AND name=?').get(project, r.repo)?.root;
+  const root = db.prepare('SELECT root FROM compartments WHERE project=? AND name=?').get(project, r.compartment)?.root;
   let lines;
   try { lines = readFileSync(join(root, r.file), 'utf8').split('\n'); }
   catch (e) { return `Could not read ${r.file}: ${e.message}`; }
@@ -91,7 +91,7 @@ export function getSource(db, project, name, repo, file, context = 0) {
   let to = Math.min(lines.length, r.endLine + ctx), truncated = false;
   if (to - from + 1 > MAX) { to = from + MAX - 1; truncated = true; }
   const body = lines.slice(from - 1, to).map((ln, i) => `${from + i}\t${ln}`).join('\n');
-  const header = `${r.repo}:${r.file}:${r.startLine}-${r.endLine} ${r.name}${r.kind && r.kind !== 'function' ? ` (${r.kind})` : ''}`;
+  const header = `${r.compartment}:${r.file}:${r.startLine}-${r.endLine} ${r.name}${r.kind && r.kind !== 'function' ? ` (${r.kind})` : ''}`;
   return header + '\n' + body + (truncated ? `\n… (truncated at ${MAX} lines)` : '');
 }
 
@@ -101,7 +101,7 @@ export function getSource(db, project, name, repo, file, context = 0) {
 // targets much larger graphs, memoize this per (db, project) for the process.
 function callGraph(db, project) {
   const meta = new Map();
-  for (const s of db.prepare('SELECT id,repo,file,name,kind,startLine FROM symbols WHERE project=?').all(project)) meta.set(s.id, s);
+  for (const s of db.prepare('SELECT id,compartment,file,name,kind,startLine FROM symbols WHERE project=?').all(project)) meta.set(s.id, s);
   const fwd = new Map(); // src -> [{dst,count,resolution}]
   const rev = new Map(); // dst -> [{src,...}]
   for (const e of db.prepare("SELECT src,dst,cnt,resolution FROM edges WHERE project=? AND type='CALLS'").all(project)) {
@@ -116,7 +116,7 @@ function trace(db, project, name, repo, file, depth, direction, includeTests) {
   const seeds = symbolMatches(db, project, name, repo, file);
   if (!seeds.length) return { seeds: [], text: null };
   if (seeds.length > 1 && !repo && !file) {
-    return { seeds, text: `"${name}" is ambiguous (${seeds.length} defs). Narrow with repo/file:\n` + seeds.map((s) => '  ' + loc(s)).join('\n') };
+    return { seeds, text: `"${name}" is ambiguous (${seeds.length} defs). Narrow with compartment/file:\n` + seeds.map((s) => '  ' + loc(s)).join('\n') };
   }
   const { meta, fwd, rev } = callGraph(db, project);
   const adj = direction === 'callers' ? rev : fwd;
@@ -163,7 +163,7 @@ function trace(db, project, name, repo, file, depth, direction, includeTests) {
       else if (childrenOf.has(k.id)) out.push(`${prefix}   … (already shown)`);
     }
   }
-  const head = `${seed.repo}:${seed.file}:${seed.startLine} ${seed.name}`;
+  const head = `${seed.compartment}:${seed.file}:${seed.startLine} ${seed.name}`;
   walk(seed.id, '', 0);
   const note = includeTests ? '' : '\n(test files excluded; includeTests=true to show)';
   // Data-triggered caveat: only when the tree actually holds ambiguous edges, so a
@@ -172,7 +172,7 @@ function trace(db, project, name, repo, file, depth, direction, includeTests) {
   const ambNote = ambCount
     ? `\n⚠ ${ambCount} branch(es) marked ~ambiguous: the call resolves by name and collided with several same-named symbols — treat those as one-of-several, not certainty. (Also blind to callback/function-pointer and string-literal dispatch.)`
     : '';
-  if (!out.length) return { seeds, text: `${loc(seed)}\n  (${direction === 'callers' ? 'no resolvable callers' : 'calls nothing resolvable'} within its repo)` };
+  if (!out.length) return { seeds, text: `${loc(seed)}\n  (${direction === 'callers' ? 'no resolvable callers' : 'calls nothing resolvable'} within its compartment)` };
   return { seeds, text: head + '\n' + out.join('\n') + note + ambNote };
 }
 
@@ -184,32 +184,32 @@ export function traceCallees(db, project, name, repo, file, depth, includeTests)
 }
 
 export function traceContract(db, project, contract, token, includeTests) {
-  let q = `SELECT c.name contract, s.repo repo, s.file file, s.name name, s.startLine startLine, e.token token
+  let q = `SELECT c.name contract, s.compartment compartment, s.file file, s.name name, s.startLine startLine, e.token token
            FROM edges e JOIN symbols s ON s.id=e.src JOIN contracts c ON c.id=e.dst
            WHERE e.project=@project AND e.type='REFERENCES' AND lower(c.name) LIKE '%'||lower(@contract)||'%'`;
   if (token) q += ' AND e.token=@token';
-  const rows = db.prepare(q + ' ORDER BY c.name,s.repo,s.file,s.startLine').all({ project, contract, token });
+  const rows = db.prepare(q + ' ORDER BY c.name,s.compartment,s.file,s.startLine').all({ project, contract, token });
   const filtered = rows.filter((r) => includeTests || !isTest(r.file));
   if (!filtered.length) return `No symbols reference a contract matching "${contract}"${token ? ` via token "${token}"` : ''}.`;
-  // aggregate tokens per (contract,repo,file,name,line)
+  // aggregate tokens per (contract,compartment,file,name,line)
   const byKey = new Map();
   for (const r of filtered) {
-    const k = `${r.contract}|${r.repo}|${r.file}|${r.name}|${r.startLine}`;
+    const k = `${r.contract}|${r.compartment}|${r.file}|${r.name}|${r.startLine}`;
     if (!byKey.has(k)) byKey.set(k, { ...r, tokens: [] });
     if (r.token && !byKey.get(k).tokens.includes(r.token)) byKey.get(k).tokens.push(r.token);
   }
   const byContract = new Map();
   for (const r of byKey.values()) {
     if (!byContract.has(r.contract)) byContract.set(r.contract, new Map());
-    const repos = byContract.get(r.contract);
-    if (!repos.has(r.repo)) repos.set(r.repo, []);
-    repos.get(r.repo).push(r);
+    const compartments = byContract.get(r.contract);
+    if (!compartments.has(r.compartment)) compartments.set(r.compartment, []);
+    compartments.get(r.compartment).push(r);
   }
   const out = [];
-  for (const [cname, repos] of byContract) {
+  for (const [cname, compartments] of byContract) {
     out.push(`Contract: ${cname}`);
-    for (const [repo, list] of repos) {
-      out.push(`  [${repo}]`);
+    for (const [compartment, list] of compartments) {
+      out.push(`  [${compartment}]`);
       for (const r of list) {
         const toks = r.tokens.slice(0, 10).join(', ') + (r.tokens.length > 10 ? `, +${r.tokens.length - 10} more` : '');
         out.push(`    ${r.file}:${r.startLine} ${r.name} — ${toks}`);
@@ -222,18 +222,19 @@ export function traceContract(db, project, contract, token, includeTests) {
 
 export function pathBetween(db, project, from, to, fromRepo, toRepo, maxHops = 12) {
   const hops = Math.max(1, Math.min(20, Math.floor(Number(maxHops) || 12)));
-  // A path over CALLS+REFERENCES can route THROUGH a Contract node (the cross-repo
-  // case this tool exists for), so resolve labels against both tables — symbols
-  // first, then contracts (which have a name but no repo/file). Mirrors Neo4j's
-  // generic coalesce(repo,'')+':'+coalesce(file,name)+... reconstruction.
+  // A path over CALLS+REFERENCES can route THROUGH a Contract node (the
+  // cross-compartment case this tool exists for), so resolve labels against both
+  // tables — symbols first, then contracts (which have a name but no
+  // compartment/file). Mirrors Neo4j's generic
+  // coalesce(compartment,'')+':'+coalesce(file,name)+... reconstruction.
   const node = (id) =>
-    db.prepare('SELECT id,repo,file,name FROM symbols WHERE id=?').get(id) ||
-    db.prepare('SELECT id,NULL repo,file,name FROM contracts WHERE id=?').get(id) ||
-    { repo: null, file: null, name: id };
+    db.prepare('SELECT id,compartment,file,name FROM symbols WHERE id=?').get(id) ||
+    db.prepare('SELECT id,NULL compartment,file,name FROM contracts WHERE id=?').get(id) ||
+    { compartment: null, file: null, name: id };
   const starts = symbolMatches(db, project, from, fromRepo).map((r) => r.id);
   const goals = new Set(symbolMatches(db, project, to, toRepo).map((r) => r.id));
   if (!starts.length || !goals.size) return `No path found between "${from}" and "${to}" within ${hops} hops.`;
-  // undirected adjacency over CALLS + REFERENCES + IMPORTS (cross-repo deps)
+  // undirected adjacency over CALLS + REFERENCES + IMPORTS (cross-compartment deps)
   const adj = new Map();
   const add = (a, b, rel) => { if (!adj.has(a)) adj.set(a, []); adj.get(a).push({ to: b, rel }); };
   for (const e of db.prepare("SELECT src,dst,type FROM edges WHERE project=? AND type IN ('CALLS','REFERENCES','IMPORTS')").all(project)) {
@@ -260,10 +261,10 @@ export function pathBetween(db, project, from, to, fromRepo, toRepo, maxHops = 1
   const chain = [hit]; const rels = [];
   let cur = hit;
   while (prev.has(cur)) { const p = prev.get(cur); rels.unshift(p.rel); chain.unshift(p.from); cur = p.from; }
-  // Match Neo4j exactly: coalesce(repo,'') + ':' + coalesce(file,name) + (file&&name ? ':'+name : '')
+  // Match Neo4j exactly: coalesce(compartment,'') + ':' + coalesce(file,name) + (file&&name ? ':'+name : '')
   const label = (id) => {
     const n = node(id);
-    return `${n.repo || ''}:${n.file || n.name}${n.file && n.name ? ':' + n.name : ''}`;
+    return `${n.compartment || ''}:${n.file || n.name}${n.file && n.name ? ':' + n.name : ''}`;
   };
   const parts = [];
   for (let i = 0; i < chain.length; i++) { parts.push(label(chain[i])); if (i < rels.length) parts.push(`  --[${rels[i]}]-->`); }

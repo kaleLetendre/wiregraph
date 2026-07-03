@@ -36,7 +36,10 @@ const SQL = await initSqlJs({ locateFile: () => require.resolve('sql.js/dist/sql
 // v2 adds files.mtime/size so staleness is "differs from what was indexed" (disk
 // mtime/size vs recorded), not "differs from the last committed git sha" — the
 // latter falsely flags an uncommitted-but-already-reindexed file as stale forever.
-export const SCHEMA_VERSION = 2;
+// v3 renames the graph-attribution unit from "repo" to "compartment": the `repos`
+// table -> `compartments`, and the `repo` column on files/symbols -> `compartment`
+// (a compartment is a .git repo OR a module manifest boundary — see walk.js).
+export const SCHEMA_VERSION = 3;
 
 // better-sqlite3 binds a single object arg as NAMED params (SQL `@key` <- obj.key)
 // and any other args as POSITIONAL (`?`). sql.js wants the `@` sigil in the keys
@@ -155,20 +158,20 @@ export function schemaVersion(db) {
 }
 
 const SCHEMA = `
-CREATE TABLE IF NOT EXISTS meta     (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS repos    (id TEXT PRIMARY KEY, project TEXT, name TEXT, root TEXT);
-CREATE TABLE IF NOT EXISTS files    (id TEXT PRIMARY KEY, project TEXT, repo TEXT, path TEXT, lang TEXT, mtime REAL, size INTEGER);
-CREATE TABLE IF NOT EXISTS symbols  (id TEXT PRIMARY KEY, project TEXT, repo TEXT, file TEXT, name TEXT, kind TEXT, lang TEXT, startLine INTEGER, endLine INTEGER);
-CREATE TABLE IF NOT EXISTS contracts(id TEXT PRIMARY KEY, project TEXT, name TEXT, file TEXT);
-CREATE TABLE IF NOT EXISTS edges    (type TEXT, src TEXT, dst TEXT, project TEXT, token TEXT, cnt INTEGER, resolution TEXT, evidence TEXT, direction TEXT, contract TEXT);
+CREATE TABLE IF NOT EXISTS meta        (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS compartments(id TEXT PRIMARY KEY, project TEXT, name TEXT, root TEXT);
+CREATE TABLE IF NOT EXISTS files       (id TEXT PRIMARY KEY, project TEXT, compartment TEXT, path TEXT, lang TEXT, mtime REAL, size INTEGER);
+CREATE TABLE IF NOT EXISTS symbols     (id TEXT PRIMARY KEY, project TEXT, compartment TEXT, file TEXT, name TEXT, kind TEXT, lang TEXT, startLine INTEGER, endLine INTEGER);
+CREATE TABLE IF NOT EXISTS contracts   (id TEXT PRIMARY KEY, project TEXT, name TEXT, file TEXT);
+CREATE TABLE IF NOT EXISTS edges       (type TEXT, src TEXT, dst TEXT, project TEXT, token TEXT, cnt INTEGER, resolution TEXT, evidence TEXT, direction TEXT, contract TEXT);
 CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(project, name);
-CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(project, repo, file);
+CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(project, compartment, file);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(project, type, src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(project, type, dst);
 CREATE INDEX IF NOT EXISTS idx_edges_proj ON edges(project, type);
 `;
 
-const TABLES = ['repos', 'files', 'symbols', 'contracts', 'edges', 'meta'];
+const TABLES = ['compartments', 'files', 'symbols', 'contracts', 'edges', 'meta'];
 
 export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
   const project = graph.project;
@@ -190,9 +193,9 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
   db.exec(SCHEMA);
   if (reset && !project) throw new Error('sqlite loadGraph --reset requires graph.project');
 
-  const insRepo = db.prepare('INSERT OR REPLACE INTO repos (id,project,name,root) VALUES (@id,@project,@name,@root)');
-  const insFile = db.prepare('INSERT OR REPLACE INTO files (id,project,repo,path,lang,mtime,size) VALUES (@id,@project,@repo,@path,@lang,@mtime,@size)');
-  const insSym = db.prepare('INSERT OR REPLACE INTO symbols (id,project,repo,file,name,kind,lang,startLine,endLine) VALUES (@id,@project,@repo,@file,@name,@kind,@lang,@startLine,@endLine)');
+  const insCompartment = db.prepare('INSERT OR REPLACE INTO compartments (id,project,name,root) VALUES (@id,@project,@name,@root)');
+  const insFile = db.prepare('INSERT OR REPLACE INTO files (id,project,compartment,path,lang,mtime,size) VALUES (@id,@project,@compartment,@path,@lang,@mtime,@size)');
+  const insSym = db.prepare('INSERT OR REPLACE INTO symbols (id,project,compartment,file,name,kind,lang,startLine,endLine) VALUES (@id,@project,@compartment,@file,@name,@kind,@lang,@startLine,@endLine)');
   const insCon = db.prepare('INSERT OR REPLACE INTO contracts (id,project,name,file) VALUES (@id,@project,@name,@file)');
   const insEdge = db.prepare('INSERT INTO edges (type,src,dst,project,token,cnt,resolution,evidence,direction,contract) VALUES (@type,@src,@dst,@project,@token,@cnt,@resolution,@evidence,@direction,@contract)');
 
@@ -205,12 +208,12 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
     // separate schema-migration DROP path above is exempt: that data is an
     // already-incompatible old schema the server refuses to query anyway.)
     if (reset) {
-      for (const t of ['repos', 'files', 'symbols', 'contracts', 'edges']) {
+      for (const t of ['compartments', 'files', 'symbols', 'contracts', 'edges']) {
         db.prepare(`DELETE FROM ${t} WHERE project = ?`).run(project);
       }
     }
     db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
-    for (const r of graph.repos.values()) insRepo.run(r);
+    for (const r of graph.compartments.values()) insCompartment.run(r);
     for (const f of graph.files.values()) insFile.run({ mtime: null, size: null, ...f });
     for (const s of graph.symbols.values()) insSym.run({ lang: null, ...s });
     for (const c of graph.contracts.values()) insCon.run({ file: null, ...c });
@@ -223,7 +226,7 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
     //      drops genuine orphans (endpoint in no file).
     //  (b) MERGE dedups on (type, src, dst) (+ token for REFERENCES/WIRE).
     const nodeIds = new Set();
-    for (const t of ['repos', 'files', 'symbols', 'contracts'])
+    for (const t of ['compartments', 'files', 'symbols', 'contracts'])
       for (const r of db.prepare(`SELECT id FROM ${t} WHERE project = ?`).all(project)) nodeIds.add(r.id);
     const seen = new Set();
     for (const e of graph.edges) {
@@ -253,25 +256,26 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
 // not just the re-parsed file. Mirrors neo4j.js loadProjectSymbols.
 export function loadProjectSymbols(db, project) {
   return db.prepare(
-    "SELECT id, repo, file, name, kind FROM symbols WHERE project = ? AND kind <> 'module'",
+    "SELECT id, compartment, file, name, kind FROM symbols WHERE project = ? AND kind <> 'module'",
   ).all(project);
 }
 
 // Surgical per-file prune for incremental rebuilds, mirroring neo4j.js pruneFile.
-// Symbol ids are content-stable (repo:file:name:line), so a symbol that survives
-// an edit keeps the SAME id and therefore its INCOMING edges from unchanged files.
+// Symbol ids are content-stable (compartment:file:name:line), so a symbol that
+// survives an edit keeps the SAME id and therefore its INCOMING edges from
+// unchanged files.
 //   - delete this file's symbols whose id is NOT in keepIds, with all their edges;
 //   - for surviving symbols, clear their OUTGOING edges (CALLS/REFERENCES AND
 //     DEFINED_IN), keeping incoming, so the reload recreates exactly one of each
 //     (Neo4j's MERGE deduped these implicitly; SQLite's INSERT is additive, so we
 //     must clear everything the re-extraction will re-add for this file);
-//   - clear the file's IN_REPO edge for the same reason;
+//   - clear the file's IN_COMPARTMENT edge for the same reason;
 //   - if keepIds is empty (file deleted on disk), also drop the File node.
-export function pruneFile(db, project, repo, relPath, keepIds, log = () => {}) {
+export function pruneFile(db, project, compartment, relPath, keepIds, log = () => {}) {
   const keep = new Set(keepIds);
   const existing = db.prepare(
-    'SELECT id FROM symbols WHERE project = ? AND repo = ? AND file = ?',
-  ).all(project, repo, relPath).map((r) => r.id);
+    'SELECT id FROM symbols WHERE project = ? AND compartment = ? AND file = ?',
+  ).all(project, compartment, relPath).map((r) => r.id);
   const toDelete = existing.filter((id) => !keep.has(id));
 
   const delEdgesOf = db.prepare('DELETE FROM edges WHERE project = ? AND (src = ? OR dst = ?)');
@@ -283,15 +287,15 @@ export function pruneFile(db, project, repo, relPath, keepIds, log = () => {}) {
   const tx = db.transaction(() => {
     for (const id of toDelete) { delEdgesOf.run(project, id, id); delSym.run(id); }
     for (const id of keepIds) delOutgoing.run(project, id);
-    // The file node's IN_REPO edge is re-added on reload too — clear it (and, if
+    // The file node's IN_COMPARTMENT edge is re-added on reload too — clear it (and, if
     // the file is gone, the File node itself; its symbols + DEFINED_IN already went).
-    const f = db.prepare('SELECT id FROM files WHERE project = ? AND repo = ? AND path = ?').get(project, repo, relPath);
+    const f = db.prepare('SELECT id FROM files WHERE project = ? AND compartment = ? AND path = ?').get(project, compartment, relPath);
     if (f) {
-      db.prepare("DELETE FROM edges WHERE project = ? AND type = 'IN_REPO' AND src = ?").run(project, f.id);
+      db.prepare("DELETE FROM edges WHERE project = ? AND type = 'IN_COMPARTMENT' AND src = ?").run(project, f.id);
       if (!keepIds.length) db.prepare('DELETE FROM files WHERE id = ?').run(f.id);
     }
   });
   tx();
-  if (!keepIds.length) log(`  pruned deleted file ${repo}/${relPath}`);
-  else log(`  pruned ${repo}/${relPath} (kept ${keepIds.length} stable symbols' incoming edges)`);
+  if (!keepIds.length) log(`  pruned deleted file ${compartment}/${relPath}`);
+  else log(`  pruned ${compartment}/${relPath} (kept ${keepIds.length} stable symbols' incoming edges)`);
 }

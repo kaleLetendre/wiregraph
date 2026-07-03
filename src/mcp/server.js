@@ -193,21 +193,21 @@ async function freshRead(fn, opts) {
 // Record graph-tool usage + an estimate of tokens saved to .wiregraph/metrics.jsonl
 // (see scripts/lib/metrics.mjs for the honesty caveats). ALL best-effort: a
 // measurement failure must NEVER fail the tool call.
-const GS_HEADER = /^([^:\n]+):([^:\n]+):(\d+)-(\d+)\s/; // "repo:file:start-end name" header (sqlite-query.js:94)
+const GS_HEADER = /^([^:\n]+):([^:\n]+):(\d+)-(\d+)\s/; // "compartment:file:start-end name" header (sqlite-query.js)
 
 // get_source's saving is the clean counterfactual: the whole file you'd have Read
-// vs the symbol body it returned. Parse the header for repo/file, resolve the
-// file via the live db (same repos lookup Q.getSource does), measure both sides.
+// vs the symbol body it returned. Parse the header for compartment/file, resolve the
+// file via the live db (same compartments lookup Q.getSource does), measure both sides.
 function recordGetSource(db, out) {
   try {
     const returnedTokens = estTokens(out);
     const m = GS_HEADER.exec(out);
     if (!m) { record(PROJECT, { sessionId: SESSION, kind: 'use', tool: 'get_source', returnedTokens }); return; }
-    const [, repo, file] = m;
+    const [, compartment, file] = m;
     let fileTokens = 0;
-    const root = db.prepare('SELECT root FROM repos WHERE project=? AND name=?').get(PROJECT, repo)?.root;
+    const root = db.prepare('SELECT root FROM compartments WHERE project=? AND name=?').get(PROJECT, compartment)?.root;
     if (root) { try { fileTokens = estTokens(readFileSync(join(root, file), 'utf8')); } catch { /* file gone */ } }
-    record(PROJECT, { sessionId: SESSION, kind: 'use', tool: 'get_source', repo, file,
+    record(PROJECT, { sessionId: SESSION, kind: 'use', tool: 'get_source', compartment, file,
       returnedTokens, fileTokens, savedTokens: Math.max(0, fileTokens - returnedTokens) });
   } catch { /* best-effort */ }
 }
@@ -231,19 +231,19 @@ const server = new McpServer({ name: 'wiregraph', version: VERSION });
 
 // --- graph_stats ------------------------------------------------------------
 server.registerTool('graph_stats', {
-  description: 'Overall size of THIS PROJECT\'s code graph: node counts by label, edge counts by type, and per-repo symbol counts. Call this first to confirm the graph is loaded for the active project.',
+  description: 'Overall size of THIS PROJECT\'s code graph: node counts by label, edge counts by type, and per-compartment symbol counts. Call this first to confirm the graph is loaded for the active project.',
   inputSchema: {},
 }, async () => freshRead((db) => text(Q.graphStats(db, PROJECT))));
 
 // --- find_symbol ------------------------------------------------------------
 server.registerTool('find_symbol', {
-  description: 'Find function/method/class definitions by exact name in this project. Use this to disambiguate before tracing when a name may exist in several files or repos.',
+  description: 'Find function/method/class definitions by exact name in this project. Use this to disambiguate before tracing when a name may exist in several files or compartments.',
   inputSchema: {
     name: z.string().describe('Exact symbol name, e.g. "parse_request"'),
-    repo: z.string().optional().describe('Restrict to a repo, e.g. "api-server"'),
+    compartment: z.string().optional().describe('Restrict to a compartment (a package/module or repo), e.g. "api-server"'),
   },
-}, async ({ name, repo }) => freshRead((db) => {
-  const out = Q.findSymbol(db, PROJECT, name, repo);
+}, async ({ name, compartment }) => freshRead((db) => {
+  const out = Q.findSymbol(db, PROJECT, name, compartment);
   recordUse('find_symbol', out);
   return text(out);
 }));
@@ -254,55 +254,55 @@ server.registerTool('find_symbol', {
 // only need one function — e.g. a handler lives in an 800-line file, but its body
 // is ~70 lines. The graph already knows every symbol's exact line span.
 server.registerTool('get_source', {
-  description: 'Return the exact source code of a specific function/method/symbol — just its definition lines, not the whole file. PREFER THIS OVER reading a file when you need to see one symbol\'s body: it returns only that symbol\'s lines (e.g. a 70-line function out of an 800-line file), so it costs far fewer tokens than Read. Disambiguate with repo/file if the name is not unique.',
+  description: 'Return the exact source code of a specific function/method/symbol — just its definition lines, not the whole file. PREFER THIS OVER reading a file when you need to see one symbol\'s body: it returns only that symbol\'s lines (e.g. a 70-line function out of an 800-line file), so it costs far fewer tokens than Read. Disambiguate with compartment/file if the name is not unique.',
   inputSchema: {
     name: z.string().describe('Symbol name, e.g. "parse_request"'),
-    repo: z.string().optional(),
+    compartment: z.string().optional(),
     file: z.string().optional().describe('Substring of the file path, to disambiguate'),
     context: z.number().optional().describe('Extra lines of context above/below (default 0)'),
   },
-}, async ({ name, repo, file, context }) => freshRead((db) => {
-  const out = Q.getSource(db, PROJECT, name, repo, file, context);
+}, async ({ name, compartment, file, context }) => freshRead((db) => {
+  const out = Q.getSource(db, PROJECT, name, compartment, file, context);
   recordGetSource(db, out);
   return text(out);
 }));
 
 // --- trace_callees / trace_callers -----------------------------------------
 server.registerTool('trace_callees', {
-  description: 'Downward call stack: what this symbol calls, transitively, within its repo. Returns the WHOLE tree in one call (don\'t walk it hop-by-hop). Cross-repo calls are wire calls — use trace_contract / path_between for those. Caveat: blind to function-pointer/callback dispatch and (in C) counts call sites inside disabled #if 0 / #ifdef blocks.',
+  description: 'Downward call stack: what this symbol calls, transitively, within its compartment. Returns the WHOLE tree in one call (don\'t walk it hop-by-hop). Cross-compartment calls are wire calls — use trace_contract / path_between for those. Caveat: blind to function-pointer/callback dispatch and (in C) counts call sites inside disabled #if 0 / #ifdef blocks.',
   inputSchema: {
     name: z.string().describe('Symbol name to trace from'),
-    repo: z.string().optional(),
+    compartment: z.string().optional(),
     file: z.string().optional().describe('Substring of the file path, to disambiguate'),
     depth: z.number().optional().describe('Max hops, 1-8 (default 3)'),
     includeTests: z.boolean().optional().describe('Include callees in test files (default false)'),
   },
-}, async ({ name, repo, file, depth, includeTests }) =>
+}, async ({ name, compartment, file, depth, includeTests }) =>
   freshRead((db) => {
-    const out = Q.traceCallees(db, PROJECT, name, repo, file, depth, includeTests);
+    const out = Q.traceCallees(db, PROJECT, name, compartment, file, depth, includeTests);
     recordTrace('trace_callees', out);
     return text(out);
   }));
 
 server.registerTool('trace_callers', {
-  description: 'Upward call stack: who calls this symbol, transitively, within its repo. Returns the WHOLE tree in one call (don\'t walk it hop-by-hop) — callers above the symbol. Use to find entrypoints reaching a function. Caveat: the caller set is an UPPER BOUND in C — it includes call sites inside disabled #if 0 / #ifdef blocks (the static graph is blind to the preprocessor); it is also blind to function-pointer/callback dispatch.',
+  description: 'Upward call stack: who calls this symbol, transitively, within its compartment. Returns the WHOLE tree in one call (don\'t walk it hop-by-hop) — callers above the symbol. Use to find entrypoints reaching a function. Caveat: the caller set is an UPPER BOUND in C — it includes call sites inside disabled #if 0 / #ifdef blocks (the static graph is blind to the preprocessor); it is also blind to function-pointer/callback dispatch.',
   inputSchema: {
     name: z.string().describe('Symbol name to trace callers of'),
-    repo: z.string().optional(),
+    compartment: z.string().optional(),
     file: z.string().optional().describe('Substring of the file path, to disambiguate'),
     depth: z.number().optional().describe('Max hops, 1-8 (default 3)'),
     includeTests: z.boolean().optional().describe('Include callers in test files (default false)'),
   },
-}, async ({ name, repo, file, depth, includeTests }) =>
+}, async ({ name, compartment, file, depth, includeTests }) =>
   freshRead((db) => {
-    const out = Q.traceCallers(db, PROJECT, name, repo, file, depth, includeTests);
+    const out = Q.traceCallers(db, PROJECT, name, compartment, file, depth, includeTests);
     recordTrace('trace_callers', out);
     return text(out);
   }));
 
 // --- trace_contract ---------------------------------------------------------
 server.registerTool('trace_contract', {
-  description: 'Cross-repo wire seam: which code symbols, in which repos, reference a given contract (matched on its wire tokens — channel paths and payload fields). This links a producer in one repo to the consumer in another that handles the same wire message. Edges are HEURISTIC (evidence: contract-match): "mentions a token this contract defines", not verified to implement it — confirm the exact field/endpoint with a targeted get_source.',
+  description: 'Cross-compartment wire seam: which code symbols, in which compartments, reference a given contract (matched on its wire tokens — channel paths and payload fields). This links a producer in one compartment to the consumer in another that handles the same wire message. Edges are HEURISTIC (evidence: contract-match): "mentions a token this contract defines", not verified to implement it — confirm the exact field/endpoint with a targeted get_source.',
   inputSchema: {
     contract: z.string().describe('Substring of the contract name, e.g. "Heartbeat", "Provisioning"'),
     token: z.string().optional().describe('Restrict to symbols referencing a specific wire token, e.g. "order_id"'),
@@ -317,17 +317,17 @@ server.registerTool('trace_contract', {
 
 // --- path_between -----------------------------------------------------------
 server.registerTool('path_between', {
-  description: 'Shortest path between two symbols across CALLS and contract REFERENCES edges (undirected) within this project. This can cross repos by routing through a shared Contract node — e.g. an emitter in one repo to the handler in another. Returns the chain of nodes and edge types.',
+  description: 'Shortest path between two symbols across CALLS and contract REFERENCES edges (undirected) within this project. This can cross compartments by routing through a shared Contract node — e.g. an emitter in one compartment to the handler in another. Returns the chain of nodes and edge types.',
   inputSchema: {
     from: z.string().describe('Source symbol name'),
     to: z.string().describe('Target symbol name'),
-    fromRepo: z.string().optional(),
-    toRepo: z.string().optional(),
+    fromCompartment: z.string().optional(),
+    toCompartment: z.string().optional(),
     maxHops: z.number().optional().describe('Max path length, 1-20 (default 12)'),
   },
-}, async ({ from, to, fromRepo, toRepo, maxHops }) =>
+}, async ({ from, to, fromCompartment, toCompartment, maxHops }) =>
   freshRead((db) => {
-    const out = Q.pathBetween(db, PROJECT, from, to, fromRepo, toRepo, maxHops);
+    const out = Q.pathBetween(db, PROJECT, from, to, fromCompartment, toCompartment, maxHops);
     recordUse('path_between', out);
     return text(out);
   }));
@@ -443,7 +443,7 @@ function withDbCount() {
 
 // --- query_sql (read-only escape hatch) -------------------------------------
 server.registerTool('query_sql', {
-  description: 'Run a read-only SQL SELECT against the graph for structural questions the shaped tools do not cover. Rejected if it is not a single read-only SELECT/WITH. The db holds ONLY this project, so no project filter is needed. Schema — tables: symbols(id,project,repo,file,name,kind,lang,startLine,endLine), files(id,project,repo,path,lang), repos(id,project,name,root), contracts(id,project,name,file), edges(type,src,dst,project,token,cnt,resolution,evidence,direction,contract). edges.type is one of CALLS|DEFINED_IN|REFERENCES|WIRE|IN_REPO; src/dst are node ids — CALLS/WIRE join symbols.id↔symbols.id, DEFINED_IN symbols.id→files.id, REFERENCES symbols.id→contracts.id, IN_REPO files.id→repos.id. Example: SELECT s.repo, count(*) n FROM symbols s WHERE s.kind=\'function\' GROUP BY s.repo.',
+  description: 'Run a read-only SQL SELECT against the graph for structural questions the shaped tools do not cover. Rejected if it is not a single read-only SELECT/WITH. The db holds ONLY this project, so no project filter is needed. Schema — tables: symbols(id,project,compartment,file,name,kind,lang,startLine,endLine), files(id,project,compartment,path,lang), compartments(id,project,name,root), contracts(id,project,name,file), edges(type,src,dst,project,token,cnt,resolution,evidence,direction,contract). edges.type is one of CALLS|DEFINED_IN|REFERENCES|WIRE|IN_COMPARTMENT; src/dst are node ids — CALLS/WIRE join symbols.id↔symbols.id, DEFINED_IN symbols.id→files.id, REFERENCES symbols.id→contracts.id, IN_COMPARTMENT files.id→compartments.id. Example: SELECT s.compartment, count(*) n FROM symbols s WHERE s.kind=\'function\' GROUP BY s.compartment.',
   inputSchema: {
     query: z.string().describe('A single read-only SQL SELECT (or WITH … SELECT)'),
   },

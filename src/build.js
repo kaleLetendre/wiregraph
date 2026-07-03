@@ -24,7 +24,7 @@ import { Graph } from './model.js';
 import { extractCode } from './extract/index.js';
 import { resolveCalls } from './extract/resolve.js';
 import { loadContracts, matchContracts, buildWireEdges } from './extract/contracts.js';
-import { findRepoRoots, repoNameFor } from './extract/walk.js';
+import { findCompartmentRoots, compartmentNameFor } from './extract/walk.js';
 import { connect, loadGraph, loadProjectSymbols, pruneFile } from './store/sqlite.js';
 import { wiregraphDir, updateState } from '../scripts/lib/state.mjs';
 import { clusterSeams } from './contracts/infer.js';
@@ -53,7 +53,7 @@ const log = (m) => process.stderr.write(m + '\n');
 function resolveContractsDir(opts, root) {
   if (opts.contracts) return opts.contracts;
   // Auto-detect an AsyncAPI contracts dir: one named `contracts`/`asyncapi`, or any
-  // `*-contracts` dir directly under the target. The cross-repo wire feature only
+  // `*-contracts` dir directly under the target. The cross-compartment wire feature only
   // activates if such a dir exists, so projects without one just skip it.
   try {
     for (const e of readdirSync(root, { withFileTypes: true })) {
@@ -89,16 +89,17 @@ function fullBuild(opts, root, project) {
     matchContracts(graph, root, contracts, log);
     buildWireEdges(graph, contracts, log);
   } else {
-    log('3/4 no contracts dir found — skipping cross-repo wire edges');
+    log('3/4 no contracts dir found — skipping cross-compartment wire edges');
   }
 
-  // Cross-repo library/SDK boundaries: resolve import specifiers into IMPORTS edges
-  // (explicit deps, so safe to link across repos — unlike name-based calls).
+  // Cross-compartment library/SDK boundaries: resolve import specifiers into
+  // IMPORTS edges (explicit deps, so safe to link across compartments — unlike
+  // name-based calls).
   const importEdges = resolveImports(candidates, graph);
   for (const e of importEdges) graph.addEdge('IMPORTS', e.from, e.to, { evidence: 'import' });
-  if (importEdges.length) log(`  resolved ${importEdges.length} cross-repo IMPORTS edge(s)`);
+  if (importEdges.length) log(`  resolved ${importEdges.length} cross-compartment IMPORTS edge(s)`);
 
-  // Persist the cross-repo seam count + detected contracts dir so SessionStart and
+  // Persist the cross-compartment seam count + detected contracts dir so SessionStart and
   // /wiregraph-status nudge toward /wiregraph-contracts only when there's real,
   // *uncovered* potential (seams found AND no contracts dir present).
   try { updateState(project, { inferredSeams: clusterSeams(candidates).length, contractsDir: contractsDir || null, structuralDriftSinceFullBuild: false }); }
@@ -109,7 +110,7 @@ function fullBuild(opts, root, project) {
 
   if (opts.dump) {
     const payload = {
-      repos: [...graph.repos.values()], files: [...graph.files.values()],
+      compartments: [...graph.compartments.values()], files: [...graph.files.values()],
       symbols: [...graph.symbols.values()], contracts: [...graph.contracts.values()],
       edges: graph.edges, stats,
     };
@@ -137,18 +138,18 @@ function fullBuild(opts, root, project) {
 // Re-index only the given files: delete their prior nodes, extract just them,
 // resolve their OUTGOING calls against the whole project (read from the db), then
 // reload. Incoming name-based CALLS to a renamed symbol may dangle until a full
-// rebuild; WIRE (cross-repo derived) edges are not rebuilt here — both are the
-// documented full-rebuild backstop.
+// rebuild; WIRE (cross-compartment derived) edges are not rebuilt here — both are
+// the documented full-rebuild backstop.
 function incrementalBuild(opts, root, project) {
   if (!opts.load) throw new Error('--files (incremental) requires a load; remove --no-load');
 
-  // Attribute each changed path to its repo (works for existing AND deleted files).
-  const repoRoots = findRepoRoots(root);
+  // Attribute each changed path to its compartment (works for existing AND deleted files).
+  const compartmentRoots = findCompartmentRoots(root);
   const rootName = basename(root);
   const changed = opts.files.map((f) => {
     const abs = resolve(root, f);
-    const { name: repo, root: repoRoot } = repoNameFor(abs, repoRoots, rootName, root);
-    return { abs, repo, relPath: relative(repoRoot, abs), exists: existsSync(abs) };
+    const { name: compartment, root: compartmentRoot } = compartmentNameFor(abs, compartmentRoots, rootName, root);
+    return { abs, compartment, relPath: relative(compartmentRoot, abs), exists: existsSync(abs) };
   });
   log(`wiregraph incremental: ${changed.length} file(s) in project ${project}`);
 
@@ -168,9 +169,9 @@ function incrementalBuild(opts, root, project) {
       // already holds them. Otherwise a re-indexed file's unchanged symbols appear
       // twice (fresh + stale-in-db) and same-file calls get falsely tagged
       // ~ambiguous against their own duplicate.
-      const changedKeys = new Set(changed.map((c) => `${c.repo}\0${c.relPath}`));
+      const changedKeys = new Set(changed.map((c) => `${c.compartment}\0${c.relPath}`));
       const allPrior = loadProjectSymbols(db, project);
-      const extraDefs = allPrior.filter((s) => !changedKeys.has(`${s.repo}\0${s.file}`));
+      const extraDefs = allPrior.filter((s) => !changedKeys.has(`${s.compartment}\0${s.file}`));
       resolveCalls(graph, calls, log, extraDefs);
       const contractsDir = resolveContractsDir(opts, root);
       if (contractsDir) {
@@ -180,8 +181,8 @@ function incrementalBuild(opts, root, project) {
       // Structural drift: did this update change the symbol NAME-set (add / remove /
       // rename) rather than only edit a body? If so, callers resolved by name in
       // UNCHANGED files may be approximate until the next full rebuild.
-      const priorNames = new Set(allPrior.filter((s) => changedKeys.has(`${s.repo}\0${s.file}`)).map((s) => `${s.repo}\0${s.file}\0${s.name}`));
-      const freshNames = new Set([...graph.symbols.values()].map((s) => `${s.repo}\0${s.file}\0${s.name}`));
+      const priorNames = new Set(allPrior.filter((s) => changedKeys.has(`${s.compartment}\0${s.file}`)).map((s) => `${s.compartment}\0${s.file}\0${s.name}`));
+      const freshNames = new Set([...graph.symbols.values()].map((s) => `${s.compartment}\0${s.file}\0${s.name}`));
       structuralDrift = priorNames.size !== freshNames.size || [...freshNames].some((k) => !priorNames.has(k));
     }
 
@@ -190,9 +191,9 @@ function incrementalBuild(opts, root, project) {
     //    set of symbol ids the fresh extraction produced for that file.
     for (const c of changed) {
       const keepIds = [...graph.symbols.values()]
-        .filter((s) => s.repo === c.repo && s.file === c.relPath)
+        .filter((s) => s.compartment === c.compartment && s.file === c.relPath)
         .map((s) => s.id);
-      pruneFile(db, project, c.repo, c.relPath, keepIds, log);
+      pruneFile(db, project, c.compartment, c.relPath, keepIds, log);
     }
 
     // 4. load (no reset — survivors INSERT-OR-REPLACE; outgoing edges recreated).

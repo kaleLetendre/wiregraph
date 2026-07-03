@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // wiregraph export-html — render the graph as a standalone HTML file using a
-// d3 clustered-force layout: each repo has its own gravity center (same color
-// attracts), every node repels (charge), repo centers are spread apart
-// (different colors separate), contracts sit in the middle as bridges. Sliders
-// tune attraction vs repulsion live. No Neo4j needed to view the result.
+// d3 clustered-force layout: each compartment has its own gravity center (same
+// color attracts), every node repels (charge), compartment centers are spread
+// apart (different colors separate), contracts sit in the middle as bridges.
+// Sliders tune attraction vs repulsion live. No Neo4j needed to view the result.
 //
 // Modes:
 //   (default)              symbols that REFERENCE a contract + the contracts
 //   --all                  full Symbol/Contract graph + CALLS edges
-//   --contract "<name>"    ONE contract, all repos, with the call stacks that
+//   --contract "<name>"    ONE contract, all compartments, with the call stacks that
 //                          reach it: callers up to --up hops, callees down to
 //                          --down hops, plus a single collapsed REFERENCES edge
 //                          per symbol (no per-token fan-out).
@@ -115,26 +115,27 @@ function collapseLinks(links) {
 }
 
 // The default contract view: collapse every function->contract reference to ONE
-// arrow per (repo -> contract), so a big workspace shows which repos touch which
-// contracts instead of a hairball of per-function edges. Arrow weight = number of
-// distinct functions in that repo referencing the contract; tokens = union of
-// fields. Symbol nodes are dropped in favor of one hub node per repo.
-function aggregateByRepo(built) {
-  const symRepo = new Map(); const contracts = new Map();
-  for (const n of built.nodes) { if (n.kind === 'contract') contracts.set(n.id, n); else symRepo.set(n.id, n.repo); }
-  const repoNodes = new Map(); const agg = new Map();
+// arrow per (compartment -> contract), so a big workspace shows which compartments
+// touch which contracts instead of a hairball of per-function edges. Arrow weight
+// = number of distinct functions in that compartment referencing the contract;
+// tokens = union of fields. Symbol nodes are dropped in favor of one hub node per
+// compartment.
+function aggregateByCompartment(built) {
+  const symCompartment = new Map(); const contracts = new Map();
+  for (const n of built.nodes) { if (n.kind === 'contract') contracts.set(n.id, n); else symCompartment.set(n.id, n.compartment); }
+  const compartmentNodes = new Map(); const agg = new Map();
   for (const l of built.links) {
     if (l.type !== 'REFERENCES') continue;
-    const r = symRepo.get(l.source); const c = l.target;
+    const r = symCompartment.get(l.source); const c = l.target;
     if (!r || !contracts.has(c)) continue;
-    if (!repoNodes.has(r)) repoNodes.set(r, { id: 'repo::' + r, kind: 'repo', repo: r, name: r, file: null, line: null });
+    if (!compartmentNodes.has(r)) compartmentNodes.set(r, { id: 'compartment::' + r, kind: 'compartment', compartment: r, name: r, file: null, line: null });
     const key = r + '||' + c; let e = agg.get(key);
-    if (!e) { e = { source: 'repo::' + r, target: c, type: 'REFERENCES', tokens: new Set(), funcs: new Set() }; agg.set(key, e); }
+    if (!e) { e = { source: 'compartment::' + r, target: c, type: 'REFERENCES', tokens: new Set(), funcs: new Set() }; agg.set(key, e); }
     for (const t of l.tokens || []) e.tokens.add(t);
     e.funcs.add(l.source);
   }
   const links = [...agg.values()].map((e) => ({ source: e.source, target: e.target, type: 'REFERENCES', tokens: [...e.tokens], count: e.funcs.size }));
-  return { nodes: [...repoNodes.values(), ...contracts.values()], links };
+  return { nodes: [...compartmentNodes.values(), ...contracts.values()], links };
 }
 
 function resolveProject(opts) {
@@ -158,20 +159,20 @@ async function main() {
     db.close();
   }
 
-  // Default contract view aggregates per repo; --functions keeps the per-function
-  // detail; --all / --contract are their own modes.
-  const repoMode = !opts.all && !opts.contract && !opts.functions;
-  if (repoMode) built = aggregateByRepo(built);
+  // Default contract view aggregates per compartment; --functions keeps the
+  // per-function detail; --all / --contract are their own modes.
+  const compartmentMode = !opts.all && !opts.contract && !opts.functions;
+  if (compartmentMode) built = aggregateByCompartment(built);
   else built.links = collapseLinks(built.links);
-  const repos = [...new Set(built.nodes.map((n) => n.repo).filter(Boolean))].sort();
-  const repoColor = {};
-  repos.forEach((r, i) => { repoColor[r] = PALETTE[i % PALETTE.length]; });
+  const compartments = [...new Set(built.nodes.map((n) => n.compartment).filter(Boolean))].sort();
+  const compartmentColor = {};
+  compartments.forEach((r, i) => { compartmentColor[r] = PALETTE[i % PALETTE.length]; });
 
-  const title = opts.contract || (opts.all ? 'full graph' : repoMode ? 'contracts × repos' : 'contract references');
-  const data = { nodes: built.nodes, links: built.links, repos, repoColor, contractColor: CONTRACT_COLOR, title, aggregated: repoMode };
+  const title = opts.contract || (opts.all ? 'full graph' : compartmentMode ? 'contracts × compartments' : 'contract references');
+  const data = { nodes: built.nodes, links: built.links, compartments, compartmentColor, contractColor: CONTRACT_COLOR, title, aggregated: compartmentMode };
   writeFileSync(opts.out, renderHtml(data, { allowCdn: opts.allowCdn }));
   process.stderr.write(`wrote ${data.nodes.length} nodes / ${data.links.length} links -> ${opts.out}\n`);
-  process.stderr.write('repos: ' + repos.map((r) => `${r}=${repoColor[r]}`).join(', ') + '\n');
+  process.stderr.write('compartments: ' + compartments.map((r) => `${r}=${compartmentColor[r]}`).join(', ') + '\n');
   if (opts.open && openInBrowser(opts.out)) process.stderr.write(`opening ${opts.out} in your default browser…\n`);
 }
 
@@ -204,7 +205,7 @@ ${d3ScriptTag(allowCdn)}
 <svg id="graph"></svg>
 <div id="panel">
   <h1>${data.title} &middot; ${data.nodes.length} nodes</h1>
-  <div class="ctl"><label>same-repo attraction <span id="vCluster">0.30</span></label>
+  <div class="ctl"><label>same-compartment attraction <span id="vCluster">0.30</span></label>
     <input id="cluster" type="range" min="0" max="1" step="0.02" value="0.30"></div>
   <div class="ctl"><label>repulsion <span id="vCharge">40</span></label>
     <input id="charge" type="range" min="0" max="300" step="5" value="40"></div>
@@ -212,12 +213,12 @@ ${d3ScriptTag(allowCdn)}
     <input id="link" type="range" min="10" max="200" step="5" value="45"></div>
   <div class="ctl"><label style="cursor:pointer"><input id="labels" type="checkbox" style="vertical-align:middle"> show all labels</label></div>
   <div id="legend"></div>
-  <div class="hint">hover a node for its name &middot; drag nodes &middot; scroll to zoom &middot; click a swatch to hide a repo</div>
+  <div class="hint">hover a node for its name &middot; drag nodes &middot; scroll to zoom &middot; click a swatch to hide a compartment</div>
 </div>
 <div id="tip"></div>
 <script>
 const DATA = ${JSON.stringify(data)};
-const color = d => d.kind === 'contract' ? ${JSON.stringify(CONTRACT_COLOR)} : (DATA.repoColor[d.repo] || '#888');
+const color = d => d.kind === 'contract' ? ${JSON.stringify(CONTRACT_COLOR)} : (DATA.compartmentColor[d.compartment] || '#888');
 const svg = d3.select('#graph'), g = svg.append('g');
 const W = () => window.innerWidth, H = () => window.innerHeight;
 svg.call(d3.zoom().scaleExtent([0.03, 5]).on('zoom', e => g.attr('transform', e.transform)));
@@ -228,10 +229,10 @@ function arrow(id, col){ defs.append('marker').attr('id',id).attr('viewBox','0 -
   .attr('refX',10).attr('refY',0).attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
   .append('path').attr('d','M0,-5L10,0L0,5').attr('fill',col); }
 arrow('aRef','#E0A458'); arrow('aCall','#7B8CDE');
-const rOf = d => d.kind==='contract' ? 12 : d.kind==='repo' ? 16 : 5;
+const rOf = d => d.kind==='contract' ? 12 : d.kind==='compartment' ? 16 : 5;
 
 const centers = {};
-DATA.repos.forEach((r, i) => { const a = (i/DATA.repos.length)*2*Math.PI - Math.PI/2; centers[r] = {x:Math.cos(a), y:Math.sin(a)}; });
+DATA.compartments.forEach((r, i) => { const a = (i/DATA.compartments.length)*2*Math.PI - Math.PI/2; centers[r] = {x:Math.cos(a), y:Math.sin(a)}; });
 const radius = () => Math.min(W(),H())*0.40;
 // Spread contracts around a smaller inner ring (stable index order) instead of
 // pinning every one to the exact center — otherwise all the seams and their
@@ -241,8 +242,8 @@ contractNodes.forEach((c,i)=>{ c.__ci = i; });
 const NC = contractNodes.length;
 const innerR = () => NC<=1 ? 0 : Math.min(radius()*0.66, Math.max(Math.min(W(),H())*0.16, NC*10));
 const cAngle = d => (d.__ci/NC)*2*Math.PI - Math.PI/2;
-const tx = d => d.kind==='contract' ? W()/2 + Math.cos(cAngle(d))*innerR() : W()/2 + (centers[d.repo]?.x||0)*radius();
-const ty = d => d.kind==='contract' ? H()/2 + Math.sin(cAngle(d))*innerR() : H()/2 + (centers[d.repo]?.y||0)*radius();
+const tx = d => d.kind==='contract' ? W()/2 + Math.cos(cAngle(d))*innerR() : W()/2 + (centers[d.compartment]?.x||0)*radius();
+const ty = d => d.kind==='contract' ? H()/2 + Math.sin(cAngle(d))*innerR() : H()/2 + (centers[d.compartment]?.y||0)*radius();
 
 const tip = document.getElementById('tip');
 function showTip(e, html){ tip.style.display='block'; tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY+12)+'px'; tip.innerHTML=html; }
@@ -255,7 +256,7 @@ const link = g.append('g').attr('stroke-opacity',0.38).selectAll('line')
   .attr('marker-end', d => d.type==='REFERENCES' ? 'url(#aRef)' : 'url(#aCall)')
   .on('mousemove', (e,d)=> showTip(e, d.type==='REFERENCES'
       ? (DATA.aggregated
-          ? '<b>'+d.count+' function(s)</b> in this repo &rarr; contract<br>'+d.tokens.length+' field(s): '+d.tokens.join(', ')
+          ? '<b>'+d.count+' function(s)</b> in this compartment &rarr; contract<br>'+d.tokens.length+' field(s): '+d.tokens.join(', ')
           : '<b>REFERENCES</b> &middot; '+d.count+' field(s)<br>'+d.tokens.join(', '))
       : '<b>CALLS</b> &times;'+d.count))
   .on('mouseout', hideTip);
@@ -263,12 +264,12 @@ const link = g.append('g').attr('stroke-opacity',0.38).selectAll('line')
 const node = g.append('g').selectAll('circle')
   .data(DATA.nodes).join('circle')
   .attr('r', rOf)
-  .attr('fill', color).attr('stroke','#1b1d23').attr('stroke-width',d=>d.kind==='repo'?2:1.2)
+  .attr('fill', color).attr('stroke','#1b1d23').attr('stroke-width',d=>d.kind==='compartment'?2:1.2)
   .on('mousemove', (e,d)=> showTip(e, d.kind==='contract'
       ? '<b>'+d.name+'</b><br>contract'
-      : d.kind==='repo'
-      ? '<b>'+d.name+'</b><br>repo'
-      : '<b>'+d.name+'</b><br>'+d.repo+'<br>'+(d.file||'')+(d.line?(':'+d.line):'')))
+      : d.kind==='compartment'
+      ? '<b>'+d.name+'</b><br>compartment'
+      : '<b>'+d.name+'</b><br>'+d.compartment+'<br>'+(d.file||'')+(d.line?(':'+d.line):'')))
   .on('mouseout', hideTip)
   .call(d3.drag()
     .on('start',(e,d)=>{ if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
@@ -276,10 +277,10 @@ const node = g.append('g').selectAll('circle')
     .on('end',(e,d)=>{ if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
 
 const label = g.append('g').selectAll('text')
-  .data(DATA.nodes.filter(d=>d.kind==='contract'||d.kind==='repo')).join('text')
-  .text(d=>d.name).attr('fill',d=>d.kind==='repo'?'#e6e6e6':'#f2e9c0')
-  .attr('font-size',d=>d.kind==='repo'?'13px':'12px').attr('font-weight',d=>d.kind==='repo'?'600':'400')
-  .attr('text-anchor','middle').attr('dy',d=>d.kind==='repo'?-21:-15)
+  .data(DATA.nodes.filter(d=>d.kind==='contract'||d.kind==='compartment')).join('text')
+  .text(d=>d.name).attr('fill',d=>d.kind==='compartment'?'#e6e6e6':'#f2e9c0')
+  .attr('font-size',d=>d.kind==='compartment'?'13px':'12px').attr('font-weight',d=>d.kind==='compartment'?'600':'400')
+  .attr('text-anchor','middle').attr('dy',d=>d.kind==='compartment'?-21:-15)
   .style('pointer-events','none');
 
 const sim = d3.forceSimulation(DATA.nodes)
@@ -287,7 +288,7 @@ const sim = d3.forceSimulation(DATA.nodes)
   .force('charge', d3.forceManyBody().strength(-70))
   .force('x', d3.forceX(tx).strength(d=>d.kind==='contract'?0.5:0.28))
   .force('y', d3.forceY(ty).strength(d=>d.kind==='contract'?0.5:0.28))
-  .force('collide', d3.forceCollide(d=>d.kind==='contract'?20:d.kind==='repo'?24:6))
+  .force('collide', d3.forceCollide(d=>d.kind==='contract'?20:d.kind==='compartment'?24:6))
   .on('tick', ()=>{
     // Trim each line to the target node's border so the arrowhead is visible.
     link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
@@ -304,19 +305,19 @@ bind('charge','vCharge', v=> sim.force('charge').strength(-v), v=>v.toFixed(0));
 bind('link','vLink', v=> sim.force('link').distance(v), v=>v.toFixed(0));
 
 const hidden=new Set();
-const items=[...DATA.repos.map(r=>({key:r,label:r,col:DATA.repoColor[r]})),{key:'__contract',label:'contract',col:${JSON.stringify(CONTRACT_COLOR)}}];
+const items=[...DATA.compartments.map(r=>({key:r,label:r,col:DATA.compartmentColor[r]})),{key:'__contract',label:'contract',col:${JSON.stringify(CONTRACT_COLOR)}}];
 const legend=d3.select('#legend');
 items.forEach(it=>{ const row=legend.append('div').attr('class','leg').on('click',function(){
     hidden.has(it.key)?hidden.delete(it.key):hidden.add(it.key); d3.select(this).classed('off',hidden.has(it.key)); applyFilter(); });
   row.append('div').attr('class','sw').style('background',it.col); row.append('div').text(it.label); });
-const isHidden=d=> hidden.has(d.kind==='contract'?'__contract':d.repo);
+const isHidden=d=> hidden.has(d.kind==='contract'?'__contract':d.compartment);
 // Labels are OFF by default: with many seams the always-on text is the main source
 // of clutter, and hovering any node already shows its name in the tooltip. The
 // "show all labels" checkbox turns them on for when the user has zoomed into a region.
 let labelsOn=false;
 document.getElementById('labels').addEventListener('change', e=>{ labelsOn=e.target.checked; applyFilter(); });
 function applyFilter(){ node.attr('display',d=>isHidden(d)?'none':null);
-  label.attr('display',d=>((d.kind==='repo'||labelsOn) && !isHidden(d))?null:'none');
+  label.attr('display',d=>((d.kind==='compartment'||labelsOn) && !isHidden(d))?null:'none');
   link.attr('display',d=>(isHidden(d.source)||isHidden(d.target))?'none':null); }
 applyFilter();
 </script>

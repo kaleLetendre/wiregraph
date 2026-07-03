@@ -1,9 +1,9 @@
-// Cross-repo wire edges via the contracts repo.
+// Cross-compartment wire edges via the contracts dir.
 //
-// Repos that don't call each other in-process may still agree on wire shapes
-// published in an AsyncAPI contracts dir. So the join between a producer in one
-// repo and the consumer in another that answers it is the *contract*, not a call
-// edge. We model each contract file as a Contract node, pull out the
+// Compartments that don't call each other in-process may still agree on wire
+// shapes published in an AsyncAPI contracts dir. So the join between a producer in
+// one compartment and the consumer in another that answers it is the *contract*,
+// not a call edge. We model each contract file as a Contract node, pull out the
 // distinctive wire tokens it defines (channel address paths + snake_case payload
 // fields), then attach any code symbol whose body mentions one of those tokens
 // to the Contract via a REFERENCES edge tagged evidence:'contract-match'.
@@ -27,16 +27,17 @@ const STOP = new Set([
 ]);
 
 // Generic HTTP endpoints every service exposes — sharing one is NOT a contract
-// between two specific services, so they must not mint a cross-repo seam.
+// between two specific services, so they must not mint a cross-compartment seam.
 const ROUTE_STOP = new Set([
   '/', '/health', '/healthz', '/health/live', '/health/ready', '/metrics',
   '/status', '/ping', '/ready', '/readyz', '/live', '/livez', '/version',
   '/favicon.ico', '/robots.txt', '/api', '/api/v1', '/api/v2', '/v1', '/v2', '/index',
 ]);
 
-// Ubiquitous infrastructure env vars — two services reading DATABASE_URL share
-// infra config, not a service-to-service contract. (Project-named vars like
-// STRIPE_WEBHOOK_URL still pass — only these exact generic names are dropped.)
+// Ubiquitous infrastructure environment variables — two services reading
+// DATABASE_URL share infra config, not a service-to-service contract.
+// (Project-named vars like STRIPE_WEBHOOK_URL still pass — only these exact
+// generic names are dropped.)
 const ENV_STOP = new Set([
   'DATABASE_URL', 'REDIS_URL', 'REDIS_HOST', 'NODE_ENV', 'PORT', 'HOST', 'HOSTNAME',
   'LOG_LEVEL', 'DEBUG', 'PATH', 'HOME', 'PWD', 'USER', 'SHELL', 'TERM', 'LANG',
@@ -176,10 +177,10 @@ export function loadContracts(graph, contractsDir, log = () => {}) {
 // Build a per-file list of {startLine, endLine, id} intervals from real symbols
 // so we can map a token's line back to the function that contains it.
 function symbolIntervals(graph) {
-  const byFile = new Map(); // `${repo}\0${file}` -> [{startLine,endLine,id}]
+  const byFile = new Map(); // `${compartment}\0${file}` -> [{startLine,endLine,id}]
   for (const s of graph.symbols.values()) {
     if (s.kind === 'module') continue;
-    const k = `${s.repo}\0${s.file}`;
+    const k = `${s.compartment}\0${s.file}`;
     if (!byFile.has(k)) byFile.set(k, []);
     byFile.get(k).push(s);
   }
@@ -225,8 +226,8 @@ export function matchContracts(graph, rootDir, contracts, log = () => {}, fileFi
     } catch {
       continue;
     }
-    const fileIntervals = intervals.get(`${f.repo}\0${f.relPath}`);
-    const moduleIdOf = `sym:${f.repo}:${f.relPath}:<module>:0`;
+    const fileIntervals = intervals.get(`${f.compartment}\0${f.relPath}`);
+    const moduleIdOf = `sym:${f.compartment}:${f.relPath}:<module>:0`;
 
     for (const tok of allTokens) {
       const at = text.indexOf(tok);
@@ -245,7 +246,7 @@ export function matchContracts(graph, rootDir, contracts, log = () => {}, fileFi
         graph.addEdge('REFERENCES', fromId, cid, {
           evidence: 'contract-match',
           token: tok,
-          side: f.repo,
+          side: f.compartment,
         });
         refs++;
       }
@@ -262,17 +263,18 @@ export function matchContracts(graph, rootDir, contracts, log = () => {}, fileFi
 // (request = terminal->server, reply = server->terminal). A token only one side
 // touches yields no edge — that asymmetry is the gap, made visible by absence.
 // WIRE edges encode a producer->consumer direction, which needs to know which
-// repo is the "server" side. That's project-specific, so it's configured via env
-// (WIREGRAPH_SERVER_REPO, and optionally WIREGRAPH_SELF_REPO to exclude a
-// root/aggregate repo). With no server repo set, directional WIRE derivation is
-// skipped — the REFERENCES edges and Contract nodes (which trace_contract and
-// path_between use) are unaffected; only the export visualizations use WIRE.
-const SERVER_REPO = process.env.WIREGRAPH_SERVER_REPO || null;
-const SELF_REPO = process.env.WIREGRAPH_SELF_REPO || null;
+// compartment is the "server" side. That's project-specific, so it's configured
+// via env (WIREGRAPH_SERVER_REPO, and optionally WIREGRAPH_SELF_REPO to exclude a
+// root/aggregate compartment). With no server compartment set, directional WIRE
+// derivation is skipped — the REFERENCES edges and Contract nodes (which
+// trace_contract and path_between use) are unaffected; only the export
+// visualizations use WIRE.
+const SERVER_COMPARTMENT = process.env.WIREGRAPH_SERVER_REPO || null;
+const SELF_COMPARTMENT = process.env.WIREGRAPH_SELF_REPO || null;
 const MAX_PAIRS_PER_TOKEN = 25;
 
 export function buildWireEdges(graph, contracts, log = () => {}) {
-  if (!SERVER_REPO) {
+  if (!SERVER_COMPARTMENT) {
     log('  WIRE edges skipped (set WIREGRAPH_SERVER_REPO to derive directional wire edges)');
     return { wire: 0, gaps: 0 };
   }
@@ -283,7 +285,7 @@ export function buildWireEdges(graph, contracts, log = () => {}) {
   for (const e of graph.edges) {
     if (e.type !== 'REFERENCES') continue;
     const sym = graph.symbols.get(e.from);
-    if (!sym || sym.repo === SELF_REPO) continue;
+    if (!sym || sym.compartment === SELF_COMPARTMENT) continue;
     const key = e.to + '|' + e.props.token;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(sym);
@@ -298,8 +300,8 @@ export function buildWireEdges(graph, contracts, log = () => {}) {
     const c = cById.get(cid);
     if (!c) continue;
 
-    const server = syms.filter((s) => s.repo === SERVER_REPO);
-    const terminal = syms.filter((s) => s.repo !== SERVER_REPO);
+    const server = syms.filter((s) => s.compartment === SERVER_COMPARTMENT);
+    const terminal = syms.filter((s) => s.compartment !== SERVER_COMPARTMENT);
     if (!server.length || !terminal.length) { gaps++; continue; }
 
     const dir = c.direction[token] || 'unknown';

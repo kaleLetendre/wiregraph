@@ -128,11 +128,11 @@ export async function summarize(project, { sessionId = null } = {}) {
       if (existsSync(dbp)) {
         const db = connect(dbp, { readonly: true });
         try {
-          const roots = new Map();         // repo name -> root path
-          for (const r of db.prepare('SELECT name,root FROM repos WHERE project=?').all(project)) roots.set(r.name, r.root);
+          const roots = new Map();         // compartment name -> root path
+          for (const r of db.prepare('SELECT name,root FROM compartments WHERE project=?').all(project)) roots.set(r.name, r.root);
           const byName = new Map();        // symbol name -> {file, root}
-          for (const s of db.prepare("SELECT name, file, repo FROM symbols WHERE project=? AND kind <> 'module'").all(project)) {
-            if (!byName.has(s.name)) byName.set(s.name, { file: s.file, root: roots.get(s.repo) });
+          for (const s of db.prepare("SELECT name, file, compartment FROM symbols WHERE project=? AND kind <> 'module'").all(project)) {
+            if (!byName.has(s.name)) byName.set(s.name, { file: s.file, root: roots.get(s.compartment) });
           }
           const fileTok = new Map();
           let reads = 0;

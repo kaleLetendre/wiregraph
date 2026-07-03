@@ -1,6 +1,6 @@
 // Data-gathering for the GEXF / HTML exporters, reading the embedded SQLite
 // store (the renderers stay pure-JS and unchanged). Returns { nodes, links }
-// where a node is { id, kind, repo, name, file, line } (kind 'contract' for
+// where a node is { id, kind, compartment, name, file, line } (kind 'contract' for
 // Contract nodes) and a link is { source, target, type, token?, contract?,
 // direction?, count? }. Mirrors the shapes the old Neo4j gather produced.
 
@@ -10,15 +10,15 @@ const isTest = (f) => !!f && (f.includes('tests/') || f.includes('/test/') || f.
 
 function symbolNodes(db, project) {
   const m = new Map();
-  for (const s of db.prepare('SELECT id,repo,file,name,kind,startLine FROM symbols WHERE project=?').all(project)) {
-    m.set(s.id, { id: s.id, kind: s.kind || 'symbol', repo: s.repo || null, name: s.name || s.id, file: s.file || null, line: s.startLine != null ? Number(s.startLine) : null });
+  for (const s of db.prepare('SELECT id,compartment,file,name,kind,startLine FROM symbols WHERE project=?').all(project)) {
+    m.set(s.id, { id: s.id, kind: s.kind || 'symbol', compartment: s.compartment || null, name: s.name || s.id, file: s.file || null, line: s.startLine != null ? Number(s.startLine) : null });
   }
   return m;
 }
 function contractNodes(db, project) {
   const m = new Map();
   for (const c of db.prepare('SELECT id,name FROM contracts WHERE project=?').all(project)) {
-    m.set(c.id, { id: c.id, kind: 'contract', repo: null, name: c.name || c.id, file: null, line: null });
+    m.set(c.id, { id: c.id, kind: 'contract', compartment: null, name: c.name || c.id, file: null, line: null });
   }
   return m;
 }

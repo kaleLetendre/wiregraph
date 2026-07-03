@@ -217,9 +217,9 @@ async function rebuildDurabilityTest() {
   const project = join(work, 'proj');
 
   const g1 = new Graph(project);
-  g1.addRepo('r', project);
+  g1.addCompartment('r', project);
   g1.addFile('r', 'a.c', 'c');
-  g1.addSymbol({ id: 'sym:r:a.c:keepme:1', repo: 'r', file: 'a.c', name: 'keepme', kind: 'function', lang: 'c', startLine: 1, endLine: 2 });
+  g1.addSymbol({ id: 'sym:r:a.c:keepme:1', compartment: 'r', file: 'a.c', name: 'keepme', kind: 'function', lang: 'c', startLine: 1, endLine: 2 });
   let conn = connect(db);
   loadGraph(conn, g1);
   conn.close();
@@ -232,9 +232,9 @@ async function rebuildDurabilityTest() {
   conn.close();
 
   const g2 = new Graph(project);
-  g2.addRepo('r', project);
+  g2.addCompartment('r', project);
   // startLine is an object — sql.js can't bind it, so insSym.run throws mid-tx.
-  g2.symbols.set('bad', { id: 'bad', repo: 'r', file: 'b.c', name: 'bad', kind: 'function', lang: 'c', startLine: {}, endLine: 0, project });
+  g2.symbols.set('bad', { id: 'bad', compartment: 'r', file: 'b.c', name: 'bad', kind: 'function', lang: 'c', startLine: {}, endLine: 0, project });
 
   conn = connect(db);
   let threw = false;
@@ -410,8 +410,8 @@ async function contractsTests() {
   const seams = I.clusterSeams(candidates);
   eq(seams.length, 1, 'contracts: exactly one cross-repo seam (server-only /api/users/:id excluded)');
   eq(seams[0].token, '/api/register', 'contracts: seam token is /api/register');
-  eq(seams[0].repos.length, 2, 'contracts: seam spans both repos');
-  ok(seams[0].inRepos.includes('svc-api'), 'contracts: server side learned (svc-api defines the route)');
+  eq(seams[0].compartments.length, 2, 'contracts: seam spans both compartments');
+  ok(seams[0].inCompartments.includes('svc-api'), 'contracts: server side learned (svc-api defines the route)');
 
   // round-trip: generated YAML must re-extract through loadContracts/matchContracts
   const yaml = I.synthesizeAsyncApi(seams);
@@ -423,7 +423,7 @@ async function contractsTests() {
   await runBuild({ target: project, project, db, reset: true });
   const conn = connect(db, { readonly: true });
   const repos = new Set(
-    conn.prepare("SELECT DISTINCT s.repo repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES'")
+    conn.prepare("SELECT DISTINCT s.compartment repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES'")
       .all(project).map((r) => r.repo),
   );
   ok(repos.has('svc-api') && repos.has('mobile-app'),
@@ -447,7 +447,7 @@ async function messagingTest() {
   const seams = I.clusterSeams(I.extractCandidates(project));
   const msg = seams.find((s) => s.kind === 'message' && s.token === 'device.heartbeat');
   ok(msg, `messaging: cross-repo topic seam detected (got ${seams.map((s) => s.kind + ':' + s.token).join(', ') || 'none'})`);
-  ok(msg && msg.repos.length === 2, 'messaging: topic seam spans producer + consumer repos');
+  ok(msg && msg.compartments.length === 2, 'messaging: topic seam spans producer + consumer compartments');
 
   const yaml = I.synthesizeAsyncApi(seams);
   has(yaml, 'address: device.heartbeat', 'messaging: generated channel address is the topic');
@@ -457,7 +457,7 @@ async function messagingTest() {
   await runBuild({ target: project, project, db, reset: true });
   const conn = connect(db, { readonly: true });
   const repos = new Set(
-    conn.prepare("SELECT DISTINCT s.repo repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES'")
+    conn.prepare("SELECT DISTINCT s.compartment repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES'")
       .all(project).map((r) => r.repo),
   );
   ok(repos.has('producer') && repos.has('consumer'),
@@ -490,7 +490,7 @@ async function stateTest() {
   await runBuild({ target: project, project, db, reset: true });
   const conn = connect(db, { readonly: true });
   const repos = new Set(
-    conn.prepare("SELECT DISTINCT s.repo repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES'")
+    conn.prepare("SELECT DISTINCT s.compartment repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES'")
       .all(project).map((r) => r.repo),
   );
   ok(repos.has('svc-a') && repos.has('svc-b'), `state: round-trip links both env readers (got ${[...repos].join(', ') || 'none'})`);
@@ -631,7 +631,7 @@ async function monorepoCompartmentTest() {
   const seams = I.clusterSeams(I.extractCandidates(project));
   eq(seams.length, 1, 'compartments: one seam inside a single-git monorepo');
   eq(seams[0].token, '/internal/sync', 'compartments: seam token is the shared route');
-  const parts = [...seams[0].repos].sort();
+  const parts = [...seams[0].compartments].sort();
   ok(parts.includes('api') && parts.includes('worker'), `compartments: seam spans the api + worker packages (got ${parts.join(', ')})`);
   rmSync(work, { recursive: true, force: true });
 }

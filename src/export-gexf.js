@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-// wiregraph export-gexf — write a GEXF file for Gephi. Nodes carry repo/kind/
-// file/line attributes and a viz:color matching the repo palette; edges are
-// DIRECTED (a CALLS b; publisher WIRE consumer) with type/token/contract/
-// direction attributes. Open in Gephi, run ForceAtlas2, partition-color by
-// "repo" (colors are pre-set so it already matches).
+// wiregraph export-gexf — write a GEXF file for Gephi. Nodes carry compartment/
+// kind/file/line attributes and a viz:color matching the compartment palette;
+// edges are DIRECTED (a CALLS b; publisher WIRE consumer) with type/token/
+// contract/direction attributes. Open in Gephi, run ForceAtlas2, partition-color
+// by "compartment" (colors are pre-set so it already matches).
 //
 // Modes:
-//   (default)             the cross-repo WIRE surface (symbol->symbol wire edges)
-//   --contract "<name>"   ONE contract: its WIRE edges + the in-repo call stacks
+//   (default)             the cross-compartment WIRE surface (symbol->symbol wire edges)
+//   --contract "<name>"   ONE contract: its WIRE edges + the in-compartment call stacks
 //                         that reach each endpoint (callers --up, callees --down)
 //   --all                 every symbol + CALLS + WIRE
 //
@@ -56,20 +56,20 @@ function collapse(links) {
   return [...m.values()];
 }
 
-function renderGexf(nodes, links, repoColor) {
+function renderGexf(nodes, links, compartmentColor) {
   const out = [];
   out.push('<?xml version="1.0" encoding="UTF-8"?>');
   out.push('<gexf xmlns="http://gexf.net/1.3" xmlns:viz="http://gexf.net/1.3/viz" version="1.3">');
-  out.push('  <meta><creator>wiregraph</creator><description>cross-repo call + wire graph</description></meta>');
+  out.push('  <meta><creator>wiregraph</creator><description>cross-compartment call + wire graph</description></meta>');
   out.push('  <graph defaultedgetype="directed" mode="static">');
-  out.push('    <attributes class="node"><attribute id="0" title="repo" type="string"/><attribute id="1" title="kind" type="string"/><attribute id="2" title="file" type="string"/><attribute id="3" title="line" type="integer"/></attributes>');
+  out.push('    <attributes class="node"><attribute id="0" title="compartment" type="string"/><attribute id="1" title="kind" type="string"/><attribute id="2" title="file" type="string"/><attribute id="3" title="line" type="integer"/></attributes>');
   out.push('    <attributes class="edge"><attribute id="0" title="type" type="string"/><attribute id="1" title="tokens" type="string"/><attribute id="2" title="contract" type="string"/><attribute id="3" title="direction" type="string"/></attributes>');
   out.push('    <nodes>');
   for (const n of nodes) {
-    const c = hexToRgb(repoColor[n.repo] || '#9aa1ac');
-    // Contract nodes have no repo/file/line — emit empty, not the literal "null".
+    const c = hexToRgb(compartmentColor[n.compartment] || '#9aa1ac');
+    // Contract nodes have no compartment/file/line — emit empty, not the literal "null".
     out.push(`      <node id="${xml(n.id)}" label="${xml(n.name)}">` +
-      `<attvalues><attvalue for="0" value="${xml(n.repo ?? '')}"/><attvalue for="1" value="${xml(n.kind ?? '')}"/><attvalue for="2" value="${xml(n.file ?? '')}"/><attvalue for="3" value="${xml(n.line ?? '')}"/></attvalues>` +
+      `<attvalues><attvalue for="0" value="${xml(n.compartment ?? '')}"/><attvalue for="1" value="${xml(n.kind ?? '')}"/><attvalue for="2" value="${xml(n.file ?? '')}"/><attvalue for="3" value="${xml(n.line ?? '')}"/></attvalues>` +
       `<viz:color r="${c.r}" g="${c.g}" b="${c.b}"/></node>`);
   }
   out.push('    </nodes>');
@@ -102,13 +102,13 @@ async function main() {
   } finally { db.close(); }
 
   const links = collapse(built.links);
-  const repos = [...new Set(built.nodes.map((n) => n.repo).filter(Boolean))].sort();
-  const repoColor = {};
-  repos.forEach((r, i) => { repoColor[r] = PALETTE[i % PALETTE.length]; });
+  const compartments = [...new Set(built.nodes.map((n) => n.compartment).filter(Boolean))].sort();
+  const compartmentColor = {};
+  compartments.forEach((r, i) => { compartmentColor[r] = PALETTE[i % PALETTE.length]; });
 
-  writeFileSync(opts.out, renderGexf(built.nodes, links, repoColor));
+  writeFileSync(opts.out, renderGexf(built.nodes, links, compartmentColor));
   process.stderr.write(`wrote ${built.nodes.length} nodes / ${links.length} edges -> ${opts.out}\n`);
-  process.stderr.write('repos: ' + repos.map((r) => `${r}=${repoColor[r]}`).join(', ') + '\n');
+  process.stderr.write('compartments: ' + compartments.map((r) => `${r}=${compartmentColor[r]}`).join(', ') + '\n');
 }
 
 main().catch((e) => { process.stderr.write('ERROR: ' + (e.stack || e.message) + '\n'); process.exit(1); });

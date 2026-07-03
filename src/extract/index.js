@@ -1,6 +1,6 @@
 // Top-level extraction: walk -> parse each file -> populate the Graph with
-// Repo/File/Symbol nodes and DEFINED_IN edges, and accumulate raw (unresolved)
-// calls that resolve.js will turn into CALLS edges.
+// Compartment/File/Symbol nodes and DEFINED_IN edges, and accumulate raw
+// (unresolved) calls that resolve.js will turn into CALLS edges.
 
 import { readFileSync, statSync } from 'node:fs';
 import { walkSources } from './walk.js';
@@ -10,11 +10,11 @@ import { symbolId, moduleId } from '../model.js';
 const MAX_BYTES = 2_000_000; // skip pathologically large/generated files
 
 // fileFilter (optional): a Set of absolute paths. When present, only those files
-// are parsed — the incremental path. The walker still discovers repo roots so a
-// changed file is attributed to the right repo.
+// are parsed — the incremental path. The walker still discovers compartment roots
+// so a changed file is attributed to the right compartment.
 export function extractCode(graph, rootDir, log = () => {}, fileFilter = null) {
-  const calls = []; // { fromId, repo, relPath, name, line }
-  const candidates = []; // contract signals { kind, token, role, label, repo, file, line }
+  const calls = []; // { fromId, compartment, relPath, name, line }
+  const candidates = []; // contract signals { kind, token, role, label, compartment, file, line }
   let fileCount = 0;
 
   for (const f of walkSources(rootDir)) {
@@ -33,17 +33,17 @@ export function extractCode(graph, rootDir, log = () => {}, fileFilter = null) {
     let mtime = null, size = null;
     try { const st = statSync(f.abs); mtime = st.mtimeMs; size = st.size; } catch { /* keep null */ }
 
-    graph.addRepo(f.repo, f.repoRoot);
-    graph.addFile(f.repo, f.relPath, f.lang, mtime, size);
-    graph.addEdge('IN_REPO', `file:${f.repo}:${f.relPath}`, `repo:${f.repo}`);
+    graph.addCompartment(f.compartment, f.compartmentRoot);
+    graph.addFile(f.compartment, f.relPath, f.lang, mtime, size);
+    graph.addEdge('IN_COMPARTMENT', `file:${f.compartment}:${f.relPath}`, `compartment:${f.compartment}`);
 
     // Synthetic module symbol owns top-level calls.
-    const modId = moduleId(f.repo, f.relPath);
+    const modId = moduleId(f.compartment, f.relPath);
     graph.addSymbol({
-      id: modId, repo: f.repo, file: f.relPath, name: '<module>',
+      id: modId, compartment: f.compartment, file: f.relPath, name: '<module>',
       kind: 'module', lang: f.lang, startLine: 0, endLine: 0,
     });
-    graph.addEdge('DEFINED_IN', modId, `file:${f.repo}:${f.relPath}`);
+    graph.addEdge('DEFINED_IN', modId, `file:${f.compartment}:${f.relPath}`);
 
     let parsed;
     try {
@@ -55,21 +55,21 @@ export function extractCode(graph, rootDir, log = () => {}, fileFilter = null) {
 
     // Mint global ids for this file's symbols (index-aligned with parsed.symbols).
     const localIds = parsed.symbols.map((s) => {
-      const id = symbolId(f.repo, f.relPath, s.name, s.startLine);
+      const id = symbolId(f.compartment, f.relPath, s.name, s.startLine);
       graph.addSymbol({
-        id, repo: f.repo, file: f.relPath, name: s.name, kind: s.kind,
+        id, compartment: f.compartment, file: f.relPath, name: s.name, kind: s.kind,
         lang: f.lang, startLine: s.startLine, endLine: s.endLine,
       });
-      graph.addEdge('DEFINED_IN', id, `file:${f.repo}:${f.relPath}`);
+      graph.addEdge('DEFINED_IN', id, `file:${f.compartment}:${f.relPath}`);
       return id;
     });
 
     for (const c of parsed.calls) {
       const fromId = c.enclosing == null ? modId : localIds[c.enclosing];
-      calls.push({ fromId, repo: f.repo, relPath: f.relPath, name: c.name, line: c.line });
+      calls.push({ fromId, compartment: f.compartment, relPath: f.relPath, name: c.name, line: c.line });
     }
     for (const c of parsed.candidates || []) {
-      candidates.push({ kind: c.kind, token: c.token, role: c.role, label: c.label, repo: f.repo, file: f.relPath, line: c.line });
+      candidates.push({ kind: c.kind, token: c.token, role: c.role, label: c.label, compartment: f.compartment, file: f.relPath, line: c.line });
     }
 
     fileCount++;

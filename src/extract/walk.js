@@ -1,5 +1,6 @@
-// Walk a root directory: discover sub-repos (by .git) and yield source files
-// tagged with the repo they belong to and their language.
+// Walk a root directory: discover compartments (by .git or a module manifest)
+// and yield source files tagged with the compartment they belong to and their
+// language.
 
 import { readdirSync, statSync, existsSync, readFileSync } from 'node:fs';
 import { join, relative, basename } from 'node:path';
@@ -31,11 +32,11 @@ function isCompartmentBoundary(dir, entries) {
   return false;
 }
 
-// A file belongs to the *nearest* ancestor directory that contains a .git.
-// Files under the root that sit in no sub-repo are attributed to the root's name.
-function repoNameFor(absPath, repoRoots, rootName, rootDir) {
+// A file belongs to the *nearest* ancestor compartment boundary. Files under the
+// root that sit in no sub-compartment are attributed to the root's name.
+function compartmentNameFor(absPath, compartmentRoots, rootName, rootDir) {
   let best = null;
-  for (const r of repoRoots) {
+  for (const r of compartmentRoots) {
     if (absPath === r.dir || absPath.startsWith(r.dir + '/')) {
       if (!best || r.dir.length > best.dir.length) best = r;
     }
@@ -44,7 +45,7 @@ function repoNameFor(absPath, repoRoots, rootName, rootDir) {
   return { name: rootName, root: rootDir };
 }
 
-function findRepoRoots(rootDir) {
+function findCompartmentRoots(rootDir) {
   const roots = [];
   (function scan(dir) {
     let entries;
@@ -63,10 +64,10 @@ function findRepoRoots(rootDir) {
   return roots;
 }
 
-// Yields { abs, repo, repoRoot, relPath, lang, variant }
+// Yields { abs, compartment, compartmentRoot, relPath, lang, variant }
 export function* walkSources(rootDir) {
   const rootName = basename(rootDir);
-  const repoRoots = findRepoRoots(rootDir);
+  const compartmentRoots = findCompartmentRoots(rootDir);
 
   const stack = [rootDir];
   while (stack.length) {
@@ -86,12 +87,12 @@ export function* walkSources(rootDir) {
       if (!e.isFile()) continue;
       const lang = langForFile(e.name);
       if (!lang) continue;
-      const { name: repo, root: repoRoot } = repoNameFor(abs, repoRoots, rootName, rootDir);
+      const { name: compartment, root: compartmentRoot } = compartmentNameFor(abs, compartmentRoots, rootName, rootDir);
       yield {
         abs,
-        repo,
-        repoRoot,
-        relPath: relative(repoRoot, abs),
+        compartment,
+        compartmentRoot,
+        relPath: relative(compartmentRoot, abs),
         lang: lang.lang,
         variant: lang.variant,
       };
@@ -99,4 +100,4 @@ export function* walkSources(rootDir) {
   }
 }
 
-export { findRepoRoots, repoNameFor };
+export { findCompartmentRoots, compartmentNameFor };
