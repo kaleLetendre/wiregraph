@@ -181,8 +181,12 @@ function incrementalBuild(opts, root, project) {
       // Structural drift: did this update change the symbol NAME-set (add / remove /
       // rename) rather than only edit a body? If so, callers resolved by name in
       // UNCHANGED files may be approximate until the next full rebuild.
+      // Compare only real symbols: loadProjectSymbols (priorNames) excludes the
+      // synthetic <module> symbol, so freshNames must too — otherwise the module
+      // entry is always "new" and a pure body edit falsely reads as drift, nagging
+      // "run rebuild" after every incremental update.
       const priorNames = new Set(allPrior.filter((s) => changedKeys.has(`${s.compartment}\0${s.file}`)).map((s) => `${s.compartment}\0${s.file}\0${s.name}`));
-      const freshNames = new Set([...graph.symbols.values()].map((s) => `${s.compartment}\0${s.file}\0${s.name}`));
+      const freshNames = new Set([...graph.symbols.values()].filter((s) => s.kind !== 'module').map((s) => `${s.compartment}\0${s.file}\0${s.name}`));
       structuralDrift = priorNames.size !== freshNames.size || [...freshNames].some((k) => !priorNames.has(k));
     }
 

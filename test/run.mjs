@@ -607,6 +607,12 @@ async function structuralDriftTest() {
   S.updateState(proj, {}); // ensure state file exists with defaults
   eq(!!S.readState(proj)?.structuralDriftSinceFullBuild, false, 'drift: clear after full build');
 
+  // pure body edit (no symbol added/removed/renamed) must NOT set drift — else the
+  // <module> symbol makes every incremental look like drift and the nag is useless.
+  writeFileSync(join(src, 'a.js'), 'export function foo(){ return 1 + 1; }\nexport function bar(){ return foo(); }\n');
+  await runBuild({ target: proj, project: proj, db, files: [join(src, 'a.js')] });
+  eq(!!S.readState(proj)?.structuralDriftSinceFullBuild, false, 'drift: NOT set by a pure body edit');
+
   // rename foo -> qux (a name-set change) via incremental
   writeFileSync(join(src, 'a.js'), 'export function qux(){ return 1; }\nexport function bar(){ return qux(); }\n');
   await runBuild({ target: proj, project: proj, db, files: [join(src, 'a.js')] });
