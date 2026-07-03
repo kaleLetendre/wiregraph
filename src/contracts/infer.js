@@ -87,14 +87,20 @@ export function clusterSeams(candidates) {
 
 // --- 3. synthesize a draft AsyncAPI 3.0 doc ---------------------------------
 // One channel per seam, address = the token (path or topic). A server-perspective
-// `receive` operation per channel; the cross-compartment REFERENCES link the seam
-// creates doesn't depend on exact direction.
+// `receive` operation per channel. We also record, as `x-wiregraph-*` extensions,
+// which compartments PRODUCE (call/send — the seam's out side) and CONSUME
+// (define/receive — the in side): the scan already knows this, so encoding it lets
+// buildWireEdges derive directional producer->consumer WIRE edges straight from an
+// inferred spec, with no WIREGRAPH_SERVER_REPO env var. (REFERENCES don't need it;
+// directional WIRE does — and throwing the direction away made the round-trip lossy.)
 export function synthesizeAsyncApi(seams, title = 'wiregraph-inferred') {
   const channels = {};
   const operations = {};
   for (const s of seams) {
     const key = channelKey(s.kind, s.token);
     channels[key] = { address: s.token, messages: { request: { payload: { type: 'object', properties: {} } } } };
+    if (s.outCompartments.length) channels[key]['x-wiregraph-producers'] = s.outCompartments;
+    if (s.inCompartments.length) channels[key]['x-wiregraph-consumers'] = s.inCompartments;
     operations[`receive-${key}`] = {
       action: 'receive',
       channel: { $ref: `#/channels/${key}` },

@@ -59,6 +59,19 @@ export function isDistinctive(tok) {
   return false;
 }
 
+// A channel `address` -> the matchable token: a path is trimmed at its first
+// {param} segment to a prefix; a non-path (topic / routing key) is matched
+// literally. Shared by collectTokens and the wire-role reader so both key on the
+// exact same token that lands on REFERENCES edges. null = no matchable token.
+function normalizeAddress(addr) {
+  if (typeof addr !== 'string' || !addr) return null;
+  if (addr.startsWith('/')) {
+    const prefix = addr.split('/').filter((s) => s && !s.includes('{')).join('/');
+    return prefix ? '/' + prefix : null;
+  }
+  return addr;
+}
+
 // Walk a parsed YAML doc collecting every key that sits under a "properties"
 // map, plus channel address paths (with {param} segments trimmed to a prefix).
 function collectTokens(doc) {
@@ -74,14 +87,9 @@ function collectTokens(doc) {
         for (const k of Object.keys(node)) tokens.add(k);
       }
       for (const [k, v] of Object.entries(node)) {
-        if (k === 'address' && typeof v === 'string') {
-          if (v.startsWith('/')) {
-            // path address: trim {param} segments to a matchable prefix
-            const prefix = v.split('/').filter((s) => s && !s.includes('{')).join('/');
-            if (prefix) tokens.add('/' + prefix);
-          } else {
-            tokens.add(v); // non-path address (message topic / routing key) — matched literally
-          }
+        if (k === 'address') {
+          const t = normalizeAddress(v);
+          if (t) tokens.add(t);
         }
         walk(v, k);
       }
@@ -89,6 +97,22 @@ function collectTokens(doc) {
   })(doc, null);
 
   return [...tokens].filter(isDistinctive);
+}
+
+// Read the producer/consumer compartments the inference encoded per channel, keyed
+// by the same normalized token REFERENCES edges use. Empty when a (hand-written)
+// spec carries no x-wiregraph-* extensions — buildWireEdges then falls back to env.
+function readWireRoles(doc) {
+  const roles = new Map();
+  for (const ch of Object.values(doc.channels || {})) {
+    if (!ch || typeof ch !== 'object') continue;
+    const tok = normalizeAddress(ch.address);
+    if (!tok) continue;
+    const producers = new Set(Array.isArray(ch['x-wiregraph-producers']) ? ch['x-wiregraph-producers'] : []);
+    const consumers = new Set(Array.isArray(ch['x-wiregraph-consumers']) ? ch['x-wiregraph-consumers'] : []);
+    if (producers.size || consumers.size) roles.set(tok, { producers, consumers });
+  }
+  return roles;
 }
 
 // --- direction inference ----------------------------------------------------
@@ -168,7 +192,7 @@ export function loadContracts(graph, contractsDir, log = () => {}) {
     // Channel address paths are endpoints the client calls -> client to server.
     for (const t of tokens) if (t.startsWith('/') && !(t in direction)) direction[t] = 'c2s';
     graph.addContract({ id, name, kind: 'asyncapi', file: f });
-    contracts.push({ id, name, file: f, tokens, direction });
+    contracts.push({ id, name, file: f, tokens, direction, wireRoles: readWireRoles(doc) });
   }
   log(`  loaded ${contracts.length} contracts; ${contracts.reduce((n, c) => n + c.tokens.length, 0)} wire tokens`);
   return contracts;
@@ -274,11 +298,16 @@ const SELF_COMPARTMENT = process.env.WIREGRAPH_SELF_REPO || null;
 const MAX_PAIRS_PER_TOKEN = 25;
 
 export function buildWireEdges(graph, contracts, log = () => {}) {
-  if (!SERVER_COMPARTMENT) {
-    log('  WIRE edges skipped (set WIREGRAPH_SERVER_REPO to derive directional wire edges)');
+  const cById = new Map(contracts.map((c) => [c.id, c]));
+  // Two ways to orient a WIRE edge: the producer/consumer compartments the
+  // inference encoded per channel (x-wiregraph-*, read into c.wireRoles), or — for
+  // a hand-written spec without them — the WIREGRAPH_SERVER_REPO env var. With
+  // neither, skip: REFERENCES + Contract nodes are unaffected, only WIRE.
+  const anyRoles = contracts.some((c) => c.wireRoles && c.wireRoles.size);
+  if (!anyRoles && !SERVER_COMPARTMENT) {
+    log('  WIRE edges skipped (no producer/consumer compartments in specs; set WIREGRAPH_SERVER_REPO for hand-written specs without direction)');
     return { wire: 0, gaps: 0 };
   }
-  const cById = new Map(contracts.map((c) => [c.id, c]));
 
   // contractId|token -> [symbol, ...]
   const groups = new Map();
@@ -300,14 +329,23 @@ export function buildWireEdges(graph, contracts, log = () => {}) {
     const c = cById.get(cid);
     if (!c) continue;
 
-    const server = syms.filter((s) => s.compartment === SERVER_COMPARTMENT);
-    const terminal = syms.filter((s) => s.compartment !== SERVER_COMPARTMENT);
-    if (!server.length || !terminal.length) { gaps++; continue; }
-
-    const dir = c.direction[token] || 'unknown';
     let pubs, cons, dirLabel;
-    if (dir === 's2c') { pubs = server; cons = terminal; dirLabel = 's2c'; }
-    else { pubs = terminal; cons = server; dirLabel = dir === 'unknown' ? 'c2s?' : 'c2s'; }
+    const roles = c.wireRoles && c.wireRoles.get(token);
+    if (roles && (roles.producers.size || roles.consumers.size)) {
+      // Direction encoded by inference: producers (callers/senders) -> consumers
+      // (definers/receivers). No env var needed — the scan already knew the sides.
+      pubs = syms.filter((s) => roles.producers.has(s.compartment));
+      cons = syms.filter((s) => roles.consumers.has(s.compartment));
+      dirLabel = 'c2s';
+    } else if (SERVER_COMPARTMENT) {
+      // Hand-written spec without the extension: orient via the configured server.
+      const server = syms.filter((s) => s.compartment === SERVER_COMPARTMENT);
+      const terminal = syms.filter((s) => s.compartment !== SERVER_COMPARTMENT);
+      const dir = c.direction[token] || 'unknown';
+      if (dir === 's2c') { pubs = server; cons = terminal; dirLabel = 's2c'; }
+      else { pubs = terminal; cons = server; dirLabel = dir === 'unknown' ? 'c2s?' : 'c2s'; }
+    } else { continue; } // this contract has no roles and no env server — can't orient
+    if (!pubs.length || !cons.length) { gaps++; continue; }
 
     let pairs = 0;
     outer:

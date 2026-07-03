@@ -428,6 +428,17 @@ async function contractsTests() {
   );
   ok(repos.has('svc-api') && repos.has('mobile-app'),
     `contracts: round-trip yields cross-repo REFERENCES from both repos (got ${[...repos].join(', ') || 'none'})`);
+
+  // Axis 1: the inferred spec encodes producer/consumer compartments, so directional
+  // WIRE edges are derived WITHOUT setting WIREGRAPH_SERVER_REPO — oriented from the
+  // caller (out = mobile-app) to the definer (in = svc-api).
+  const wires = conn.prepare(
+    `SELECT sp.compartment src, dp.compartment dst FROM edges e
+       JOIN symbols sp ON sp.id=e.src JOIN symbols dp ON dp.id=e.dst
+      WHERE e.project=? AND e.type='WIRE'`).all(project);
+  ok(wires.length >= 1, `contracts: inferred spec yields WIRE edges with no WIREGRAPH_SERVER_REPO (got ${wires.length})`);
+  ok(wires.some((w) => w.src === 'mobile-app' && w.dst === 'svc-api'),
+    `contracts: WIRE oriented producer(mobile-app) -> consumer(svc-api) (got ${wires.map((w) => w.src + '->' + w.dst).join(', ') || 'none'})`);
   conn.close();
   rmSync(work, { recursive: true, force: true });
 }
