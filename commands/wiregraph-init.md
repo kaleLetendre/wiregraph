@@ -54,17 +54,17 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    `/reload-plugins` (once) so the MCP server restarts with the deps present — then
    the `find_symbol`/`trace_*`/etc. tools come online for the rest of the steps.
 
-2. **Confirm scope, then build the graph.** wiregraph indexes every **compartment**
-   under `<TARGET>` — a compartment is a git repo OR a package/module with its own
-   manifest, so one repo can hold several. List what it would cover and confirm the
-   scope is what the user meant (prevents the two footguns: indexing one compartment
-   when they meant the workspace, or pointing at a huge tree like `$HOME`):
+2. **Confirm scope.** wiregraph indexes every **compartment** under `<TARGET>` — a
+   compartment is a git repo OR a package/module with its own manifest, so one repo
+   can hold several. List what it would cover and confirm the scope is what the user
+   meant (prevents the two footguns: indexing one compartment when they meant the
+   workspace, or pointing at a huge tree like `$HOME`):
 
    ```
    node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/workspace.mjs repos "<TARGET>"
    ```
 
-   Read the `scope:` line and act before building:
+   Read the `scope:` line and act:
    - **MULTI** — 2+ compartments (a monorepo of packages, or repos side-by-side), so
      cross-compartment contracts are possible. Show the compartment list and confirm
      it's the intended set.
@@ -75,33 +75,14 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    - **NO-GIT** — the whole folder is indexed as one unit (fine for a lone non-git
      project; note contracts need 2+ compartments).
 
-   Then build (full, project-scoped) into `<TARGET>/.wiregraph/graph.db` and report
-   the printed stats (repos, files, symbols, contracts, edge counts):
+   Don't build yet — infer contracts first (step 3) so a single build produces the
+   call graph AND the contract edges in one pass (no redundant second build).
 
-   ```
-   node ${CLAUDE_PLUGIN_ROOT}/src/build.js "<TARGET>" --reset
-   ```
-
-3. **Seed state + gitignore the footprint.** Everything wiregraph writes per
-   project lives in one hidden folder `<TARGET>/.wiregraph/` (`graph.db`,
-   `state.json`, `refresh.log`). This step seeds the state (build time, per-repo
-   git shas for incremental catch-up, posture → `balanced`) AND adds `.wiregraph/`
-   to `<TARGET>/.gitignore` so the indexed graph + machine-local state are never
-   committed:
-
-   ```
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs seed "<TARGET>"
-   ```
-
-   Confirm to the user that `.wiregraph/` was added to `.gitignore` (the command
-   prints whether it added it, it was already present, or there's no `.git` here).
-
-4. **Infer cross-compartment contracts (MULTI scope only).** If step 2 reported
-   **2+ compartments**, auto-run the wire-contract inference now so the
-   cross-compartment seams light up without a second command — you don't have to
-   invoke `/wiregraph-contracts` separately or remember to rebuild. **Skip this step
-   entirely** for a SINGLE or NO-GIT target (there are no cross-compartment seams to
-   find), and just note that contracts don't apply.
+3. **Infer cross-compartment contracts (MULTI scope only) — before the build.** If
+   step 2 reported **2+ compartments**, run the wire-contract inference now, *before*
+   building, so the applied spec is on disk when the single build runs — no separate
+   command, no rebuild. **Skip this step entirely** for a SINGLE or NO-GIT target (no
+   cross-compartment seams to find) and go straight to step 4.
 
    a. **Scan (no writes)** and show the user the proposed seams + AsyncAPI YAML:
 
@@ -109,25 +90,48 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
       node ${CLAUDE_PLUGIN_ROOT}/scripts/contracts.mjs scan "<TARGET>"
       ```
 
-   b. **If it found no seams**, say so and move on — nothing to write. (Common when
-      repos are indexed together but don't actually share a route / topic / env var
+   b. **If it found no seams**, say so and go to step 4 — nothing to write. (Common
+      when compartments are indexed together but don't share a route / topic / env var
       yet.)
 
    c. **If it found seams**, ask with AskUserQuestion whether to write the draft
-      contract, making clear it's a heuristic starting point the user owns and
-      should review/commit. On decline, move on — the seams are still reported.
+      contract, making clear it's a heuristic starting point the user owns and should
+      review/commit. On decline, go to step 4 — the seams are still reported.
 
-   d. **On yes**, write the draft and rebuild so the seams become graph edges:
+   d. **On yes**, write the draft (no build here — step 4 picks it up):
 
       ```
       node ${CLAUDE_PLUGIN_ROOT}/scripts/contracts.mjs apply "<TARGET>"
-      node ${CLAUDE_PLUGIN_ROOT}/src/build.js "<TARGET>" --reset
       ```
 
-      Then confirm with the `trace_contract` MCP tool (which symbols in which repos
-      reference the contract) and report the cross-compartment edge counts now in the graph.
+4. **Build the graph — once.** Full, project-scoped, into `<TARGET>/.wiregraph/graph.db`.
+   If step 3 wrote a spec, this single build auto-detects it and produces the call
+   graph AND the cross-compartment contract edges in the same pass (that's why the
+   build comes after inference — it avoids a second full walk of the workspace):
 
-5. **Install the navigation directive** into `<TARGET>/CLAUDE.md`. First show the
+   ```
+   node ${CLAUDE_PLUGIN_ROOT}/src/build.js "<TARGET>" --reset
+   ```
+
+   Report the printed stats (compartments, files, symbols, contracts, edge counts). If
+   a spec was applied in step 3, confirm the seams lit up with the `trace_contract` MCP
+   tool and report the cross-compartment edge counts now in the graph.
+
+5. **Seed state + gitignore the footprint.** Everything wiregraph writes per project
+   lives in one hidden folder `<TARGET>/.wiregraph/` (`graph.db`, `state.json`,
+   `refresh.log`). Run this **after** the build so `lastFullBuild` reflects it. It
+   seeds the state (build time, per-repo git shas for incremental catch-up, posture →
+   `balanced`) AND adds `.wiregraph/` to `<TARGET>/.gitignore` so the indexed graph +
+   machine-local state are never committed:
+
+   ```
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs seed "<TARGET>"
+   ```
+
+   Confirm to the user that `.wiregraph/` was added to `.gitignore` (the command prints
+   whether it added it, it was already present, or there's no `.git` here).
+
+6. **Install the navigation directive** into `<TARGET>/CLAUDE.md`. First show the
    user what would change, then get explicit consent before writing:
 
    ```
@@ -145,13 +149,13 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    If they decline, continue — the MCP tool descriptions still carry the economy
    guidance, but note the win is strongest with the directive installed.
 
-6. **Auto-update / hooks.** The plugin ships `SessionStart`, `PreToolUse`, and
+7. **Auto-update / hooks.** The plugin ships `SessionStart`, `PreToolUse`, and
    `PostToolUse` hooks; they fire automatically whenever the wiregraph plugin is
    enabled. `SessionStart` catches up on out-of-session changes (and re-asserts
    the directive), `PreToolUse` on `Grep`/`Glob`/`Read` reminds Claude to prefer
    the graph (rate-limited per session so it stays cheap; the `Read` nudge only
    fires on a full read of a sizable source file), and `PostToolUse` re-indexes
-   edited files. The posture written in step 3 controls them:
+   edited files. The posture written in step 5 controls them:
    - `off` — hooks do nothing (no catch-up, no navigation nudge)
    - `conservative` — SessionStart catch-up + the search/read navigation nudge
    - `balanced` (default) — + re-index each file Claude edits
@@ -162,7 +166,7 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    If the user's Claude Code does not auto-run plugin hooks, they can enable them
    explicitly in `<TARGET>/.claude/settings.json` (offer this only if asked).
 
-7. **Confirm** by calling the `graph_status` MCP tool. Then summarize: graph
+8. **Confirm** by calling the `graph_status` MCP tool. Then summarize: graph
    built (counts), directive installed (or declined), posture, and that the
    wiregraph MCP tools (`find_symbol`, `get_source`, `trace_callers`,
    `trace_callees`, `trace_contract`, `path_between`, `graph_status`,
@@ -170,6 +174,6 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
 
 Note: a project may contain several git repos (wiregraph indexes them all under
 this one project); cross-compartment links flow through Contract nodes — see
-`trace_contract` / `path_between`. Step 4 already infers those wire contracts for a
+`trace_contract` / `path_between`. Step 3 already infers those wire contracts for a
 multi-compartment workspace; the user can re-run `/wiregraph-contracts` any time to
 re-scan and refine the draft after the workspace changes.
