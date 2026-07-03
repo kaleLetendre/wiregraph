@@ -2,8 +2,8 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>wiregraph — cross-repo call + contract graph for AI coding agents</title>
-<meta name="description" content="A cross-repo call + contract graph for AI coding agents — ~half the tokens, 100% local. Solid edges are calls within a repo; glowing dashed edges are the contracts across repos that grep and ordinary call graphs can't see.">
+<title>wiregraph — cross-compartment call + contract graph for AI coding agents</title>
+<meta name="description" content="A cross-compartment call + contract graph for AI coding agents — ~half the tokens, 100% local. Solid edges are calls within a compartment; glowing dashed edges are the contracts across compartments that grep and ordinary call graphs can't see.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔗</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -345,10 +345,10 @@
         </div>
       </div>
 
-      <div class="hero-viz" aria-label="Animated cross-repo graph">
+      <div class="hero-viz" aria-label="Animated cross-compartment graph">
         <span class="tag">GRAPH.DB</span>
         <span class="dots"><i></i><i></i><i></i></span>
-        <svg id="heroGraph" viewBox="0 0 440 340" role="img" aria-label="Two repositories. Inside each, solid edges connect functions that call each other — an ordinary call graph. Across the two repos there is no call; instead glowing dashed contract edges light up, linking a producer in repo A to a consumer in repo B through a shared contract token that grep and call graphs cannot see.">
+        <svg id="heroGraph" viewBox="0 0 440 340" role="img" aria-label="Two compartments. Inside each, solid edges connect functions that call each other — an ordinary call graph. Across the two compartments there is no call; instead glowing dashed contract edges light up, linking a producer in compartment A to a consumer in compartment B through a shared contract token that grep and call graphs cannot see.">
           <defs>
             <radialGradient id="nodeGlow" cx="50%" cy="50%" r="50%">
               <stop offset="0%" stop-color="rgba(34,227,201,.25)"/>
@@ -358,9 +358,9 @@
 
           <!-- repo boundary boxes -->
           <rect x="18" y="40" width="150" height="270" rx="13" fill="rgba(155,140,255,.035)" stroke="var(--line)" stroke-dasharray="5 5"/>
-          <text x="93" y="60" text-anchor="middle" class="node-label" fill="var(--violet)" style="font-size:9.5px;letter-spacing:.12em">REPO A</text>
+          <text x="93" y="60" text-anchor="middle" class="node-label" fill="var(--violet)" style="font-size:9px;letter-spacing:.08em">COMPARTMENT A</text>
           <rect x="272" y="40" width="150" height="270" rx="13" fill="rgba(92,240,138,.035)" stroke="var(--line)" stroke-dasharray="5 5"/>
-          <text x="347" y="60" text-anchor="middle" class="node-label" fill="var(--green)" style="font-size:9.5px;letter-spacing:.12em">REPO B</text>
+          <text x="347" y="60" text-anchor="middle" class="node-label" fill="var(--green)" style="font-size:9px;letter-spacing:.08em">COMPARTMENT B</text>
 
           <!-- ===== solid CALL edges INSIDE each repo (call graph) ===== -->
           <g id="heroCallEdges" stroke-linecap="round">
@@ -377,7 +377,7 @@
             <path id="hcA" class="edge" d="M118,150 L200,180" stroke-dasharray="5 6"/>
             <path id="hcB" class="edge" d="M322,150 L240,180" stroke-dasharray="5 6"/>
           </g>
-          <!-- the (missing) direct call across repos -->
+          <!-- the (missing) direct call across compartments -->
           <path class="edge" d="M118,150 Q220,300 322,150" stroke="var(--red)" stroke-dasharray="3 6" opacity=".4"/>
           <text x="220" y="298" text-anchor="middle" class="node-label" fill="var(--red)" style="font-size:8.5px" opacity=".65">no code-level call ✕</text>
 
@@ -412,8 +412,8 @@
           <g id="heroPulses"></g>
         </svg>
         <div class="hero-legend">
-          <span><i class="swatch solid"></i> call · within a repo</span>
-          <span><i class="swatch dashed"></i> contract · across repos</span>
+          <span><i class="swatch solid"></i> call · within a compartment</span>
+          <span><i class="swatch dashed"></i> contract · across compartments</span>
         </div>
       </div>
     </div>
@@ -458,7 +458,7 @@
   <section id="contracts" aria-label="Works with your contract architecture">
     <p class="eyebrow reveal">The differentiator</p>
     <h2 class="reveal">Works with your <span class="accent">contract architecture.</span></h2>
-    <p class="lead reveal d1">Within a repo, calls resolve by name. Across repos there's usually <b>no call at all</b> — services agree on a shared shape instead. wiregraph treats that shape as a <b>standard</b>: it detects the seam a call graph can't see, so Claude traces a cross-repo change <b>from the graph</b> instead of re-reading both services — the same token savings, now across the boundary.</p>
+    <p class="lead reveal d1">Within a compartment, calls resolve by name. Across compartments there's usually <b>no call at all</b> — services agree on a shared shape instead. wiregraph treats that shape as a <b>standard</b>: it detects the seam a call graph can't see, so Claude traces a cross-compartment change <b>from the graph</b> instead of re-reading both services — the same token savings, now across the boundary.</p>
 
     <div class="ca-grid">
       <div class="reveal d1">
@@ -471,13 +471,13 @@
       </div>
 
       <div class="contract-viz reveal d2">
-        <svg id="contractSvg" viewBox="0 0 460 300" role="img" aria-label="A producer symbol in repo A and a consumer symbol in repo B, with no direct call between them, both reference the same contract token, which lights up and links them producer to consumer.">
-          <!-- repo A box -->
+        <svg id="contractSvg" viewBox="0 0 460 300" role="img" aria-label="A producer symbol in compartment A and a consumer symbol in compartment B, with no direct call between them, both reference the same contract token, which lights up and links them producer to consumer.">
+          <!-- compartment A box -->
           <rect x="14" y="30" width="150" height="200" rx="13" fill="rgba(155,140,255,.04)" stroke="var(--line)" stroke-dasharray="5 5"/>
-          <text x="89" y="52" text-anchor="middle" class="node-label" fill="var(--violet)" style="font-size:9.5px;letter-spacing:.1em">REPO A · producer</text>
+          <text x="89" y="52" text-anchor="middle" class="node-label" fill="var(--violet)" style="font-size:8px;letter-spacing:.04em">COMPARTMENT A · producer</text>
           <!-- repo B box -->
           <rect x="296" y="30" width="150" height="200" rx="13" fill="rgba(92,240,138,.04)" stroke="var(--line)" stroke-dasharray="5 5"/>
-          <text x="371" y="52" text-anchor="middle" class="node-label" fill="var(--green)" style="font-size:9.5px;letter-spacing:.1em">REPO B · consumer</text>
+          <text x="371" y="52" text-anchor="middle" class="node-label" fill="var(--green)" style="font-size:8px;letter-spacing:.04em">COMPARTMENT B · consumer</text>
 
           <!-- producer node -->
           <g id="cProd" class="node" transform="translate(89,130)">
@@ -534,7 +534,7 @@
       </div>
       <div class="card tool reveal d3">
         <span class="glyph">🔗</span>
-        <div><code>trace_contract</code><div class="ans">answers how code connects across repos, via a contract.</div></div>
+        <div><code>trace_contract</code><div class="ans">answers how code connects across compartments, via a contract.</div></div>
       </div>
       <div class="card tool reveal d3">
         <span class="glyph">🧭</span>

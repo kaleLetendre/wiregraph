@@ -5,16 +5,16 @@
     "email": "kaleletendre@gmail.com"
   },
   "metadata": {
-    "description": "wiregraph — cross-repo call graph in an embedded SQLite file (no daemon), exposed to Claude as MCP tools.",
+    "description": "wiregraph — cross-compartment call graph in an embedded SQLite file (no daemon), exposed to Claude as MCP tools.",
     "version": "0.5.0"
   },
   "plugins": [
     {
       "name": "wiregraph",
       "source": ".",
-      "description": "Index a project into a cross-repo call graph (embedded SQLite, no daemon or JVM) exposed as MCP tools, so Claude navigates/audits/refactors code at ~40-60% fewer tokens than grep+Read. Project-scoped, balanced auto-update, self-refresh via update_graph. /wiregraph-init to start.",
+      "description": "Index a project into a cross-compartment call graph (embedded SQLite, no daemon or JVM) exposed as MCP tools, so Claude navigates/audits/refactors code reading ~half the file bytes grep+Read would. Project-scoped, balanced auto-update, self-refresh via update_graph. /wiregraph-init to start.",
       "category": "development",
-      "keywords": ["graph", "sqlite", "mcp", "call-graph", "cross-repo", "contracts", "tokens", "code-navigation"]
+      "keywords": ["graph", "sqlite", "mcp", "call-graph", "cross-compartment", "contracts", "tokens", "code-navigation"]
     }
   ]
 }

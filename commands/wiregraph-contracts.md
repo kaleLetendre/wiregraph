@@ -1,17 +1,18 @@
 ---
-description: Infer cross-repo wire contracts from code and write a draft AsyncAPI spec, so wiregraph can trace how your services connect
+description: Infer cross-compartment wire contracts from code and write a draft AsyncAPI spec, so wiregraph can trace how your services connect
 argument-hint: "[target-dir] (defaults to the active project)"
 allowed-tools: Bash, Read, AskUserQuestion
 ---
 
-Discover the **wire seams** between repos in this workspace — endpoints one repo
-defines and another repo calls — and propose an AsyncAPI **contract** that links
-them, so `trace_contract` / `path_between` can follow producer→consumer across
-repos. wiregraph reads these seams out of the code (shared HTTP routes today); you
-don't have to hand-write specs.
+Discover the **wire seams** between compartments in this workspace — endpoints one
+compartment defines and another calls — and propose an AsyncAPI **contract** that
+links them, so `trace_contract` / `path_between` can follow producer→consumer across
+compartments. wiregraph reads these seams out of the code (shared HTTP routes today);
+you don't have to hand-write specs.
 
 A contract is just **the defined communication between two compartments** — here,
-two repos talking over HTTP. (The same idea covers a library/SDK's API surface or a
+two services talking over HTTP. (A compartment is a package/module or repo; the same
+idea covers a library/SDK's API surface or a
 shared-state boundary; see `docs/contracts.md`.) The inference is a **heuristic**:
 it's a draft to review and commit, not the truth.
 
@@ -21,7 +22,7 @@ is safe to run from inside a sub-repo.
 
 Do the steps in order:
 
-1. **Scan (no writes).** Infer the cross-repo seams and show the proposal:
+1. **Scan (no writes).** Infer the cross-compartment seams and show the proposal:
 
    ```
    node ${CLAUDE_PLUGIN_ROOT}/scripts/contracts.mjs scan "<TARGET>"
@@ -30,9 +31,10 @@ Do the steps in order:
    Show the user the seams and the proposed AsyncAPI YAML.
 
 2. **If it found no seams**, don't write anything. Explain the **workspace model**,
-   which is what cross-repo contracts depend on: put all the related repos
-   side-by-side under one parent folder (each its own git repo) and `/wiregraph-init`
-   that parent — wiregraph can only see a shared route if both repos are indexed
+   which is what cross-compartment contracts depend on: index 2+ compartments
+   together under one parent — either related repos cloned side-by-side, OR the
+   packages of a monorepo (each with its own manifest) — and `/wiregraph-init` that
+   parent. wiregraph can only see a shared route if both compartments are indexed
    together. Stop here.
 
 3. **If it found seams**, ask the user with AskUserQuestion whether to write the
@@ -48,10 +50,12 @@ Do the steps in order:
    `*-contracts` dir/repo) and writes `wiregraph-inferred.asyncapi.yaml` into it.
 
 5. **Light up the edges.** The read tools self-heal, or run `/wiregraph-update` to
-   re-index now. Then confirm with `trace_contract` (which symbols in which repos
-   reference the contract) and `path_between` (a producer in one repo to the
-   consumer in another). Summarize what was linked.
+   re-index now. Then confirm with `trace_contract` (which symbols in which
+   compartments reference the contract) and `path_between` (a producer in one
+   compartment to the consumer in another). Summarize what was linked.
 
-Note: cross-repo attribution relies on each repo having its own `.git`. If repos
-are indexed separately rather than together in one workspace, the shared routes
-won't be visible — guide the user to the workspace model above.
+Note: cross-compartment attribution needs the compartments indexed **together**
+under one root. A compartment boundary is a `.git` OR a package/module manifest, so
+a monorepo of packages works — but repos indexed *separately* (each its own
+`/wiregraph-init`) can't see a shared route between them; guide the user to the
+workspace model above.

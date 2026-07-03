@@ -3,7 +3,7 @@
 wiregraph indexes your codebase into a structured graph of its symbols and how they
 connect. It makes Claude a better **engineer** on your codebase — not just a better
 search box: when it implements a feature, fixes a bug, or refactors, it works from the
-full picture (every caller, the real blast radius, cross-repo wiring) instead of a
+full picture (every caller, the real blast radius, cross-compartment wiring) instead of a
 partial grep — so changes land in the right places. And it gets there reading **far
 less** — returning one symbol, or a whole call-tree, in a single query instead of
 full-file reads and repeated greps. On navigation-heavy work that's **roughly half
@@ -43,7 +43,7 @@ flowchart LR
 - [Index a workspace (once)](#index-a-workspace-once)
 - [What Claude can do](#what-claude-can-do)
 - [Measuring impact](#measuring-impact)
-- [Cross-repo connections](#cross-repo-connections) — [contracts in depth](https://kaleletendre.github.io/wiregraph/contracts.html)
+- [Cross-compartment connections](#cross-compartment-connections) — [contracts in depth](https://kaleletendre.github.io/wiregraph/contracts.html)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -63,9 +63,9 @@ flowchart LR
 
 Tree-sitter parses your files into symbols and call sites and stores them in one
 per-workspace SQLite file (`<workspace>/.wiregraph/graph.db`). Calls resolve by name
-within a repo; cross-repo links go through shared contracts (see
-[Cross-repo connections](#cross-repo-connections)). It was built and tested on a real
-four-repo workspace wired this way. Edits re-index a file at a time via hooks, so the
+within a compartment; cross-compartment links go through shared contracts (see
+[Cross-compartment connections](#cross-compartment-connections)). It was built and tested on a real
+four-service workspace wired this way. Edits re-index a file at a time via hooks, so the
 graph stays fresh without you touching it.
 
 It's a static, name-based graph, so it's blind to function-pointer/callback dispatch and
@@ -146,9 +146,9 @@ side by side:
 /wiregraph-init
 ```
 
-That's the whole job — **once per workspace**. It finds every repo under that root and
-indexes them into one graph. (If your repos share an **AsyncAPI** contract spec, it also
-links likely producers↔consumers across repos through it — a heuristic, opt-in extra.)
+That's the whole job — **once per workspace**. It finds every compartment under that root
+and indexes them into one graph. (If your compartments share an **AsyncAPI** contract spec,
+it also links likely producers↔consumers across compartments through it — a heuristic, opt-in extra.)
 It keeps itself current as you edit (set and forget) for everyday work; after a big
 refactor or mass rename, run `/wiregraph-rebuild` once to resync. From then on just put
 Claude to work — "add an endpoint that does X", "fix this bug", "refactor Y safely",
@@ -194,15 +194,15 @@ CLAUDE.md directive + MCP tool schemas the model carries each turn), which
 guarantee. Recording is on for any active project and silent when the posture is
 `off`; set `WIREGRAPH_METRICS=0` to turn it off entirely.
 
-## Cross-repo connections
+## Cross-compartment connections
 
-Within one repo, wiregraph links calls by name. **Across** repos it won't guess by name
-(a shared `start` in two repos would be a false link), so how it bridges depends on how
-your repos actually connect.
+Within one compartment, wiregraph links calls by name. **Across** compartments it won't
+guess by name (a shared `start` in two compartments would be a false link), so how it
+bridges depends on how your compartments actually connect.
 
 ### Services that talk over the wire (HTTP, queues)
 
-A producer sends a message; a consumer in another repo handles it. There is **no
+A producer sends a message; a consumer in another compartment handles it. There is **no
 code-level call** between them — they share only the message *shape*. Code-only analysis
 can't connect that, so wiregraph bridges them through that shape, described as an
 **AsyncAPI contract**.
@@ -213,7 +213,7 @@ can't connect that, so wiregraph bridges them through that shape, described as a
   (e.g. `api-contracts`) — or pass `--contracts <dir>`.
 - Inside it, one or more **AsyncAPI 3.0** specs named `*.asyncapi.yaml` / `*.asyncapi.yml`
   (other files are ignored).
-- Nothing if you don't have specs — no contracts dir simply means no cross-repo edges;
+- Nothing if you don't have specs — no contracts dir simply means no cross-compartment edges;
   everything else still works.
 
 **What wiregraph does with it:**
@@ -223,7 +223,7 @@ can't connect that, so wiregraph bridges them through that shape, described as a
    names (`id`, `type`, `status`, `data`, …) are filtered out so links stay meaningful.
 2. Scans each symbol's body for those tokens; a hit adds a `REFERENCES` edge from that
    symbol to the Contract node.
-3. When symbols in **different** repos reference the same token, it joins them
+3. When symbols in **different** compartments reference the same token, it joins them
    producer→consumer, taking request/reply direction from the spec's operations.
 
 ```mermaid
@@ -240,9 +240,9 @@ to implement it" — so link quality tracks how distinctive your endpoint/field 
 Walk the seams with `trace_contract` and `path_between`.
 
 **No specs yet? Infer them.** Run `/wiregraph-contracts` and wiregraph scans the
-workspace for HTTP routes one repo *defines* and another repo *calls*, then proposes a
+workspace for HTTP routes one compartment *defines* and another *calls*, then proposes a
 draft AsyncAPI spec wiring them together — review it, and on confirmation it's written
-into your contracts dir as a committable artifact. So the cross-repo graph works out of
+into your contracts dir as a committable artifact. So the cross-compartment graph works out of
 the box, without hand-writing anything. A contract is really just **defined
 communication between two compartments** (services over the wire, a library/SDK's API
 surface, or one program reading another's state) — see **[the contract-architecture page](https://kaleletendre.github.io/wiregraph/contracts.html)**
@@ -251,15 +251,15 @@ for the full model, the inference flow, and how to author contracts by hand.
 ### Packages that import each other in-process
 
 In a monorepo where one package imports another, the link is right there in the code (the
-`import` / `#include`). wiregraph doesn't follow cross-repo imports yet (on the roadmap
+`import` / `#include`). wiregraph doesn't follow cross-compartment imports yet (on the roadmap
 below).
 
 ## Roadmap
 
 - **More languages** — Go, Rust, C++ (the 🔜 rows above); each is a grammar
   plus two small rules.
-- **Cross-repo imports** — follow `import` / `#include` across packages, so in-process
-  cross-repo links work without needing a contract.
+- **Cross-compartment imports** — follow `import` / `#include` across packages, so in-process
+  cross-compartment links work without needing a contract.
 - **More contract inference** — contract inference from code shipped for HTTP routes
   (`/wiregraph-contracts`); next are queues/topics, library/SDK API surfaces, and
   shared-state schemas as additional sources onto the same contract machinery.

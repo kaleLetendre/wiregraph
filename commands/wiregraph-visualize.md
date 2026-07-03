@@ -40,9 +40,9 @@ Steps:
    output path, and the repo→color map.
 
 2. **If it reports `0 nodes`** in the default (contract) view, this project has no
-   cross-repo contracts to draw yet. Tell the user and offer the alternatives:
+   cross-compartment contracts to draw yet. Tell the user and offer the alternatives:
    - re-run with `--all` to visualize the full call graph instead, and/or
-   - run `/wiregraph-contracts` (multi-repo workspaces) to infer the seams first.
+   - run `/wiregraph-contracts` (2+ compartments) to infer the seams first.
    Don't treat an empty contract view as an error — a single-repo project simply has
    no contracts.
 

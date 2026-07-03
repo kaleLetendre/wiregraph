@@ -5,7 +5,7 @@ allowed-tools: Bash, Read, Edit, AskUserQuestion
 ---
 
 Set up wiregraph for a project end to end: install dependencies, build the
-cross-repo call graph into an embedded SQLite file, install the proven navigation
+cross-compartment call graph into an embedded SQLite file, install the proven navigation
 directive into the project's CLAUDE.md, and turn on balanced auto-update. After
 this, just use Claude normally — code navigation/audit/refactor questions cost
 ~40–60% fewer tokens. There is no daemon, JVM, or background server.
@@ -125,7 +125,7 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
       ```
 
       Then confirm with the `trace_contract` MCP tool (which symbols in which repos
-      reference the contract) and report the cross-repo edge counts now in the graph.
+      reference the contract) and report the cross-compartment edge counts now in the graph.
 
 5. **Install the navigation directive** into `<TARGET>/CLAUDE.md`. First show the
    user what would change, then get explicit consent before writing:
@@ -169,7 +169,7 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    `update_graph`, `query_sql`) are now queryable for this project.
 
 Note: a project may contain several git repos (wiregraph indexes them all under
-this one project); cross-repo links flow through Contract nodes — see
+this one project); cross-compartment links flow through Contract nodes — see
 `trace_contract` / `path_between`. Step 4 already infers those wire contracts for a
-multi-repo workspace; the user can re-run `/wiregraph-contracts` any time to
+multi-compartment workspace; the user can re-run `/wiregraph-contracts` any time to
 re-scan and refine the draft after the workspace changes.

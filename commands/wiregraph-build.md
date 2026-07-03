@@ -26,7 +26,7 @@ Steps:
    find_symbol, get_source, trace_callees, trace_callers, trace_contract,
    path_between, query_sql) are now queryable.
 
-Note: cross-repo edges are discovered through an AsyncAPI contracts directory
+Note: cross-compartment edges are discovered through an AsyncAPI contracts directory
 under the target (a `contracts`, `asyncapi`, or `*-contracts` dir), if present.
-CALLS edges are within-repo by design; cross-repo links flow through Contract
-nodes (see `trace_contract` / `path_between`).
+CALLS edges are within-compartment by design; cross-compartment links flow through
+Contract nodes (see `trace_contract` / `path_between`).

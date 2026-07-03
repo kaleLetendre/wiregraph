@@ -44,7 +44,7 @@ that's off. **Target** = `${CLAUDE_PROJECT_DIR}` or cwd; call it `<TARGET>`.
    (it explains how the numbers are projected). Don't recompute it here.
 
 6. **Contract coverage**: from the state shown in step 3, read `inferredSeams` (the
-   cross-repo seams — messaging/state/HTTP — the last full build detected) and
+   cross-compartment seams — messaging/state/HTTP — the last full build detected) and
    `contractsDir`. If `inferredSeams > 0` and there's no `contractsDir`, those seams
    aren't captured yet — recommend `/wiregraph-contracts` to draft contracts for
    them. If a `contractsDir` is present, coverage is in place (nothing to do).
