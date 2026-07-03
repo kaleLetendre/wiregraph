@@ -16,8 +16,13 @@ cwd). Call it `<TARGET>`. Pass `--all` or `--contract "<name>"` through if the u
 asked for them.
 
 Modes (pick based on what the user wants to see):
-- **default** — the **contract view**: every symbol that references a contract, plus
-  the Contract nodes. This is the "visualize my contracts" picture.
+- **default** — the **contract view, aggregated per repo**: one hub node per repo and
+  one arrow per (repo → contract), so a big workspace shows which repos touch which
+  contracts instead of a hairball of per-function edges. Arrow thickness = how many
+  functions in that repo reference the contract; hover for the count and the fields.
+- **`--functions`** — the same contract view but **per function**: every symbol that
+  references a contract, one arrow each. More detail, busier — use when a repo's mass
+  of references matters.
 - **`--all`** — the full Symbol/Contract graph with CALLS edges (the whole codebase).
 - **`--contract "<name>"`** — one contract across all repos, with the call stacks that
   reach it (callers up, callees down).
@@ -30,8 +35,9 @@ Steps:
    node ${CLAUDE_PLUGIN_ROOT}/src/export-html.js --project "<TARGET>" --open
    ```
 
-   For the full graph use `--all`, or focus one seam with `--contract "<name>"`. The
-   command prints the node/link counts, the output path, and the repo→color map.
+   For per-function detail use `--functions`, the full graph `--all`, or focus one
+   seam with `--contract "<name>"`. The command prints the node/link counts, the
+   output path, and the repo→color map.
 
 2. **If it reports `0 nodes`** in the default (contract) view, this project has no
    cross-repo contracts to draw yet. Tell the user and offer the alternatives:

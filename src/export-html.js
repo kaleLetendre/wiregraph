@@ -52,12 +52,13 @@ const PALETTE = ['#E15554', '#4D9DE0', '#3BB273', '#7768AE', '#E67E22', '#1B9AAA
 const CONTRACT_COLOR = '#F2C94C';
 
 function parseArgs(argv) {
-  const o = { out: null, all: false, tests: false, contract: null, up: 3, down: 1, project: null, db: null, open: false };
+  const o = { out: null, all: false, tests: false, contract: null, up: 3, down: 1, project: null, db: null, open: false, functions: false };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all') o.all = true;
     else if (a === '--include-tests') o.tests = true;
+    else if (a === '--functions') o.functions = true;
     else if (a === '--open') o.open = true;
     else if (a === '--contract') o.contract = argv[++i];
     else if (a === '--up') o.up = parseInt(argv[++i], 10);
@@ -92,6 +93,29 @@ function collapseLinks(links) {
   return [...m.values()];
 }
 
+// The default contract view: collapse every function->contract reference to ONE
+// arrow per (repo -> contract), so a big workspace shows which repos touch which
+// contracts instead of a hairball of per-function edges. Arrow weight = number of
+// distinct functions in that repo referencing the contract; tokens = union of
+// fields. Symbol nodes are dropped in favor of one hub node per repo.
+function aggregateByRepo(built) {
+  const symRepo = new Map(); const contracts = new Map();
+  for (const n of built.nodes) { if (n.kind === 'contract') contracts.set(n.id, n); else symRepo.set(n.id, n.repo); }
+  const repoNodes = new Map(); const agg = new Map();
+  for (const l of built.links) {
+    if (l.type !== 'REFERENCES') continue;
+    const r = symRepo.get(l.source); const c = l.target;
+    if (!r || !contracts.has(c)) continue;
+    if (!repoNodes.has(r)) repoNodes.set(r, { id: 'repo::' + r, kind: 'repo', repo: r, name: r, file: null, line: null });
+    const key = r + '||' + c; let e = agg.get(key);
+    if (!e) { e = { source: 'repo::' + r, target: c, type: 'REFERENCES', tokens: new Set(), funcs: new Set() }; agg.set(key, e); }
+    for (const t of l.tokens || []) e.tokens.add(t);
+    e.funcs.add(l.source);
+  }
+  const links = [...agg.values()].map((e) => ({ source: e.source, target: e.target, type: 'REFERENCES', tokens: [...e.tokens], count: e.funcs.size }));
+  return { nodes: [...repoNodes.values(), ...contracts.values()], links };
+}
+
 function resolveProject(opts) {
   const raw = opts.project || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   try { return realpathSync(raw); } catch { return raw; }
@@ -113,12 +137,17 @@ async function main() {
     db.close();
   }
 
-  built.links = collapseLinks(built.links);
+  // Default contract view aggregates per repo; --functions keeps the per-function
+  // detail; --all / --contract are their own modes.
+  const repoMode = !opts.all && !opts.contract && !opts.functions;
+  if (repoMode) built = aggregateByRepo(built);
+  else built.links = collapseLinks(built.links);
   const repos = [...new Set(built.nodes.map((n) => n.repo).filter(Boolean))].sort();
   const repoColor = {};
   repos.forEach((r, i) => { repoColor[r] = PALETTE[i % PALETTE.length]; });
 
-  const data = { nodes: built.nodes, links: built.links, repos, repoColor, contractColor: CONTRACT_COLOR, title: opts.contract || (opts.all ? 'full graph' : 'contract references') };
+  const title = opts.contract || (opts.all ? 'full graph' : repoMode ? 'contracts × repos' : 'contract references');
+  const data = { nodes: built.nodes, links: built.links, repos, repoColor, contractColor: CONTRACT_COLOR, title, aggregated: repoMode };
   writeFileSync(opts.out, renderHtml(data));
   process.stderr.write(`wrote ${data.nodes.length} nodes / ${data.links.length} links -> ${opts.out}\n`);
   process.stderr.write('repos: ' + repos.map((r) => `${r}=${repoColor[r]}`).join(', ') + '\n');
@@ -178,7 +207,7 @@ function arrow(id, col){ defs.append('marker').attr('id',id).attr('viewBox','0 -
   .attr('refX',10).attr('refY',0).attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
   .append('path').attr('d','M0,-5L10,0L0,5').attr('fill',col); }
 arrow('aRef','#E0A458'); arrow('aCall','#7B8CDE');
-const rOf = d => d.kind==='contract' ? 12 : 5;
+const rOf = d => d.kind==='contract' ? 12 : d.kind==='repo' ? 16 : 5;
 
 const centers = {};
 DATA.repos.forEach((r, i) => { const a = (i/DATA.repos.length)*2*Math.PI - Math.PI/2; centers[r] = {x:Math.cos(a), y:Math.sin(a)}; });
@@ -201,19 +230,23 @@ function hideTip(){ tip.style.display='none'; }
 const link = g.append('g').attr('stroke-opacity',0.38).selectAll('line')
   .data(DATA.links).join('line')
   .attr('stroke', d => d.type==='REFERENCES' ? '#E0A458' : '#7B8CDE')
-  .attr('stroke-width', d => d.type==='REFERENCES' ? Math.min(5, 1 + d.count*0.5) : Math.min(3.5, 0.8 + d.count*0.3))
+  .attr('stroke-width', d => d.type==='REFERENCES' ? Math.min(7, 1 + d.count*0.6) : Math.min(3.5, 0.8 + d.count*0.3))
   .attr('marker-end', d => d.type==='REFERENCES' ? 'url(#aRef)' : 'url(#aCall)')
   .on('mousemove', (e,d)=> showTip(e, d.type==='REFERENCES'
-      ? '<b>REFERENCES</b> &middot; '+d.count+' field(s)<br>'+d.tokens.join(', ')
+      ? (DATA.aggregated
+          ? '<b>'+d.count+' function(s)</b> in this repo &rarr; contract<br>'+d.tokens.length+' field(s): '+d.tokens.join(', ')
+          : '<b>REFERENCES</b> &middot; '+d.count+' field(s)<br>'+d.tokens.join(', '))
       : '<b>CALLS</b> &times;'+d.count))
   .on('mouseout', hideTip);
 
 const node = g.append('g').selectAll('circle')
   .data(DATA.nodes).join('circle')
-  .attr('r', d => d.kind==='contract' ? 12 : 5)
-  .attr('fill', color).attr('stroke','#1b1d23').attr('stroke-width',1.2)
+  .attr('r', rOf)
+  .attr('fill', color).attr('stroke','#1b1d23').attr('stroke-width',d=>d.kind==='repo'?2:1.2)
   .on('mousemove', (e,d)=> showTip(e, d.kind==='contract'
       ? '<b>'+d.name+'</b><br>contract'
+      : d.kind==='repo'
+      ? '<b>'+d.name+'</b><br>repo'
       : '<b>'+d.name+'</b><br>'+d.repo+'<br>'+(d.file||'')+(d.line?(':'+d.line):'')))
   .on('mouseout', hideTip)
   .call(d3.drag()
@@ -222,8 +255,10 @@ const node = g.append('g').selectAll('circle')
     .on('end',(e,d)=>{ if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
 
 const label = g.append('g').selectAll('text')
-  .data(DATA.nodes.filter(d=>d.kind==='contract')).join('text')
-  .text(d=>d.name).attr('fill','#f2e9c0').attr('font-size','12px').attr('text-anchor','middle').attr('dy',-15)
+  .data(DATA.nodes.filter(d=>d.kind==='contract'||d.kind==='repo')).join('text')
+  .text(d=>d.name).attr('fill',d=>d.kind==='repo'?'#e6e6e6':'#f2e9c0')
+  .attr('font-size',d=>d.kind==='repo'?'13px':'12px').attr('font-weight',d=>d.kind==='repo'?'600':'400')
+  .attr('text-anchor','middle').attr('dy',d=>d.kind==='repo'?-21:-15)
   .style('pointer-events','none');
 
 const sim = d3.forceSimulation(DATA.nodes)
@@ -231,7 +266,7 @@ const sim = d3.forceSimulation(DATA.nodes)
   .force('charge', d3.forceManyBody().strength(-70))
   .force('x', d3.forceX(tx).strength(d=>d.kind==='contract'?0.5:0.28))
   .force('y', d3.forceY(ty).strength(d=>d.kind==='contract'?0.5:0.28))
-  .force('collide', d3.forceCollide(d=>d.kind==='contract'?20:6))
+  .force('collide', d3.forceCollide(d=>d.kind==='contract'?20:d.kind==='repo'?24:6))
   .on('tick', ()=>{
     // Trim each line to the target node's border so the arrowhead is visible.
     link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
@@ -260,7 +295,7 @@ const isHidden=d=> hidden.has(d.kind==='contract'?'__contract':d.repo);
 let labelsOn=false;
 document.getElementById('labels').addEventListener('change', e=>{ labelsOn=e.target.checked; applyFilter(); });
 function applyFilter(){ node.attr('display',d=>isHidden(d)?'none':null);
-  label.attr('display',d=>(labelsOn && !isHidden(d))?null:'none');
+  label.attr('display',d=>((d.kind==='repo'||labelsOn) && !isHidden(d))?null:'none');
   link.attr('display',d=>(isHidden(d.source)||isHidden(d.target))?'none':null); }
 applyFilter();
 </script>
