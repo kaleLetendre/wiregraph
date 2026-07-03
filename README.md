@@ -242,8 +242,11 @@ Walk the seams with `trace_contract` and `path_between`.
 **No specs yet? Infer them.** Run `/wiregraph-contracts` and wiregraph scans the
 workspace for HTTP routes one compartment *defines* and another *calls*, then proposes a
 draft AsyncAPI spec wiring them together — review it, and on confirmation it's written
-into your contracts dir as a committable artifact. So the cross-compartment graph works out of
-the box, without hand-writing anything. A contract is really just **defined
+into your contracts dir as a committable artifact. The inferred spec also records which
+compartment *produces* vs *consumes* each seam, so directional producer→consumer `WIRE`
+edges are derived automatically — no `WIREGRAPH_SERVER_REPO` needed (that env var is only
+a fallback for hand-written specs that omit the direction). So the cross-compartment graph
+works out of the box, without hand-writing anything. A contract is really just **defined
 communication between two compartments** (services over the wire, a library/SDK's API
 surface, or one program reading another's state) — see **[the contract-architecture page](https://kaleletendre.github.io/wiregraph/contracts.html)**
 for the full model, the inference flow, and how to author contracts by hand.
