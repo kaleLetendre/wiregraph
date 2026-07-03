@@ -72,6 +72,9 @@ export function defaultState(project, pluginVersion = null) {
     // callers resolved by name may be approximate until the next full rebuild.
     // Cleared by every full build. graph_status surfaces it so "fresh" isn't a lie.
     structuralDriftSinceFullBuild: false,
+    // Stamped by the SessionStart hook each run. Absent on an indexed project ⇒
+    // plugin hooks aren't firing (catch-up/nudges/re-index off); /wiregraph-status flags it.
+    hooksLastFired: null,
   };
 }
 
@@ -91,22 +94,26 @@ export function readState(project) {
 // that was indexed at a higher level — the graph, db, and metrics all live at that
 // root. Returns the realpath of the indexed root, or null if none is found (callers
 // fall back to the cwd so a genuinely uninitialized tree still gets the init nudge).
-export function findIndexedRoot(startDir) {
-  let dir;
-  try { dir = realpathSync(startDir); } catch { dir = startDir; }
+export function findIndexedRoot(startDir, homeDir = homedir()) {
+  let start;
+  try { start = realpathSync(startDir); } catch { start = startDir; }
   let home;
-  try { home = realpathSync(homedir()); } catch { home = homedir(); }
+  try { home = realpathSync(homeDir); } catch { home = homeDir; }
+  let dir = start;
   for (;;) {
-    // Never resolve to $HOME (or above): a workspace lives in a dedicated folder
-    // BELOW home, and a stray .wiregraph at the home dir (e.g. an accidental index
-    // of the whole home tree) must not hijack every nested project — that would
-    // point the graph at the wrong, enormous index. Stopping here returns null,
-    // so callers fall back to the cwd and a genuinely uninitialized project still
-    // gets the init nudge.
-    if (dir === home) return null;
-    if (existsSync(stateFilePath(dir))) return dir;
+    if (existsSync(stateFilePath(dir))) {
+      // A `.wiregraph` AT $HOME is honored ONLY when the caller is at $HOME itself
+      // (someone who deliberately ran init on their home dir). Reached by walking UP
+      // from a nested project, a $HOME index is treated as a stray that must not
+      // hijack that project — it would point the graph at the wrong, enormous index;
+      // the project gets the "run init" nudge instead. Any index BELOW home is always
+      // honored (the normal workspace case).
+      if (dir === home && start !== home) return null;
+      return dir;
+    }
+    if (dir === home) return null;      // never resolve above $HOME
     const parent = dirname(dir);
-    if (parent === dir) return null; // reached the filesystem root
+    if (parent === dir) return null;    // reached the filesystem root
     dir = parent;
   }
 }

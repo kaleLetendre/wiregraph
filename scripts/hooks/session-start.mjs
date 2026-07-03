@@ -13,7 +13,7 @@ import { realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readState, findIndexedRoot } from '../lib/state.mjs';
+import { readState, findIndexedRoot, updateState } from '../lib/state.mjs';
 import { changedSince } from '../lib/git.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -56,6 +56,12 @@ async function main() {
     // here; keep it to a single short line.
     emit(`wiregraph: this project is not indexed. Run /wiregraph-init to build the call graph and navigate code at ~50% fewer tokens.`);
   }
+
+  // Heartbeat: record that the SessionStart hook actually ran. /wiregraph-status
+  // reads this to tell whether plugin hooks are firing at all — a missing stamp on
+  // an indexed project means catch-up, nudges, and re-index-on-edit are silently
+  // off (hooks not enabled in this Claude Code), which the doctor should flag.
+  try { updateState(PROJECT, { hooksLastFired: new Date().toISOString() }); } catch { /* best-effort */ }
 
   // Indexed: spawn the detached catch-up worker.
   const child = spawn('node', [join(HERE, 'refresh.mjs')], {

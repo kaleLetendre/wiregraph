@@ -384,8 +384,26 @@ async function resolutionTests() {
   const fromNone = (await execFileP('node', [STATE, 'check', orphan])).stdout;
   eq(fromNone.trim(), 'indexed: no', 'check: reports not-indexed for an uninitialized tree');
 
+  // $HOME handling: a deliberately-indexed workspace AT $HOME must be honored when
+  // the caller IS $HOME, but a $HOME index must NOT hijack a nested project reached
+  // by walking up. (homeDir is injectable so we can test without touching real $HOME.)
+  const fakeHome = mkdtempSync(join(tmpdir(), 'cg-home-'));
+  mkdirSync(join(fakeHome, '.wiregraph'), { recursive: true });
+  writeFileSync(join(fakeHome, '.wiregraph', 'state.json'), '{}');
+  eq(S.findIndexedRoot(fakeHome, fakeHome), realpathSync(fakeHome), 'findIndexedRoot: honors an index AT $HOME when the caller is $HOME');
+  const nested = join(fakeHome, 'proj', 'sub');
+  mkdirSync(nested, { recursive: true });
+  eq(S.findIndexedRoot(nested, fakeHome), null, 'findIndexedRoot: a $HOME index does NOT hijack a nested unindexed project');
+  const belowWs = join(fakeHome, 'ws');
+  const belowDeep = join(belowWs, 'a', 'b');
+  mkdirSync(belowDeep, { recursive: true });
+  mkdirSync(join(belowWs, '.wiregraph'), { recursive: true });
+  writeFileSync(join(belowWs, '.wiregraph', 'state.json'), '{}');
+  eq(S.findIndexedRoot(belowDeep, fakeHome), realpathSync(belowWs), 'findIndexedRoot: an index BELOW $HOME is honored from a sub-dir');
+
   rmSync(ws, { recursive: true, force: true });
   rmSync(orphan, { recursive: true, force: true });
+  rmSync(fakeHome, { recursive: true, force: true });
 }
 
 // Contract inference: HTTP routes -> cross-repo seams -> draft AsyncAPI that the

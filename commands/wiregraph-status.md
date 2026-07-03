@@ -35,15 +35,27 @@ that's off. **Target** = `${CLAUDE_PROJECT_DIR}` or cwd; call it `<TARGET>`.
    Remind them posture is changeable with
    `node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs posture "<TARGET>" <off|conservative|balanced|aggressive>`.
 
-4. **Recent background refreshes** (optional): if `<TARGET>/.wiregraph/refresh.log`
+4. **Hooks firing?** From the state in step 3, read `hooksLastFired` — the SessionStart
+   hook stamps it every session it runs on an indexed project.
+   - **absent / `null`** → If the user *just* ran `/wiregraph-init` this session, that's
+     expected (SessionStart ran before the graph existed; it'll stamp on the next
+     session) — say so, don't alarm. But if it stays absent across sessions, the
+     plugin's hooks are NOT firing in this Claude Code: no SessionStart catch-up, no
+     navigation nudges, no re-index-on-edit — the graph only self-heals on MCP reads,
+     so heavy editing drifts silently. Tell them to enable the plugin's hooks (or add
+     them to `<TARGET>/.claude/settings.json`) and to run `/wiregraph-update` after big
+     edits until then.
+   - **present** → note "hooks active (last SessionStart: `<hooksLastFired>`)".
+
+5. **Recent background refreshes** (optional): if `<TARGET>/.wiregraph/refresh.log`
    exists, show the last few lines so the user can see auto-updates are running.
 
-5. **Measured impact** (optional): if `<TARGET>/.wiregraph/metrics.jsonl` exists,
+6. **Measured impact** (optional): if `<TARGET>/.wiregraph/metrics.jsonl` exists,
    point the user to **`/wiregraph-stats`** — the dedicated, deterministic
    dashboard of graph-tool usage, estimated tokens saved, and the adoption gap
    (it explains how the numbers are projected). Don't recompute it here.
 
-6. **Contract coverage**: from the state shown in step 3, read `inferredSeams` (the
+7. **Contract coverage**: from the state shown in step 3, read `inferredSeams` (the
    cross-compartment seams — messaging/state/HTTP — the last full build detected) and
    `contractsDir`. If `inferredSeams > 0` and there's no `contractsDir`, those seams
    aren't captured yet — recommend `/wiregraph-contracts` to draft contracts for
