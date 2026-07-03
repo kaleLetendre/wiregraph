@@ -617,6 +617,25 @@ async function distinctivenessTest() {
     ok(isDistinctive(t), `distinctive: '${t}' is specific, must be kept`);
 }
 
+// Compartments: a MONOREPO (one .git at the root, two packages) must still produce
+// a cross-compartment seam — the packages are distinct compartments (detected by
+// package.json), so a shared route between them is a contract even without two
+// separate git repos. This is the case the old .git-only model was blind to.
+const FIXTURE_MONOREPO = join(HERE, 'fixture-monorepo');
+async function monorepoCompartmentTest() {
+  const I = await import('../src/contracts/infer.js');
+  const work = mkdtempSync(join(tmpdir(), 'cg-mono-'));
+  cpSync(FIXTURE_MONOREPO, work, { recursive: true });
+  mkdirSync(join(work, '.git'), { recursive: true }); // ONE git repo for the whole monorepo
+  const project = realpathSync(work);
+  const seams = I.clusterSeams(I.extractCandidates(project));
+  eq(seams.length, 1, 'compartments: one seam inside a single-git monorepo');
+  eq(seams[0].token, '/internal/sync', 'compartments: seam token is the shared route');
+  const parts = [...seams[0].repos].sort();
+  ok(parts.includes('api') && parts.includes('worker'), `compartments: seam spans the api + worker packages (got ${parts.join(', ')})`);
+  rmSync(work, { recursive: true, force: true });
+}
+
 console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -636,5 +655,6 @@ await exportHtmlTests();
 await schemaGuardTest();
 await structuralDriftTest();
 await distinctivenessTest();
+await monorepoCompartmentTest();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
