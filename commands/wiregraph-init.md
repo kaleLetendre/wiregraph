@@ -54,24 +54,26 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    `/reload-plugins` (once) so the MCP server restarts with the deps present — then
    the `find_symbol`/`trace_*`/etc. tools come online for the rest of the steps.
 
-2. **Confirm scope, then build the graph.** wiregraph indexes EVERY git repo under
-   `<TARGET>`, so first list what it would cover and confirm the scope is what the
-   user meant (this prevents the two footguns: indexing one repo when they meant the
-   workspace, or pointing at a huge tree like `$HOME`):
+2. **Confirm scope, then build the graph.** wiregraph indexes every **compartment**
+   under `<TARGET>` — a compartment is a git repo OR a package/module with its own
+   manifest, so one repo can hold several. List what it would cover and confirm the
+   scope is what the user meant (prevents the two footguns: indexing one compartment
+   when they meant the workspace, or pointing at a huge tree like `$HOME`):
 
    ```
    node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/workspace.mjs repos "<TARGET>"
    ```
 
    Read the `scope:` line and act before building:
-   - **SINGLE-REPO** — only that one repo is indexed, so cross-repo contracts won't
-     be possible. Ask the user (AskUserQuestion) whether they meant the **parent**
-     folder. wiregraph works best as a *workspace*: all related repos cloned
-     side-by-side under one parent folder, with `/wiregraph-init` run there. Proceed
-     with the single repo only if they confirm.
-   - **WORKSPACE** — show the repo list and confirm it's the intended set.
+   - **MULTI** — 2+ compartments (a monorepo of packages, or repos side-by-side), so
+     cross-compartment contracts are possible. Show the compartment list and confirm
+     it's the intended set.
+   - **SINGLE** — one compartment, so contracts need more than this. Ask the user
+     (AskUserQuestion) whether they meant the **parent** folder (related repos/packages
+     side-by-side under one parent, `/wiregraph-init` run there). Proceed with the
+     single compartment only if they confirm.
    - **NO-GIT** — the whole folder is indexed as one unit (fine for a lone non-git
-     project; note cross-repo contracts need separate git repos).
+     project; note contracts need 2+ compartments).
 
    Then build (full, project-scoped) into `<TARGET>/.wiregraph/graph.db` and report
    the printed stats (repos, files, symbols, contracts, edge counts):
@@ -94,11 +96,11 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    Confirm to the user that `.wiregraph/` was added to `.gitignore` (the command
    prints whether it added it, it was already present, or there's no `.git` here).
 
-4. **Infer cross-repo contracts (multi-repo workspaces only).** If step 2 indexed
-   **more than one git repo**, auto-run the wire-contract inference now so the
-   cross-repo seams light up without a second command — you don't have to invoke
-   `/wiregraph-contracts` separately or remember to rebuild. **Skip this step
-   entirely** for a SINGLE-REPO or NO-GIT target (there are no cross-repo seams to
+4. **Infer cross-compartment contracts (MULTI scope only).** If step 2 reported
+   **2+ compartments**, auto-run the wire-contract inference now so the
+   cross-compartment seams light up without a second command — you don't have to
+   invoke `/wiregraph-contracts` separately or remember to rebuild. **Skip this step
+   entirely** for a SINGLE or NO-GIT target (there are no cross-compartment seams to
    find), and just note that contracts don't apply.
 
    a. **Scan (no writes)** and show the user the proposed seams + AsyncAPI YAML:
