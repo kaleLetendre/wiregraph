@@ -125,7 +125,7 @@ async function main() {
   if (opts.open) { openInBrowser(opts.out); process.stderr.write(`opening ${opts.out} in your default browser…\n`); }
 }
 
-function renderHtml(data) {
+export function renderHtml(data) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -160,8 +160,9 @@ ${d3ScriptTag()}
     <input id="charge" type="range" min="0" max="300" step="5" value="40"></div>
   <div class="ctl"><label>link length <span id="vLink">45</span></label>
     <input id="link" type="range" min="10" max="200" step="5" value="45"></div>
+  <div class="ctl"><label style="cursor:pointer"><input id="labels" type="checkbox" style="vertical-align:middle"> show all labels</label></div>
   <div id="legend"></div>
-  <div class="hint">drag nodes &middot; scroll to zoom &middot; click swatch to hide a repo &middot; hover an edge for details</div>
+  <div class="hint">hover a node for its name &middot; drag nodes &middot; scroll to zoom &middot; click a swatch to hide a repo</div>
 </div>
 <div id="tip"></div>
 <script>
@@ -174,25 +175,33 @@ svg.call(d3.zoom().scaleExtent([0.03, 5]).on('zoom', e => g.attr('transform', e.
 // Directional arrowheads (a CALLS b, symbol REFERENCES contract point at the target).
 const defs = svg.append('defs');
 function arrow(id, col){ defs.append('marker').attr('id',id).attr('viewBox','0 -5 10 10')
-  .attr('refX',10).attr('refY',0).attr('markerWidth',7).attr('markerHeight',7).attr('orient','auto')
+  .attr('refX',10).attr('refY',0).attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
   .append('path').attr('d','M0,-5L10,0L0,5').attr('fill',col); }
 arrow('aRef','#E0A458'); arrow('aCall','#7B8CDE');
 const rOf = d => d.kind==='contract' ? 12 : 5;
 
 const centers = {};
-DATA.repos.forEach((r, i) => { const a = (i/DATA.repos.length)*2*Math.PI; centers[r] = {x:Math.cos(a), y:Math.sin(a)}; });
-const radius = () => Math.min(W(),H())*0.36;
-const tx = d => d.kind==='contract' ? W()/2 : W()/2 + (centers[d.repo]?.x||0)*radius();
-const ty = d => d.kind==='contract' ? H()/2 : H()/2 + (centers[d.repo]?.y||0)*radius();
+DATA.repos.forEach((r, i) => { const a = (i/DATA.repos.length)*2*Math.PI - Math.PI/2; centers[r] = {x:Math.cos(a), y:Math.sin(a)}; });
+const radius = () => Math.min(W(),H())*0.40;
+// Spread contracts around a smaller inner ring (stable index order) instead of
+// pinning every one to the exact center — otherwise all the seams and their
+// labels collapse into a single unreadable blob.
+const contractNodes = DATA.nodes.filter(d=>d.kind==='contract');
+contractNodes.forEach((c,i)=>{ c.__ci = i; });
+const NC = contractNodes.length;
+const innerR = () => NC<=1 ? 0 : Math.min(radius()*0.66, Math.max(Math.min(W(),H())*0.16, NC*10));
+const cAngle = d => (d.__ci/NC)*2*Math.PI - Math.PI/2;
+const tx = d => d.kind==='contract' ? W()/2 + Math.cos(cAngle(d))*innerR() : W()/2 + (centers[d.repo]?.x||0)*radius();
+const ty = d => d.kind==='contract' ? H()/2 + Math.sin(cAngle(d))*innerR() : H()/2 + (centers[d.repo]?.y||0)*radius();
 
 const tip = document.getElementById('tip');
 function showTip(e, html){ tip.style.display='block'; tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY+12)+'px'; tip.innerHTML=html; }
 function hideTip(){ tip.style.display='none'; }
 
-const link = g.append('g').attr('stroke-opacity',0.55).selectAll('line')
+const link = g.append('g').attr('stroke-opacity',0.38).selectAll('line')
   .data(DATA.links).join('line')
   .attr('stroke', d => d.type==='REFERENCES' ? '#E0A458' : '#7B8CDE')
-  .attr('stroke-width', d => d.type==='REFERENCES' ? Math.min(8, 1.2 + d.count*0.6) : Math.min(4, 0.8 + d.count*0.3))
+  .attr('stroke-width', d => d.type==='REFERENCES' ? Math.min(5, 1 + d.count*0.5) : Math.min(3.5, 0.8 + d.count*0.3))
   .attr('marker-end', d => d.type==='REFERENCES' ? 'url(#aRef)' : 'url(#aCall)')
   .on('mousemove', (e,d)=> showTip(e, d.type==='REFERENCES'
       ? '<b>REFERENCES</b> &middot; '+d.count+' field(s)<br>'+d.tokens.join(', ')
@@ -218,11 +227,11 @@ const label = g.append('g').selectAll('text')
   .style('pointer-events','none');
 
 const sim = d3.forceSimulation(DATA.nodes)
-  .force('link', d3.forceLink(DATA.links).id(d=>d.id).distance(45).strength(0.12))
-  .force('charge', d3.forceManyBody().strength(-40))
-  .force('x', d3.forceX(tx).strength(0.3))
-  .force('y', d3.forceY(ty).strength(0.3))
-  .force('collide', d3.forceCollide(d=>d.kind==='contract'?18:7))
+  .force('link', d3.forceLink(DATA.links).id(d=>d.id).distance(45).strength(0.08))
+  .force('charge', d3.forceManyBody().strength(-70))
+  .force('x', d3.forceX(tx).strength(d=>d.kind==='contract'?0.5:0.28))
+  .force('y', d3.forceY(ty).strength(d=>d.kind==='contract'?0.5:0.28))
+  .force('collide', d3.forceCollide(d=>d.kind==='contract'?20:6))
   .on('tick', ()=>{
     // Trim each line to the target node's border so the arrowhead is visible.
     link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
@@ -234,7 +243,7 @@ const sim = d3.forceSimulation(DATA.nodes)
 
 const bind=(id,vid,fn,fmt)=>{ const el=document.getElementById(id);
   el.addEventListener('input',()=>{ document.getElementById(vid).textContent=fmt(+el.value); fn(+el.value); sim.alpha(0.5).restart(); }); };
-bind('cluster','vCluster', v=>{ sim.force('x').strength(v); sim.force('y').strength(v); }, v=>v.toFixed(2));
+bind('cluster','vCluster', v=>{ const f=d=>d.kind==='contract'?Math.min(1,v+0.2):v; sim.force('x').strength(f); sim.force('y').strength(f); }, v=>v.toFixed(2));
 bind('charge','vCharge', v=> sim.force('charge').strength(-v), v=>v.toFixed(0));
 bind('link','vLink', v=> sim.force('link').distance(v), v=>v.toFixed(0));
 
@@ -245,12 +254,20 @@ items.forEach(it=>{ const row=legend.append('div').attr('class','leg').on('click
     hidden.has(it.key)?hidden.delete(it.key):hidden.add(it.key); d3.select(this).classed('off',hidden.has(it.key)); applyFilter(); });
   row.append('div').attr('class','sw').style('background',it.col); row.append('div').text(it.label); });
 const isHidden=d=> hidden.has(d.kind==='contract'?'__contract':d.repo);
-function applyFilter(){ node.attr('display',d=>isHidden(d)?'none':null); label.attr('display',d=>isHidden(d)?'none':null);
+// Labels are OFF by default: with many seams the always-on text is the main source
+// of clutter, and hovering any node already shows its name in the tooltip. The
+// "show all labels" checkbox turns them on for when the user has zoomed into a region.
+let labelsOn=false;
+document.getElementById('labels').addEventListener('change', e=>{ labelsOn=e.target.checked; applyFilter(); });
+function applyFilter(){ node.attr('display',d=>isHidden(d)?'none':null);
+  label.attr('display',d=>(labelsOn && !isHidden(d))?null:'none');
   link.attr('display',d=>(isHidden(d.source)||isHidden(d.target))?'none':null); }
+applyFilter();
 </script>
 </body>
 </html>
 `;
 }
 
-main().catch((e) => { process.stderr.write('ERROR: ' + (e.stack || e.message) + '\n'); process.exit(1); });
+const isCli = process.argv[1] && process.argv[1].endsWith('export-html.js');
+if (isCli) main().catch((e) => { process.stderr.write('ERROR: ' + (e.stack || e.message) + '\n'); process.exit(1); });
