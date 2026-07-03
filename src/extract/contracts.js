@@ -26,10 +26,31 @@ const STOP = new Set([
   'examples', 'properties', 'required', 'enum', 'format', 'items', 'schema',
 ]);
 
+// Generic HTTP endpoints every service exposes — sharing one is NOT a contract
+// between two specific services, so they must not mint a cross-repo seam.
+const ROUTE_STOP = new Set([
+  '/', '/health', '/healthz', '/health/live', '/health/ready', '/metrics',
+  '/status', '/ping', '/ready', '/readyz', '/live', '/livez', '/version',
+  '/favicon.ico', '/robots.txt', '/api', '/api/v1', '/api/v2', '/v1', '/v2', '/index',
+]);
+
+// Ubiquitous infrastructure env vars — two services reading DATABASE_URL share
+// infra config, not a service-to-service contract. (Project-named vars like
+// STRIPE_WEBHOOK_URL still pass — only these exact generic names are dropped.)
+const ENV_STOP = new Set([
+  'DATABASE_URL', 'REDIS_URL', 'REDIS_HOST', 'NODE_ENV', 'PORT', 'HOST', 'HOSTNAME',
+  'LOG_LEVEL', 'DEBUG', 'PATH', 'HOME', 'PWD', 'USER', 'SHELL', 'TERM', 'LANG',
+  'TZ', 'CI', 'TMPDIR', 'AWS_REGION', 'AWS_PROFILE', 'HTTP_PROXY', 'HTTPS_PROXY',
+]);
+
 export function isDistinctive(tok) {
   if (!tok) return false;
-  if (tok.includes('/')) return tok.length >= 5; // path / channel address
+  if (tok.includes('/')) { // path / channel address
+    if (ROUTE_STOP.has(tok.toLowerCase().replace(/\/+$/, ''))) return false;
+    return tok.length >= 5;
+  }
   if (STOP.has(tok.toLowerCase())) return false;
+  if (ENV_STOP.has(tok.toUpperCase())) return false;
   // dotted/colon topic or routing key (order.created, device:heartbeat)
   if ((tok.includes('.') || tok.includes(':')) && tok.length >= 5 && !/\s/.test(tok)) return true;
   if (tok.includes('_') && tok.length >= 6) return true; // snake_case field / ENV_VAR

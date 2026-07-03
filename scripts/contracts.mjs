@@ -9,7 +9,7 @@
 // The inference is heuristic — a draft to REVIEW and commit, not authoritative.
 // See docs/contracts.md. Works from any subdir of an indexed workspace.
 
-import { readdirSync, mkdirSync, writeFileSync, realpathSync } from 'node:fs';
+import { readdirSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { findIndexedRoot, readState, updateState } from './lib/state.mjs';
 import { extractCandidates, clusterSeams, synthesizeAsyncApi, formatSeams } from '../src/contracts/infer.js';
@@ -68,6 +68,17 @@ function main(argv) {
   let created = false;
   if (!dir) { dir = join(root, 'contracts'); mkdirSync(dir, { recursive: true }); created = true; }
   const out = join(dir, SPEC_NAME);
+
+  // Never silently clobber a hand-edited draft. The spec is meant to be reviewed,
+  // extended (payload schemas, direction), and committed as the user's own — a
+  // re-run that overwrote those edits with regenerated skeletons would destroy
+  // real work. If the file exists and differs from what we'd write, back it up
+  // first so the edits are always recoverable.
+  let backedUp = false;
+  if (existsSync(out) && readFileSync(out, 'utf8') !== yaml) {
+    copyFileSync(out, out + '.bak');
+    backedUp = true;
+  }
   writeFileSync(out, yaml);
 
   // Record the contracts home + seam count so the SessionStart nudge can stop and
@@ -75,6 +86,7 @@ function main(argv) {
   if (readState(root)) updateState(root, { contractsDir: dir, wireSeams: seams.length });
 
   process.stdout.write(`\nWrote ${seams.length} channel(s) to ${out}${created ? ' (created contracts/)' : ''}.\n`);
+  if (backedUp) process.stdout.write(`Existing draft differed — backed it up to ${out}.bak before overwriting.\n`);
   process.stdout.write(
     'This is a DRAFT — review/commit it as your own. Refresh the graph (the read tools '
     + 'self-heal, or run /wiregraph-update), then walk the seams with trace_contract / '

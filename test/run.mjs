@@ -607,6 +607,16 @@ async function structuralDriftTest() {
   rmSync(proj, { recursive: true, force: true });
 }
 
+// Distinctiveness STOP lists: generic endpoints / infra env vars must NOT count as
+// cross-repo contract tokens (they'd mint false seams), while real ones still do.
+async function distinctivenessTest() {
+  const { isDistinctive } = await import('../src/extract/contracts.js');
+  for (const t of ['/health', '/metrics', '/status', '/api/v1', '/', 'DATABASE_URL', 'NODE_ENV', 'REDIS_URL'])
+    ok(!isDistinctive(t), `distinctive: '${t}' is generic, must be rejected`);
+  for (const t of ['/api/register', '/orders/{id}/ship', 'STRIPE_WEBHOOK_URL', 'order.created', 'device_heartbeat'])
+    ok(isDistinctive(t), `distinctive: '${t}' is specific, must be kept`);
+}
+
 console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -625,5 +635,6 @@ await importsTest();
 await exportHtmlTests();
 await schemaGuardTest();
 await structuralDriftTest();
+await distinctivenessTest();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
