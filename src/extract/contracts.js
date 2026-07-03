@@ -352,6 +352,11 @@ export function buildWireEdges(graph, contracts, log = () => {}) {
     for (const p of pubs) {
       for (const q of cons) {
         if (p.id === q.id) continue;
+        // A WIRE edge is a CROSS-compartment seam. If a compartment both produces
+        // and consumes a token (defines a route it also calls), it lands in both
+        // pubs and cons — but an edge between two of its own symbols is intra-
+        // compartment (the call graph's job), not a wire. Skip it.
+        if (p.compartment === q.compartment) continue;
         const k = `${p.id}->${q.id}|${token}`;
         if (seen.has(k)) continue;
         seen.add(k);

@@ -653,6 +653,28 @@ async function monorepoCompartmentTest() {
   rmSync(work, { recursive: true, force: true });
 }
 
+// WIRE edges are cross-compartment only: a compartment that both PRODUCES and
+// CONSUMES a token (defines a route it also calls) must not yield a WIRE edge
+// between two of its own symbols — that's intra-compartment, not a wire seam.
+async function wireCrossCompartmentOnlyTest() {
+  const { buildWireEdges } = await import('../src/extract/contracts.js');
+  const g = new Graph('p');
+  g.addSymbol({ id: 'X:a.js:def:1', compartment: 'X', file: 'a.js', name: 'def', kind: 'function', startLine: 1 });
+  g.addSymbol({ id: 'X:a.js:call:5', compartment: 'X', file: 'a.js', name: 'call', kind: 'function', startLine: 5 });
+  g.addSymbol({ id: 'Y:b.js:call:1', compartment: 'Y', file: 'b.js', name: 'call', kind: 'function', startLine: 1 });
+  const C = 'contract:t';
+  g.addContract({ id: C, name: 'T', kind: 'asyncapi', file: 't.asyncapi.yaml' });
+  for (const s of ['X:a.js:def:1', 'X:a.js:call:5', 'Y:b.js:call:1']) g.addEdge('REFERENCES', s, C, { token: '/t/x' });
+  // X is BOTH a producer and a consumer of the token; Y only produces.
+  const contracts = [{ id: C, name: 'T', tokens: ['/t/x'], direction: {}, wireRoles: new Map([['/t/x', { producers: new Set(['X', 'Y']), consumers: new Set(['X']) }]]) }];
+  buildWireEdges(g, contracts);
+  const wires = g.edges.filter((e) => e.type === 'WIRE');
+  const comp = (id) => g.symbols.get(id).compartment;
+  ok(wires.length >= 1, `wire: at least one cross-compartment edge (got ${wires.length})`);
+  ok(wires.every((e) => comp(e.from) !== comp(e.to)), 'wire: no intra-compartment WIRE edges (X-producer to X-consumer suppressed)');
+  ok(wires.some((e) => comp(e.from) === 'Y' && comp(e.to) === 'X'), 'wire: real cross-compartment edge Y -> X kept');
+}
+
 console.log('wiregraph regression test');
 await fixtureTests();
 await pythonTests();
@@ -673,5 +695,6 @@ await schemaGuardTest();
 await structuralDriftTest();
 await distinctivenessTest();
 await monorepoCompartmentTest();
+await wireCrossCompartmentOnlyTest();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
