@@ -46,12 +46,26 @@ export function d3ScriptTag(allowCdn, bundlePath = D3_BUNDLE) {
 }
 
 // Open a file in the OS default browser, detached, so this process can exit.
+// Returns true if a launch was attempted. On headless Linux/SSH (no display) or
+// WSL (xdg-open can't reach the Windows browser) we don't spawn a doomed helper —
+// we just report the path, so the caller doesn't claim it opened when it didn't.
 function openInBrowser(file) {
-  const cmd = platform() === 'darwin' ? 'open' : platform() === 'win32' ? 'cmd' : 'xdg-open';
-  const args = platform() === 'win32' ? ['/c', 'start', '', file] : [file];
+  const plat = platform();
+  if (plat === 'linux') {
+    const headless = !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+    let wsl = false;
+    try { wsl = /microsoft|wsl/i.test(readFileSync('/proc/version', 'utf8')); } catch { /* no /proc */ }
+    if (headless || wsl) {
+      process.stderr.write(`not opening a browser (${wsl ? 'WSL' : 'no display'}); open ${file} yourself.\n`);
+      return false;
+    }
+  }
+  const cmd = plat === 'darwin' ? 'open' : plat === 'win32' ? 'cmd' : 'xdg-open';
+  const args = plat === 'win32' ? ['/c', 'start', '', file] : [file];
   const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
   child.on('error', (e) => process.stderr.write(`could not open browser (${e.message}); open ${file} yourself.\n`));
   child.unref();
+  return true;
 }
 // Must match the palette/order in build.js so HTML colors are stable across runs.
 const PALETTE = ['#E15554', '#4D9DE0', '#3BB273', '#7768AE', '#E67E22', '#1B9AAA', '#D81159', '#8F2D56'];
@@ -158,7 +172,7 @@ async function main() {
   writeFileSync(opts.out, renderHtml(data, { allowCdn: opts.allowCdn }));
   process.stderr.write(`wrote ${data.nodes.length} nodes / ${data.links.length} links -> ${opts.out}\n`);
   process.stderr.write('repos: ' + repos.map((r) => `${r}=${repoColor[r]}`).join(', ') + '\n');
-  if (opts.open) { openInBrowser(opts.out); process.stderr.write(`opening ${opts.out} in your default browser…\n`); }
+  if (opts.open && openInBrowser(opts.out)) process.stderr.write(`opening ${opts.out} in your default browser…\n`);
 }
 
 export function renderHtml(data, { allowCdn = false } = {}) {

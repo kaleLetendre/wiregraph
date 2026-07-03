@@ -17,7 +17,7 @@
 // json, logs, images) is left alone — both because the graph can't help there and
 // so the small per-session budget isn't spent on irrelevant reads.
 
-import { realpathSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
+import { realpathSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { readState, wiregraphDir, findIndexedRoot } from '../lib/state.mjs';
 import { record } from '../lib/metrics.mjs';
@@ -65,9 +65,24 @@ function bumpCount(proj, sessionId) {
   try { n = parseInt(readFileSync(file, 'utf8'), 10) || 0; } catch { /* first time */ }
   try {
     mkdirSync(dir, { recursive: true });
+    if (n === 0) pruneOldNudges(dir); // once per session: stale counters don't accumulate forever
     writeFileSync(file, String(n + 1));
   } catch { /* best-effort; a write failure just means we may re-nudge */ }
   return n;
+}
+
+// A counter file is written per session and was never cleaned up — a long-lived
+// checkout would grow one file per session indefinitely. Drop counters untouched
+// for a week (any session that stale is long over). Best-effort, once per session.
+function pruneOldNudges(dir) {
+  const WEEK = 7 * 24 * 60 * 60 * 1000;
+  try {
+    const now = Date.now();
+    for (const f of readdirSync(dir)) {
+      const p = join(dir, f);
+      try { if (now - statSync(p).mtimeMs > WEEK) rmSync(p, { force: true }); } catch { /* skip */ }
+    }
+  } catch { /* dir missing or unreadable — nothing to prune */ }
 }
 
 async function main() {

@@ -168,9 +168,15 @@ async function main(argv) {
     if (!root) { process.stdout.write('indexed: no\n'); return; }
     const s = readState(root) || {};
     const repoCount = s.reposLastSha ? Object.keys(s.reposLastSha).length : 0;
+    // state.json can exist without a graph.db (a build that failed after seed, or a
+    // manually deleted db). Report the db explicitly so init reroutes to a rebuild
+    // instead of assuming a queryable graph — otherwise SessionStart says "fresh"
+    // while every MCP tool returns NOT_BUILT.
+    const dbPresent = existsSync(join(wiregraphDir(root), 'graph.db'));
     process.stdout.write('indexed: yes\n');
     process.stdout.write(`root: ${root}\n`);
     process.stdout.write(`sameDir: ${root === project ? 'yes' : 'no'}\n`);
+    process.stdout.write(`db: ${dbPresent ? 'present' : 'missing'}\n`);
     process.stdout.write(`lastFullBuild: ${s.lastFullBuild || 'unknown'}\n`);
     process.stdout.write(`repos: ${repoCount}\n`);
     return;

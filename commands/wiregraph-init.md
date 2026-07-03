@@ -26,6 +26,8 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
 - `indexed: no` → this is a fresh setup; do all the steps below.
 - `indexed: yes` → wiregraph is **already set up** here (the `root:` line shows where;
   `sameDir: no` means an ancestor workspace is what's indexed, not `<TARGET>` itself).
+  If the `db:` line says **`missing`**, the graph was never built or was deleted —
+  don't ask; go straight to **Rebuild** below.
   Re-running full init would redundantly re-confirm scope and re-prompt for the
   CLAUDE.md directive — what's almost always wanted instead is a **rebuild**. Ask with
   AskUserQuestion how to proceed, and do **not** silently re-run the full setup:
