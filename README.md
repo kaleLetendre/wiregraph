@@ -172,6 +172,12 @@ workspace).
 
 You don't call these — Claude does, automatically.
 
+**Read a whole flow at once.** `/wiregraph-linearize <Class.method>` follows the `CALLS`
+graph from one symbol and inlines every reachable body **once**, in reading order, into a
+single top-to-bottom pseudo-source file — a feature smeared across many files read like a
+script. It's a reading aid (the output doesn't compile) and works across compartments and
+languages. Narrow or widen with `--breadth tight|medium|full` and `--depth N`.
+
 ## Measuring impact
 
 Want to see whether it's actually paying off? `/wiregraph-status` ends with a
