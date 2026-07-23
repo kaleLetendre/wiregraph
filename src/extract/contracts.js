@@ -166,7 +166,21 @@ function classifyDirections(doc) {
   return dir;
 }
 
-export function loadContracts(graph, contractsDir, log = () => {}) {
+// Parse ONE AsyncAPI doc into a raw contract descriptor (no graph mutation).
+function parseContract(doc, f) {
+  const name = doc?.info?.title || basename(f).replace(/\.asyncapi\.ya?ml$/, '');
+  const id = contractId(name);
+  const tokens = collectTokens(doc);
+  const direction = classifyDirections(doc);
+  // Channel address paths are endpoints the client calls -> client to server.
+  for (const t of tokens) if (t.startsWith('/') && !(t in direction)) direction[t] = 'c2s';
+  const wireRoles = readWireRoles(doc);
+  return { id, name, file: f, tokens, direction, wireRoles };
+}
+
+// Read + parse every AsyncAPI spec in ONE dir into raw contract descriptors. No
+// merge, no graph mutation — callers merge across dirs before minting nodes.
+function readContractsDir(contractsDir, log) {
   let entries;
   try {
     entries = readdirSync(contractsDir);
@@ -174,8 +188,7 @@ export function loadContracts(graph, contractsDir, log = () => {}) {
     log(`  no contracts dir at ${contractsDir}`);
     return [];
   }
-
-  const contracts = [];
+  const out = [];
   for (const f of entries) {
     if (!f.endsWith('.asyncapi.yaml') && !f.endsWith('.asyncapi.yml')) continue;
     let doc;
@@ -185,17 +198,73 @@ export function loadContracts(graph, contractsDir, log = () => {}) {
       log(`  failed to parse ${f}: ${e.message}`);
       continue;
     }
-    const name = doc?.info?.title || basename(f).replace(/\.asyncapi\.ya?ml$/, '');
-    const id = contractId(name);
-    const tokens = collectTokens(doc);
-    const direction = classifyDirections(doc);
-    // Channel address paths are endpoints the client calls -> client to server.
-    for (const t of tokens) if (t.startsWith('/') && !(t in direction)) direction[t] = 'c2s';
-    graph.addContract({ id, name, kind: 'asyncapi', file: f });
-    contracts.push({ id, name, file: f, tokens, direction, wireRoles: readWireRoles(doc) });
+    out.push(parseContract(doc, f));
   }
-  log(`  loaded ${contracts.length} contracts; ${contracts.reduce((n, c) => n + c.tokens.length, 0)} wire tokens`);
-  return contracts;
+  return out;
+}
+
+// Merge raw contracts sharing a contractId into ONE, UNIONing tokens, directions,
+// and wireRoles across every spec that contributed the id. A hand-applied spec and
+// the link-inferred spec routinely collide on 'contract:wiregraph-inferred' (same
+// synthesizeAsyncApi default info.title) — without this merge, whichever object a
+// downstream Map (graph.addContract node dedup vs. buildWireEdges' cById) happened
+// to retain would silently DROP the other spec's channels/roles, and precedence
+// differed between those two Maps, so a hand-authored channel could lose its WIRE
+// edge. Union is order-independent, so node dedup and cById now agree regardless of
+// dir precedence. First contributor wins for the display name/file only.
+export function mergeContracts(contracts) {
+  const byId = new Map();
+  for (const c of contracts) {
+    let m = byId.get(c.id);
+    if (!m) {
+      m = { id: c.id, name: c.name, file: c.file, tokens: new Set(), direction: {}, wireRoles: new Map() };
+      byId.set(c.id, m);
+    }
+    for (const t of c.tokens || []) m.tokens.add(t);
+    for (const [t, d] of Object.entries(c.direction || {})) if (d && !(t in m.direction)) m.direction[t] = d;
+    for (const [t, roles] of c.wireRoles || new Map()) {
+      let mr = m.wireRoles.get(t);
+      if (!mr) { mr = { producers: new Set(), consumers: new Set() }; m.wireRoles.set(t, mr); }
+      for (const p of roles.producers || []) mr.producers.add(p);
+      for (const q of roles.consumers || []) mr.consumers.add(q);
+    }
+  }
+  return [...byId.values()].map((m) => ({ ...m, tokens: [...m.tokens] }));
+}
+
+// tokenMeta: the full defined-token set persisted to the store (schema v4) so
+// trace_contract can diff it against the REFERENCES edges and report drift.
+// Computed from the MERGED contract so every channel is present regardless of which
+// spec defined it. producers/consumers come from the inference's x-wiregraph-*
+// extensions when present (empty for hand-written specs — drift then keys purely on
+// how many compartments reference the token).
+function contractTokenMeta(c) {
+  const join = (s) => (s && s.size ? [...s].sort().join(',') : null);
+  return c.tokens.map((t) => {
+    const roles = c.wireRoles.get(t);
+    return { token: t, direction: c.direction[t] || null, producers: join(roles?.producers), consumers: join(roles?.consumers) };
+  });
+}
+
+// Load every AsyncAPI spec across `dirs`, MERGE specs sharing a contractId, and add
+// ONE merged Contract node per id (union tokenMeta). Returns the merged contracts:
+// matchContracts keys REFERENCES off their union token set, and buildWireEdges'
+// cById is one-per-id so its wireRoles precedence matches the node exactly. `dirs`
+// arrive ordered hand-written-first, inferred-last — the merge is order-free.
+export function loadAllContracts(graph, dirs, log = () => {}) {
+  const raw = [];
+  for (const dir of dirs) raw.push(...readContractsDir(dir, log));
+  const merged = mergeContracts(raw);
+  for (const c of merged) {
+    graph.addContract({ id: c.id, name: c.name, kind: 'asyncapi', file: c.file, tokenMeta: contractTokenMeta(c) });
+  }
+  log(`  loaded ${merged.length} contract(s) from ${dirs.length} dir(s); ${merged.reduce((n, c) => n + c.tokens.length, 0)} wire tokens`);
+  return merged;
+}
+
+// Back-compat single-dir wrapper (external callers / tests).
+export function loadContracts(graph, contractsDir, log = () => {}) {
+  return loadAllContracts(graph, [contractsDir], log);
 }
 
 // Build a per-file list of {startLine, endLine, id} intervals from real symbols
@@ -298,12 +367,17 @@ const SELF_COMPARTMENT = process.env.WIREGRAPH_SELF_REPO || null;
 const MAX_PAIRS_PER_TOKEN = 25;
 
 export function buildWireEdges(graph, contracts, log = () => {}) {
-  const cById = new Map(contracts.map((c) => [c.id, c]));
+  // Merge specs sharing a contractId first, so cById holds the SAME union of
+  // tokens/wireRoles the merged Contract node does — a hand-authored channel and an
+  // inferred one that collide on the id both keep their roles here (M2). Idempotent
+  // when the caller already passed merged contracts (loadAllContracts does).
+  const merged = mergeContracts(contracts);
+  const cById = new Map(merged.map((c) => [c.id, c]));
   // Two ways to orient a WIRE edge: the producer/consumer compartments the
   // inference encoded per channel (x-wiregraph-*, read into c.wireRoles), or — for
   // a hand-written spec without them — the WIREGRAPH_SERVER_REPO env var. With
   // neither, skip: REFERENCES + Contract nodes are unaffected, only WIRE.
-  const anyRoles = contracts.some((c) => c.wireRoles && c.wireRoles.size);
+  const anyRoles = merged.some((c) => c.wireRoles && c.wireRoles.size);
   if (!anyRoles && !SERVER_COMPARTMENT) {
     log('  WIRE edges skipped (no producer/consumer compartments in specs; set WIREGRAPH_SERVER_REPO for hand-written specs without direction)');
     return { wire: 0, gaps: 0 };

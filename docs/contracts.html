@@ -276,6 +276,7 @@
       <a href="#bug">the bug class</a>
       <a href="#detect">detection</a>
       <a href="#sources">sources</a>
+      <a href="guide.html">guide&nbsp;↗</a>
       <a href="index.html">← main</a>
     </nav>
     <a href="index.html#install" class="nav-cta">Install</a>
@@ -587,20 +588,50 @@
     reveals.forEach(function(r){ r.classList.add('in'); });
   }
 
-  /* ---------- active section in nav ---------- */
+  /* ---------- active section in nav + shareable ?section= deep-links ---------- */
   var navAnchors = Array.prototype.slice.call(document.querySelectorAll('.nav-links a[href^="#"]'));
   var sections = navAnchors.map(function(a){ return document.querySelector(a.getAttribute('href')); });
+  var sectionIds = sections.filter(Boolean).map(function(s){ return s.id; });
+  function shareSection(id){
+    if(sectionIds.indexOf(id) === -1) return;
+    try {
+      var u = new URL(window.location.href);
+      u.searchParams.set('section', id);
+      u.hash = '';
+      history.replaceState(history.state, '', u.pathname + u.search);
+    } catch(e){ /* history/URL unsupported — leave the address bar alone */ }
+  }
   if('IntersectionObserver' in window){
     var so = new IntersectionObserver(function(entries){
       entries.forEach(function(en){
         if(en.isIntersecting){
           var id = '#'+en.target.id;
           navAnchors.forEach(function(a){ a.classList.toggle('active', a.getAttribute('href')===id); });
+          shareSection(en.target.id);
         }
       });
     }, {rootMargin:'-45% 0px -50% 0px', threshold:0});
     sections.forEach(function(s){ if(s) so.observe(s); });
   }
+  /* nav clicks keep the address bar on ?section= (href="#id" stays the no-JS fallback) */
+  navAnchors.forEach(function(a){
+    a.addEventListener('click', function(e){
+      var id = a.getAttribute('href').slice(1), el = document.getElementById(id);
+      if(!el) return;
+      e.preventDefault();
+      el.scrollIntoView();
+      shareSection(id);
+    });
+  });
+  /* open at a shared ?section= on load */
+  (function(){
+    var want; try { want = new URL(window.location.href).searchParams.get('section'); } catch(e){ return; }
+    if(!want || sectionIds.indexOf(want) === -1) return;
+    var target = document.getElementById(want);
+    if(!target) return;
+    if('scrollRestoration' in history){ try { history.scrollRestoration = 'manual'; } catch(e){} }
+    requestAnimationFrame(function(){ target.scrollIntoView({behavior:'auto'}); });
+  })();
 
   if(reduce) return; /* no animated pulses under reduced motion */
 

@@ -24,3 +24,7 @@ node_modules/.bin/npm-check-updates
 /wiregraph*.gexf
 /npm-debug.log*
 .wiregraph/
+
+# Runtime marker Claude Code writes into a plugin's install dir; only lands in the
+# repo when the install is dev-symlinked here. Never part of the plugin.
+.in_use/

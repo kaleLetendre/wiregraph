@@ -21,10 +21,12 @@ import { isDistinctive } from '../extract/contracts.js';
 
 // --- 1. extract contract candidates across the workspace --------------------
 // Mirrors extractCode's walk loop, collecting the `candidates` parseSource now
-// returns. fileFilter (optional Set of abs paths) restricts the scan.
-export function extractCandidates(root, fileFilter = null) {
+// returns. fileFilter (optional Set of abs paths) restricts the scan. `roots` may
+// be a single root (string) or a UNION of member roots (array) — walkSources
+// shares one dedup set across the union so overlapping members are counted once.
+export function extractCandidatesAcross(roots, fileFilter = null) {
   const out = [];
-  for (const f of walkSources(root)) {
+  for (const f of walkSources(roots)) {
     if (fileFilter && !fileFilter.has(f.abs)) continue;
     let src;
     try { src = readFileSync(f.abs, 'utf8'); } catch { continue; }
@@ -35,6 +37,17 @@ export function extractCandidates(root, fileFilter = null) {
     }
   }
   return out;
+}
+
+// Single-root convenience (back-compat): unchanged behavior for existing callers.
+export function extractCandidates(root, fileFilter = null) {
+  return extractCandidatesAcross(root, fileFilter);
+}
+
+// Candidates for a UNION of roots -> cross-compartment seams. This is what link /
+// unlink and /wiregraph-contracts use so inference spans every member.
+export function inferSeamsAcross(roots, fileFilter = null) {
+  return clusterSeams(extractCandidatesAcross(roots, fileFilter));
 }
 
 // --- 2. cluster shared tokens into cross-compartment seams ------------------

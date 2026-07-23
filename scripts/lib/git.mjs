@@ -13,6 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { findGitRepos } from '../../src/extract/walk.js';
 import { langForFile } from '../../src/extract/lang.js';
+import { memberRoots } from './state.mjs';
 
 // Raw git output — NOT trimmed. `git status --porcelain` encodes file state in
 // the first two columns, so the leading status space is significant; a global
@@ -36,9 +37,34 @@ export function headSha(repoRoot) {
   return out ? out.trim() : null;
 }
 
-// Returns the project's repos as [{ name, root, head }] (root is the key).
+// The git repos under a SINGLE root (this graph's own tree, or one member).
+function reposUnder(root) {
+  return findGitRepos(root).map((r) => ({ name: r.name, root: r.dir, head: headSha(r.dir) }));
+}
+
+// Only THIS graph's own-tree repos (not linked members). Used to scope the
+// once-per-process upstream-divergence banner to the home root, so a member repo
+// parked on an old branch doesn't spam a caveat about a tree you didn't ask about.
+export function ownRepos(project) {
+  return reposUnder(project);
+}
+
+// Returns the project's repos across the WHOLE union — its own tree plus every
+// linked member — as [{ name, root, head }] (root is the key). memberRoots dedups
+// realpaths and drops vanished members, and repos are deduped by root so an
+// overlapping/symlinked member can't double-count a checkout. Member-aware so the
+// SessionStart catch-up and staleness probes see changes in linked members too.
 export function projectRepos(project) {
-  return findGitRepos(project).map((r) => ({ name: r.name, root: r.dir, head: headSha(r.dir) }));
+  const seen = new Set();
+  const out = [];
+  for (const root of memberRoots(project)) {
+    for (const repo of reposUnder(root)) {
+      if (seen.has(repo.root)) continue;
+      seen.add(repo.root);
+      out.push(repo);
+    }
+  }
+  return out;
 }
 
 // Compute the source files that changed since reposLastSha across every repo,
@@ -92,9 +118,12 @@ export function changedSince(project, reposLastSha = {}) {
 // Repos with no upstream configured or a detached HEAD are skipped (no baseline).
 // One `git rev-list` per repo; read-only like the rest of this module.
 // Returns [{ name, branch, upstream, ahead, behind }] for repos NOT in sync.
-export function upstreamDivergence(project) {
+// With { homeOnly: true } it inspects only this graph's own tree, skipping linked
+// members — the once-per-process read-tool banner uses that to avoid flagging a
+// member checkout the user didn't ask about; graph_status reports the full union.
+export function upstreamDivergence(project, { homeOnly = false } = {}) {
   const out = [];
-  for (const repo of projectRepos(project)) {
+  for (const repo of (homeOnly ? ownRepos(project) : projectRepos(project))) {
     const branch = git(repo.root, ['rev-parse', '--abbrev-ref', 'HEAD']);
     const b = branch ? branch.trim() : null;
     if (!b || b === 'HEAD') continue; // detached HEAD / unknown → no branch baseline

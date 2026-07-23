@@ -14,13 +14,17 @@
 
 import { realpathSync, appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { runBuild } from '../../src/build.js';
-import { readState, updateState, refreshLogPath } from '../lib/state.mjs';
+import { runBuild, reindexFiles } from '../../src/build.js';
+import { readState, updateState, refreshLogPath, findIndexedRoot } from '../lib/state.mjs';
 import { changedSince, projectRepos } from '../lib/git.mjs';
 
 function resolveProject() {
   const raw = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  try { return realpathSync(raw); } catch { return raw; }
+  // Resolve the indexed WORKSPACE root so a refresh fired from a nested sub-repo
+  // (or a linked member's own tree) targets the graph that actually indexes it,
+  // not the bare cwd. Falls back to the realpath'd cwd when nothing up the tree is
+  // indexed (an uninitialized project just no-ops below).
+  return findIndexedRoot(raw) || (() => { try { return realpathSync(raw); } catch { return raw; } })();
 }
 const PROJECT = resolveProject();
 
@@ -61,18 +65,21 @@ async function main() {
   if (o.files && o.files.length) {
     // Explicit set (post-edit): re-index just these; do NOT advance shas, since
     // committed changes between the stored sha and HEAD may not be in this set.
-    await runBuild({ target: PROJECT, project: PROJECT, files: o.files });
-    logLine(`reindexed ${o.files.length} explicit file(s)`);
+    // Fan out so an edit under a linked member updates every graph that includes
+    // it (owningMember attribution + graphsListing reverse index inside reindexFiles).
+    const rebuilt = await reindexFiles(o.files, PROJECT, { fanOut: true });
+    logLine(`reindexed ${o.files.length} explicit file(s) into ${rebuilt.length} graph(s)`);
     return;
   }
 
   // Auto (SessionStart catch-up): re-index everything changed since last index
-  // and advance the per-repo shas.
+  // (across the whole union — changedSince now iterates members) and advance the
+  // per-repo shas. Fan out so a member's committed change lands in both graphs.
   const c = changedSince(PROJECT, state.reposLastSha || {});
   if (!c.files.length) { logLine('auto: nothing changed'); return; }
-  await runBuild({ target: PROJECT, project: PROJECT, files: c.files });
+  const rebuilt = await reindexFiles(c.files, PROJECT, { fanOut: true });
   updateState(PROJECT, { reposLastSha: { ...(state.reposLastSha || {}), ...c.newShas } });
-  logLine(`auto: reindexed ${c.files.length} changed file(s)`);
+  logLine(`auto: reindexed ${c.files.length} changed file(s) into ${rebuilt.length} graph(s)`);
 }
 
 main().catch((e) => { logLine('ERROR: ' + (e.message || e)); process.exit(0); });

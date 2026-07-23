@@ -318,6 +318,7 @@
       <a href="#contracts">contracts</a>
       <a href="#tools">tools</a>
       <a href="#install">install</a>
+      <a href="guide.html">guide&nbsp;↗</a>
       <a href="contracts.html">contract&nbsp;architecture&nbsp;↗</a>
     </nav>
     <a href="#install" class="nav-cta">Install</a>
@@ -466,8 +467,12 @@
           <li><span class="b">→</span><div>A route, a queue topic, an env var, or an imported package — when a token appears in <b>2+ repos</b>, wiregraph mints a <b>Contract node</b>.</div></li>
           <li><span class="b">→</span><div>Producer and consumer both link to it with <b>REFERENCES</b> edges, so Claude can trace <b>producer → contract → consumer</b> across the boundary.</div></li>
           <li><span class="b">→</span><div>Rename one side and the seam is right there — no grep, no guessing which of your services just broke.</div></li>
+          <li><span class="b">→</span><div>Repos indexed <b>separately</b>? <code style="font-family:var(--mono);color:var(--cyan);font-size:.9em;background:rgba(34,227,201,.07);padding:1px 6px;border-radius:5px">/wiregraph-link</code> joins two graphs so a shared wire lights up across the boundary — <b>symmetric</b>, one db per graph, no shared code required.</div></li>
         </ul>
-        <a href="contracts.html" class="btn btn-contract">What is contract architecture? &nbsp;→</a>
+        <div class="cta-row" style="margin-top:0">
+          <a href="contracts.html" class="btn btn-contract">What is contract architecture? &nbsp;→</a>
+          <a href="guide.html" class="btn btn-ghost">Guide &amp; commands &nbsp;→</a>
+        </div>
       </div>
 
       <div class="contract-viz reveal d2">
@@ -550,6 +555,7 @@
       </div>
     </div>
     <p class="tools-note reveal">// set it up once and forget it — the graph stays fresh as you edit.</p>
+    <p class="tools-note reveal">// joining two separately-indexed repos? <a href="guide.html" style="color:var(--cyan)">/wiregraph-link</a> makes trace_contract cross the seam between them — see the guide.</p>
   </section>
 
   <!-- ============ INSTALL ============ -->
@@ -627,20 +633,50 @@
     reveals.forEach(function(r){ r.classList.add('in'); });
   }
 
-  /* ---------- active section in nav ---------- */
+  /* ---------- active section in nav + shareable ?section= deep-links ---------- */
   var navAnchors = Array.prototype.slice.call(document.querySelectorAll('.nav-links a[href^="#"]'));
   var sections = navAnchors.map(function(a){ return document.querySelector(a.getAttribute('href')); });
+  var sectionIds = sections.filter(Boolean).map(function(s){ return s.id; });
+  function shareSection(id){
+    if(sectionIds.indexOf(id) === -1) return;
+    try {
+      var u = new URL(window.location.href);
+      u.searchParams.set('section', id);
+      u.hash = '';
+      history.replaceState(history.state, '', u.pathname + u.search);
+    } catch(e){ /* history/URL unsupported — leave the address bar alone */ }
+  }
   if('IntersectionObserver' in window){
     var so = new IntersectionObserver(function(entries){
       entries.forEach(function(en){
         if(en.isIntersecting){
           var id = '#'+en.target.id;
           navAnchors.forEach(function(a){ a.classList.toggle('active', a.getAttribute('href')===id); });
+          shareSection(en.target.id);
         }
       });
     }, {rootMargin:'-45% 0px -50% 0px', threshold:0});
     sections.forEach(function(s){ if(s) so.observe(s); });
   }
+  /* nav clicks keep the address bar on ?section= (href="#id" stays the no-JS fallback) */
+  navAnchors.forEach(function(a){
+    a.addEventListener('click', function(e){
+      var id = a.getAttribute('href').slice(1), el = document.getElementById(id);
+      if(!el) return;
+      e.preventDefault();
+      el.scrollIntoView();
+      shareSection(id);
+    });
+  });
+  /* open at a shared ?section= on load */
+  (function(){
+    var want; try { want = new URL(window.location.href).searchParams.get('section'); } catch(e){ return; }
+    if(!want || sectionIds.indexOf(want) === -1) return;
+    var target = document.getElementById(want);
+    if(!target) return;
+    if('scrollRestoration' in history){ try { history.scrollRestoration = 'manual'; } catch(e){} }
+    requestAnimationFrame(function(){ target.scrollIntoView({behavior:'auto'}); });
+  })();
 
   /* ---------- copy buttons ---------- */
   document.querySelectorAll('.cmd-line').forEach(function(line){

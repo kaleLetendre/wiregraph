@@ -1,6 +1,6 @@
 ---
 description: Initialize wiregraph for a project — build the graph, install the directive + auto-update, and start using Claude at ~50% fewer tokens
-argument-hint: "[target-dir] (defaults to the current project root)"
+argument-hint: "[target-dir] [--no-directive] (target defaults to the current project root)"
 allowed-tools: Bash, Read, Edit, AskUserQuestion
 ---
 
@@ -28,7 +28,7 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
   `sameDir: no` means an ancestor workspace is what's indexed, not `<TARGET>` itself).
   If the `db:` line says **`missing`**, the graph was never built or was deleted —
   don't ask; go straight to **Rebuild** below.
-  Re-running full init would redundantly re-confirm scope and re-prompt for the
+  Re-running full init would redundantly re-confirm scope and re-apply the
   CLAUDE.md directive — what's almost always wanted instead is a **rebuild**. Ask with
   AskUserQuestion how to proceed, and do **not** silently re-run the full setup:
   - **Rebuild (recommended)** — regenerate the graph from scratch: call the
@@ -131,23 +131,24 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    Confirm to the user that `.wiregraph/` was added to `.gitignore` (the command prints
    whether it added it, it was already present, or there's no `.git` here).
 
-6. **Install the navigation directive** into `<TARGET>/CLAUDE.md`. First show the
-   user what would change, then get explicit consent before writing:
-
-   ```
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/claudemd.mjs diff "<TARGET>"
-   ```
-
-   Show that block to the user and ask whether to add it (use AskUserQuestion).
-   This directive is what makes Claude reach for the graph economically — it is
-   the source of the token win. If they consent:
+6. **Install the navigation directive** into `<TARGET>/CLAUDE.md`. This managed block
+   is the *mechanism* that makes Claude prefer the graph — it's the source of the token
+   win, not an optional add-on — so it's part of setup: **install it directly, do NOT
+   prompt Add/Skip.** Running `/wiregraph-init` is the opt-in; asking again here only
+   invites leaving the graph silently degraded.
 
    ```
    node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/claudemd.mjs apply "<TARGET>"
    ```
 
-   If they decline, continue — the MCP tool descriptions still carry the economy
-   guidance, but note the win is strongest with the directive installed.
+   Then, so the edit is never a surprise, report what changed: the managed wiregraph
+   block was appended to `<TARGET>/CLAUDE.md` (only between its sentinels — the rest of
+   the file is untouched), and it's removable any time with `/wiregraph-teardown` or
+   `/wiregraph-remove`. To see the exact block, `claudemd.mjs diff "<TARGET>"`.
+
+   **Opt-out:** if the invocation included **`--no-directive`** (for users who
+   hand-manage their CLAUDE.md), skip the write entirely and say so — note the MCP tools
+   still work, but the token win is weaker without the directive.
 
 7. **Auto-update / hooks.** The plugin ships `SessionStart`, `PreToolUse`, and
    `PostToolUse` hooks; they fire automatically whenever the wiregraph plugin is
@@ -166,10 +167,38 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/state.mjs check "<TARGET>"
    If the user's Claude Code does not auto-run plugin hooks, they can enable them
    explicitly in `<TARGET>/.claude/settings.json` (offer this only if asked).
 
-8. **Confirm** by calling the `graph_status` MCP tool. Then summarize: graph
-   built (counts), directive installed (or declined), posture, and that the
-   wiregraph MCP tools (`find_symbol`, `get_source`, `trace_callers`,
-   `trace_callees`, `trace_contract`, `path_between`, `graph_status`,
+8. **Offer to re-establish prior links.** A previous `/wiregraph-remove` or
+   `/wiregraph-unlink` may have torn down cross-repo links this graph had — wiregraph
+   remembers them in a tombstone that survives the removal. Check for any (peers that no
+   longer exist are already filtered out):
+
+   ```
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/links.mjs former-links "<TARGET>"
+   ```
+
+   - **No output** → nothing remembered; skip to the next step.
+   - **One or more peer paths** → ask with AskUserQuestion how to restore them, in the
+     user's words: **All** (re-link every listed peer), **Some** (walk them one at a
+     time, asking per peer), or **None** (restore nothing). Never re-link silently.
+
+     For each peer the user chooses, re-link it with `<TARGET>` as SELF:
+
+     ```
+     CLAUDE_PROJECT_DIR="<TARGET>" node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/links.mjs link "<PEER>"
+     ```
+
+     Relay each result; a peer that fails the guard (gone, or a basename collision) is
+     reported and skipped, not fatal. Whatever the choice, clear the memory afterward so
+     a future init doesn't re-ask:
+
+     ```
+     node ${CLAUDE_PLUGIN_ROOT}/scripts/lib/links.mjs forget-links "<TARGET>"
+     ```
+
+9. **Confirm** by calling the `graph_status` MCP tool. Then summarize: graph
+   built (counts), directive installed (or declined), posture, links re-established
+   (if any), and that the wiregraph MCP tools (`find_symbol`, `get_source`,
+   `trace_callers`, `trace_callees`, `trace_contract`, `path_between`, `graph_status`,
    `update_graph`, `query_sql`) are now queryable for this project.
 
 Note: a project may contain several git repos (wiregraph indexes them all under

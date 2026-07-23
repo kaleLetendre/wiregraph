@@ -1,0 +1,1076 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide — how to use wiregraph, and every command explained</title>
+<meta name="description" content="Getting started with wiregraph plus a complete reference for all 13 commands — including /wiregraph-link, -unlink and -list, which join two separately-indexed graphs so cross-repo wire and contract seams light up across the boundary.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔗</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#05070a;
+    --bg2:#080b11;
+    --panel:#0b0f16;
+    --panel2:#0e131c;
+    --line:#18202c;
+    --line2:#232e3d;
+    --ink:#e7edf5;
+    --muted:#8a97a9;
+    --dim:#5d6a7d;
+    --cyan:#22e3c9;
+    --cyan-soft:#0fd6c0;
+    --green:#5cf08a;
+    --amber:#ffcf6b;
+    --violet:#9b8cff;
+    --red:#ff6b6b;
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    --glow:0 0 22px rgba(34,227,201,.35);
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  html,body{margin:0;overflow-x:hidden;max-width:100%}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font-family:var(--sans);
+    line-height:1.6;
+    font-size:16px;
+    -webkit-font-smoothing:antialiased;
+    position:relative;
+  }
+  /* graph-paper texture */
+  body::before{
+    content:"";
+    position:fixed;
+    inset:0;
+    z-index:0;
+    pointer-events:none;
+    background-image:
+      linear-gradient(rgba(34,227,201,.045) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(34,227,201,.045) 1px,transparent 1px),
+      radial-gradient(1200px 700px at 78% -8%,rgba(34,227,201,.10),transparent 60%),
+      radial-gradient(900px 600px at 8% 12%,rgba(155,140,255,.08),transparent 60%);
+    background-size:34px 34px,34px 34px,100% 100%,100% 100%;
+    -webkit-mask-image:radial-gradient(circle at 50% 30%,#000 0%,rgba(0,0,0,.7) 55%,rgba(0,0,0,.35) 100%);
+    mask-image:radial-gradient(circle at 50% 30%,#000 0%,rgba(0,0,0,.7) 55%,rgba(0,0,0,.35) 100%);
+  }
+  main,header{position:relative;z-index:1}
+  a{color:var(--cyan);text-decoration:none}
+  a:hover{text-decoration:underline}
+  ::selection{background:rgba(34,227,201,.3);color:#fff}
+
+  /* ---------- NAV ---------- */
+  header.nav{
+    position:sticky;top:0;z-index:50;
+    backdrop-filter:blur(12px);
+    background:linear-gradient(180deg,rgba(5,7,10,.92),rgba(5,7,10,.72));
+    border-bottom:1px solid var(--line);
+  }
+  .nav-inner{
+    max-width:1180px;margin:0 auto;padding:12px 22px;
+    display:flex;align-items:center;gap:18px;
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.02em;font-size:18px;white-space:nowrap}
+  .brand .mark{width:22px;height:22px;flex:0 0 auto}
+  .brand .mark circle,.brand .mark line{stroke:var(--cyan)}
+  .brand .sub{font-family:var(--mono);font-size:11px;font-weight:500;color:var(--dim);letter-spacing:.04em}
+  .nav-links{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap}
+  .nav-links a{
+    font-family:var(--mono);font-size:12.5px;color:var(--muted);
+    padding:7px 11px;border-radius:8px;position:relative;letter-spacing:.02em;
+  }
+  .nav-links a:hover{color:var(--ink);text-decoration:none;background:rgba(255,255,255,.03)}
+  .nav-links a.active{color:var(--cyan)}
+  .nav-links a.active::after{
+    content:"";position:absolute;left:11px;right:11px;bottom:1px;height:2px;
+    background:var(--cyan);border-radius:2px;box-shadow:var(--glow);
+  }
+  .nav-cta{
+    font-family:var(--mono);font-size:12.5px;font-weight:700;
+    padding:8px 14px;border-radius:9px;
+    color:var(--bg);background:var(--cyan);
+    box-shadow:var(--glow);white-space:nowrap;
+  }
+  .nav-cta:hover{text-decoration:none;background:#3af0d8}
+  .menu-toggle{display:none}
+
+  /* ---------- LAYOUT ---------- */
+  section{max-width:1180px;margin:0 auto;padding:92px 22px;scroll-margin-top:70px}
+  .eyebrow{
+    font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--cyan);margin:0 0 14px;font-weight:500;
+    display:inline-flex;align-items:center;gap:9px;
+  }
+  .eyebrow::before{content:"";width:26px;height:1px;background:var(--cyan);opacity:.6}
+  h1,h2,h3{letter-spacing:-.025em;line-height:1.1;margin:0}
+  h2{font-size:clamp(28px,4.6vw,42px);font-weight:800}
+  h2 .accent{color:var(--cyan)}
+  .lead{color:var(--muted);font-size:clamp(16px,2.1vw,19px);max-width:60ch;margin:16px 0 0}
+  p.body{color:var(--muted);font-size:16px;max-width:66ch;margin:18px 0 0}
+  p.body b{color:var(--ink);font-weight:600}
+  code.inline{font-family:var(--mono);color:var(--cyan);font-size:.9em;background:rgba(34,227,201,.07);padding:1px 6px;border-radius:5px}
+
+  .card{
+    background:linear-gradient(180deg,var(--panel),var(--panel2));
+    border:1px solid var(--line);border-radius:var(--radius);
+    padding:22px;position:relative;transition:border-color .25s,transform .25s,box-shadow .25s;
+  }
+  .card:hover{border-color:var(--line2);transform:translateY(-3px);box-shadow:0 14px 40px rgba(0,0,0,.4)}
+
+  /* reveal on scroll */
+  .reveal{opacity:0;transform:translateY(26px);transition:opacity .7s ease,transform .7s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  .reveal.d1{transition-delay:.08s}.reveal.d2{transition-delay:.16s}
+  .reveal.d3{transition-delay:.24s}.reveal.d4{transition-delay:.32s}
+
+  /* ---------- HERO ---------- */
+  #hero{padding-top:60px;padding-bottom:56px}
+  .hero-title{font-size:clamp(38px,6.6vw,62px);font-weight:800;line-height:1.02;letter-spacing:-.04em;max-width:17ch;margin-top:10px}
+  .hero-title .g{
+    background:linear-gradient(100deg,var(--cyan),var(--green) 55%,var(--cyan));
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .backlink{font-family:var(--mono);font-size:12.5px;color:var(--muted);display:inline-flex;align-items:center;gap:8px}
+  .backlink:hover{color:var(--cyan);text-decoration:none}
+  /* quick facts strip */
+  .facts{list-style:none;padding:0;margin:34px 0 0;display:flex;flex-wrap:wrap;gap:10px}
+  .facts li{
+    font-family:var(--mono);font-size:12.5px;color:var(--muted);
+    padding:9px 14px;border-radius:9px;background:rgba(255,255,255,.02);border:1px solid var(--line);
+  }
+  .facts li b{color:var(--cyan);font-weight:500}
+
+  /* SVG shared */
+  svg{display:block;width:100%;height:auto}
+  .node-body{fill:var(--panel2);stroke:var(--line2);stroke-width:1.4}
+  .node-lit .node-body{stroke:var(--cyan);filter:drop-shadow(0 0 6px rgba(34,227,201,.6))}
+  .node-label{font-family:var(--mono);font-size:11px;fill:var(--ink)}
+  .edge{stroke:var(--line2);stroke-width:1.6;fill:none}
+  .edge-active{stroke:rgba(34,227,201,.55)}
+  .pulse{fill:var(--cyan);filter:drop-shadow(0 0 5px var(--cyan))}
+
+  /* ---------- getting-started + walkthrough steps ---------- */
+  .flow{margin-top:20px;display:flex;flex-direction:column;gap:30px}
+  .step{position:relative;padding-left:60px}
+  .step .sn{
+    position:absolute;left:0;top:2px;width:40px;height:40px;border-radius:11px;
+    border:1px solid var(--line2);display:grid;place-items:center;
+    font-family:var(--mono);font-weight:700;font-size:15px;color:var(--cyan);
+    background:rgba(34,227,201,.06);
+  }
+  .step h3{font-family:var(--mono);font-size:15.5px;font-weight:700;color:var(--ink);margin:6px 0 4px}
+  .step p{color:var(--muted);font-size:14px;margin:0;max-width:64ch}
+  .step p code{font-family:var(--mono);color:var(--cyan);font-size:13px}
+  .step .term{margin-top:16px}
+
+  /* ---------- terminal / command block ---------- */
+  .term{
+    margin-top:38px;max-width:820px;background:#070a0f;border:1px solid var(--line2);
+    border-radius:14px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.5);
+  }
+  .term-bar{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.02)}
+  .term-bar i{width:11px;height:11px;border-radius:50%;display:block}
+  .term-bar i:nth-child(1){background:#ff5f57}.term-bar i:nth-child(2){background:#febc2e}.term-bar i:nth-child(3){background:#28c840}
+  .term-bar .t{margin-left:8px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .term-body{padding:20px 20px 22px;font-family:var(--mono);font-size:13.5px;line-height:1.9}
+  .cmd-line{display:flex;align-items:center;gap:12px}
+  .cmd-line .code{color:var(--ink)}
+  .cmd-line .prompt{color:var(--cyan);user-select:none}
+  .cmd-line .prompt::after{content:"$"}
+  .cmd-line .copy{
+    margin-left:auto;font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;
+    color:var(--dim);background:transparent;border:1px solid var(--line2);border-radius:6px;
+    padding:3px 9px;cursor:pointer;transition:all .18s;opacity:0;text-transform:uppercase;
+  }
+  .cmd-line:hover .copy{opacity:1}
+  .cmd-line .copy:hover{color:var(--cyan);border-color:var(--cyan)}
+  .cmd-line .copy.done{color:var(--green);border-color:var(--green);opacity:1}
+  .term-comment{color:var(--dim)}
+  .term-comment .arrow{color:var(--cyan)}
+  /* multi-line program output under a command */
+  .term-out{margin-top:8px;font-family:var(--mono);font-size:12.5px;line-height:1.7;color:var(--muted);overflow-x:auto}
+  .term-out .l{display:block;white-space:pre}
+  .term-out .dim{color:var(--dim)}
+  .term-out .grn{color:var(--green)}
+  .term-out .amb{color:var(--amber)}
+  .term-out .red{color:var(--red)}
+  .term-out .cyn{color:var(--cyan)}
+  .term-out .vio{color:var(--violet)}
+  .install-caption{color:var(--muted);margin-top:22px;font-size:14.5px;max-width:64ch}
+  .install-caption code{font-family:var(--mono);color:var(--cyan);font-size:13px}
+
+  /* ---------- link feature signature diagram ---------- */
+  .link-viz{margin-top:38px;max-width:760px;margin-left:auto;margin-right:auto}
+  .link-caption{font-family:var(--mono);font-size:12px;color:var(--dim);text-align:center;margin-top:14px}
+  .link-caption b{color:var(--cyan);font-weight:500}
+  .guard-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:26px}
+
+  /* ---------- chips ---------- */
+  .chip{
+    font-family:var(--mono);font-size:12.5px;padding:9px 14px;border-radius:9px;
+    border:1px solid var(--line2);color:var(--muted);display:inline-flex;align-items:center;gap:9px;
+  }
+  .chip.miss{border-color:rgba(255,107,107,.3);color:var(--red)}
+  .chip.catch{border-color:rgba(92,240,138,.3);color:var(--green)}
+
+  /* ---------- command reference ---------- */
+  .grp{margin-top:56px}
+  .grp:first-of-type{margin-top:38px}
+  .grp-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;padding-bottom:14px;border-bottom:1px solid var(--line)}
+  .grp-head .gn{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--dim);letter-spacing:.08em}
+  .grp-head h3{font-family:var(--mono);font-size:20px;font-weight:700}
+  .grp-head .gd{color:var(--muted);font-size:13.5px;margin-left:auto;max-width:52ch;text-align:right}
+  .cmd-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:24px}
+  .cmd{padding:22px;display:flex;flex-direction:column}
+  .cmd .name{font-family:var(--mono);font-size:15.5px;font-weight:700;color:var(--cyan);letter-spacing:-.01em}
+  .cmd .name .arg{color:var(--dim);font-weight:400}
+  .cmd .new{
+    margin-left:8px;font-size:9.5px;font-family:var(--mono);color:var(--bg);background:var(--violet);
+    padding:2px 7px;border-radius:6px;letter-spacing:.08em;vertical-align:middle;font-weight:700;
+  }
+  .cmd .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--cyan);margin-top:10px}
+  .cmd .what{color:var(--ink);font-size:13.5px;margin:8px 0 0;font-weight:500;line-height:1.5}
+  .cmd .when{color:var(--muted);font-size:13px;margin:9px 0 0;line-height:1.55}
+  .cmd .when b{color:var(--ink);font-weight:600}
+  .cmd .lbl{color:var(--dim);font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin-right:7px}
+  .cmd .args{color:var(--muted);font-size:12.5px;margin-top:9px;font-family:var(--mono)}
+  .cmd .ex{font-family:var(--mono);font-size:11.5px;color:var(--dim);margin-top:auto;padding-top:12px;border-top:1px solid var(--line);white-space:pre-wrap;line-height:1.55}
+  .cmd .ex .c{color:var(--cyan)}
+  /* per-group accent for the category tag + name */
+  .grp.g-setup .cmd .k{color:var(--cyan)}
+  .grp.g-daily .cmd .k{color:var(--green)}
+  .grp.g-ops   .cmd .k{color:var(--amber)}
+  .grp.g-link  .cmd .k{color:var(--violet)}
+  .grp.g-down  .cmd .k{color:var(--red)}
+
+  /* teardown vs remove comparison */
+  .cmp-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:24px}
+  .cmp{padding:22px}
+  .cmp h4{font-family:var(--mono);font-size:15px;margin:0 0 4px}
+  .cmp.keep{border-color:rgba(92,240,138,.22)}
+  .cmp.wipe{border-color:rgba(255,107,107,.22)}
+  .cmp.keep h4{color:var(--green)}
+  .cmp.wipe h4{color:var(--red)}
+  .cmp .sub{color:var(--dim);font-size:12.5px;font-family:var(--mono);margin-bottom:14px}
+  .cmp ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:9px}
+  .cmp li{font-size:13px;color:var(--muted);display:flex;gap:10px;align-items:flex-start}
+  .cmp li .m{flex:0 0 auto;font-family:var(--mono)}
+  .cmp.keep li .m{color:var(--green)}
+  .cmp.wipe li .m{color:var(--red)}
+
+  /* amber caution / note */
+  .how-note{
+    margin-top:30px;padding:18px 20px;border-radius:12px;border:1px solid var(--line2);
+    background:rgba(255,207,107,.05);color:var(--muted);font-size:14px;max-width:74ch;
+    display:flex;gap:14px;align-items:flex-start;
+  }
+  .how-note .b{color:var(--amber);flex:0 0 auto;font-size:18px;line-height:1.2}
+  .how-note b{color:var(--ink);font-weight:600}
+  .how-note code{font-family:var(--mono);color:var(--amber);font-size:12.5px}
+
+  /* posture pills */
+  .posture{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}
+  .posture .p{
+    font-family:var(--mono);font-size:12px;padding:8px 13px;border-radius:9px;
+    border:1px solid var(--line2);color:var(--muted);
+  }
+  .posture .p b{color:var(--ink);font-weight:600}
+  .posture .p.def{border-color:rgba(34,227,201,.35);color:var(--cyan)}
+
+  /* ---------- footer CTA ---------- */
+  .cta-band{margin-top:40px;max-width:1180px;margin-left:auto;margin-right:auto;padding:0 22px}
+  .cta-inner{
+    background:radial-gradient(120% 160% at 50% 0%,rgba(34,227,201,.09),transparent 60%),linear-gradient(180deg,var(--panel),var(--bg2));
+    border:1px solid var(--line2);border-radius:18px;padding:40px 30px;text-align:center;
+  }
+  .cta-inner h2{margin-bottom:10px}
+  .btn{
+    font-family:var(--mono);font-weight:700;font-size:14px;border:0;cursor:pointer;
+    padding:14px 24px;border-radius:11px;display:inline-flex;align-items:center;gap:10px;
+    transition:transform .2s,box-shadow .2s,background .2s;margin-top:22px;
+  }
+  .btn-primary{background:var(--cyan);color:var(--bg);box-shadow:var(--glow)}
+  .btn-primary:hover{text-decoration:none;transform:translateY(-2px);background:#3af0d8;box-shadow:0 0 30px rgba(34,227,201,.55)}
+
+  /* ---------- FOOTER ---------- */
+  footer{border-top:1px solid var(--line);margin-top:56px;background:var(--bg2)}
+  .foot-inner{max-width:1180px;margin:0 auto;padding:44px 22px;display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+  .foot-brand{display:flex;align-items:center;gap:12px;font-weight:800;font-size:20px}
+  .foot-right{display:flex;flex-direction:column;gap:6px;text-align:right}
+  .foot-gh{font-family:var(--mono);font-size:14px;display:inline-flex;align-items:center;gap:9px}
+  .foot-meta{font-size:12.5px;color:var(--dim)}
+
+  /* ---------- RESPONSIVE ---------- */
+  @media(max-width:900px){
+    .cmd-grid{grid-template-columns:1fr}
+    .cmp-grid{grid-template-columns:1fr}
+    .grp-head .gd{text-align:left;margin-left:0}
+    section{padding:70px 20px}
+    .menu-toggle{
+      display:inline-grid;place-items:center;margin-left:auto;width:40px;height:40px;
+      border:1px solid var(--line2);border-radius:9px;background:transparent;cursor:pointer;
+    }
+    .menu-toggle span{width:18px;height:2px;background:var(--ink);position:relative;display:block}
+    .menu-toggle span::before,.menu-toggle span::after{content:"";position:absolute;left:0;width:18px;height:2px;background:var(--ink)}
+    .menu-toggle span::before{top:-6px}.menu-toggle span::after{top:6px}
+    .nav-links{
+      margin-left:0;position:absolute;top:100%;left:0;right:0;
+      flex-direction:column;gap:2px;padding:12px 16px 16px;
+      background:rgba(5,7,10,.98);border-bottom:1px solid var(--line);
+      display:none;
+    }
+    .nav-links.open{display:flex}
+    .nav-links a{padding:11px 12px}
+    .nav-links a.active::after{display:none}
+    .nav-cta{display:none}
+    .foot-right{text-align:left}
+  }
+  @media(max-width:520px){
+    .step{padding-left:0}
+    .step .sn{position:static;margin-bottom:12px}
+  }
+
+  @media(prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    .reveal{opacity:1;transform:none;transition:none}
+    .anim-pulse,.anim-flow,.anim-dash,.anim-breathe{animation:none!important;display:none}
+    *{transition-duration:.001ms!important}
+  }
+</style>
+
+<header class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand" aria-label="wiregraph home">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <line x1="6" y1="6" x2="18" y2="18" stroke-width="1.6"/>
+        <line x1="6" y1="6" x2="18" y2="7" stroke-width="1.6"/>
+        <circle cx="6" cy="6" r="3" fill="var(--bg)" stroke-width="1.6"/>
+        <circle cx="18" cy="18" r="3" fill="var(--bg)" stroke-width="1.6"/>
+        <circle cx="18" cy="7" r="2.4" fill="var(--bg)" stroke-width="1.6"/>
+      </svg>
+      wiregraph <span class="sub">/ guide</span>
+    </a>
+    <nav class="nav-links" id="navlinks" aria-label="Sections">
+      <a href="#start">getting&nbsp;started</a>
+      <a href="#linking">linking</a>
+      <a href="#walkthrough">walkthrough</a>
+      <a href="#stats">savings</a>
+      <a href="#commands">commands</a>
+      <a href="contracts.html">contracts&nbsp;↗</a>
+      <a href="index.html">←&nbsp;main</a>
+    </nav>
+    <a href="index.html#install" class="nav-cta">Install</a>
+    <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu" aria-expanded="false"><span></span></button>
+  </div>
+</header>
+
+<main>
+
+  <!-- ============ HERO ============ -->
+  <section id="hero" aria-label="How to use wiregraph">
+    <a href="index.html" class="backlink">← wiregraph</a>
+    <p class="eyebrow" style="margin-top:20px">How to use it</p>
+    <h1 class="hero-title">Stand a graph up, then <span class="g">let Claude drive it.</span></h1>
+    <p class="lead">Index once and wiregraph keeps itself fresh — Claude queries the graph instead of re-reading your tree. This guide walks the getting-started flow, shows how to <b style="color:var(--ink)">link two separately-indexed repos</b> so a cross-repo wire lights up, and documents every one of the 13 commands.</p>
+    <ul class="facts">
+      <li><b>no daemon</b> · nothing runs in the background</li>
+      <li><b>one SQLite db per graph</b> at <code style="font-family:var(--mono);color:var(--muted);font-size:12px">&lt;root&gt;/.wiregraph/graph.db</code></li>
+      <li>node ids carry <b>no project tag</b></li>
+      <li><b>100% local</b> · nothing uploaded</li>
+    </ul>
+  </section>
+
+  <!-- ============ GETTING STARTED ============ -->
+  <section id="start" aria-label="Getting started">
+    <p class="eyebrow reveal">Getting started</p>
+    <h2 class="reveal">Three lines to install. <span class="accent">One to index.</span></h2>
+    <p class="lead reveal d1">Install the plugin from Claude Code, then point <code class="inline">/wiregraph-init</code> at a workspace. It finds every repo under the root, indexes them into one graph, and re-indexes as you edit.</p>
+
+    <div class="flow">
+      <div class="step reveal d1">
+        <span class="sn">1</span>
+        <h3>Install the plugin</h3>
+        <p>Add the marketplace, install wiregraph, reload. Public repo — native bits are prebuilt and vendored for Linux / macOS / Windows, so there's no build step.</p>
+        <div class="term" role="group" aria-label="Install commands">
+          <div class="term-bar"><i></i><i></i><i></i><span class="t">claude-code</span></div>
+          <div class="term-body">
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/plugin marketplace add kaleLetendre/wiregraph</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/plugin install wiregraph@wiregraph</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/reload-plugins</span><button class="copy" aria-label="Copy command">copy</button></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step reveal d1">
+        <span class="sn">2</span>
+        <h3>Index the workspace</h3>
+        <p>Run <code>/wiregraph-init</code> once per workspace. It confirms scope, infers contracts for a multi-compartment root <i>before</i> a single build, installs the CLAUDE.md navigation directive, and turns on balanced auto-update.</p>
+        <div class="term" role="group" aria-label="Initialize the graph">
+          <div class="term-bar"><i></i><i></i><i></i><span class="t">claude-code</span></div>
+          <div class="term-body">
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/wiregraph-init ~/log-server</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="term-out" aria-hidden="true"><span class="l"><span class="cyn">scope: MULTI</span>  (3 compartments)</span><span class="l">  api      /home/dev/log-server/api</span><span class="l">  worker   /home/dev/log-server/worker</span><span class="l">  shared   /home/dev/log-server/shared</span><span class="l"><span class="dim">inferring contracts… 1 seam found  → contracts/wiregraph-inferred.asyncapi.yaml</span></span><span class="l">building…  3 compartments · 412 files · 5 180 symbols · <span class="amb">1 contract</span></span><span class="l">           9 214 CALLS · 33 REFERENCES · <span class="amb">2 WIRE</span></span><span class="l"><span class="grn">.gitignore: added .wiregraph/</span></span><span class="l"><span class="grn">CLAUDE.md: directive installed</span></span><span class="l">posture: <span class="cyn">balanced</span>   MCP tools online</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step reveal d1">
+        <span class="sn">3</span>
+        <h3>Put Claude to work</h3>
+        <p>That's it. You never call the graph tools yourself — Claude does, on every task, and the auto-update hooks keep the graph fresh as you edit. Reach for <code>/wiregraph-status</code> any time you want to confirm it's healthy.</p>
+      </div>
+    </div>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
+      <div><b>Auto-update postures.</b> <code>off</code> disables everything; <code>conservative</code> catches up at session start and nudges toward the graph; <code>balanced</code> (the default) also re-indexes on edit; <code>aggressive</code> adds optional git post-commit / post-merge hooks. A fanned-out linked peer skips only <code>off</code>. Change it anytime with <code class="inline">/wiregraph-posture &lt;level&gt;</code>.</div>
+    </div>
+    <div class="posture reveal d1">
+      <span class="p">off</span>
+      <span class="p">conservative</span>
+      <span class="p def">balanced · default</span>
+      <span class="p">aggressive</span>
+    </div>
+  </section>
+
+  <!-- ============ LINKING SEPARATE GRAPHS ============ -->
+  <section id="linking" aria-label="Linking two separately-indexed graphs">
+    <p class="eyebrow reveal">The new capability</p>
+    <h2 class="reveal">Join two graphs so the <span class="accent">wire between them lights up.</span></h2>
+    <p class="lead reveal d1">Contract detection needs the two sides seen together. Repos indexed <b>separately</b> can't see a route they share — until you <code class="inline">/wiregraph-link</code> one into the other. Linking is <b>symmetric</b> (recorded in both graphs' configs), keeps <b>one db per graph</b>, and re-infers contracts over the union on every link and unlink.</p>
+
+    <div class="link-viz reveal d2">
+      <svg id="linkSvg" viewBox="0 0 520 340" role="img" aria-label="Two separately-indexed graphs sit side by side, each with its own .wiregraph slash graph.db — edge-app on the left in violet, log-server on the right in green. edge-app's uploadLogs function calls postJson; log-server's router reaches handleLogsPost. No function calls across the gap — a faint red dashed curve labelled no code-level call arcs between them. After /wiregraph-link, a single amber contract node for the route slash api slash logs sits in the seam; a directional WIRE edge lights up from the edge-app producer through the contract to the log-server consumer, and a double-headed mutual-link arrow underneath records the same link, initiator edge-app, in both graphs.">
+        <defs>
+          <marker id="wireArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--cyan)"/>
+          </marker>
+          <marker id="mutHead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
+          </marker>
+        </defs>
+
+        <!-- graph boxes -->
+        <rect x="18" y="46" width="184" height="214" rx="15" fill="rgba(155,140,255,.05)" stroke="var(--violet)" stroke-opacity=".5" stroke-dasharray="6 6"/>
+        <text x="110" y="70" text-anchor="middle" class="node-label" fill="var(--violet)" style="font-size:9.5px;letter-spacing:.1em">edge-app GRAPH</text>
+        <text x="110" y="84" text-anchor="middle" class="node-label" fill="var(--dim)" style="font-size:8px">.wiregraph/graph.db · edge terminal</text>
+
+        <rect x="318" y="46" width="184" height="214" rx="15" fill="rgba(92,240,138,.05)" stroke="var(--green)" stroke-opacity=".5" stroke-dasharray="6 6"/>
+        <text x="410" y="70" text-anchor="middle" class="node-label" fill="var(--green)" style="font-size:9.5px;letter-spacing:.1em">log-server GRAPH</text>
+        <text x="410" y="84" text-anchor="middle" class="node-label" fill="var(--dim)" style="font-size:8px">.wiregraph/graph.db · server</text>
+
+        <!-- in-graph CALL edges (solid) -->
+        <g stroke-linecap="round">
+          <path class="edge" d="M75,140 L150,168"/>
+          <path class="edge" d="M445,140 L370,168"/>
+        </g>
+
+        <!-- seam edges through the contract (dashed, lit by JS) -->
+        <path id="linkEdgeA" class="edge" d="M172,168 L214,155" stroke-dasharray="5 6"/>
+        <path id="linkEdgeB" class="edge" d="M306,155 L348,168" stroke-dasharray="5 6" marker-end="url(#wireArrow)"/>
+
+        <!-- the missing direct call -->
+        <path class="edge" d="M150,190 Q260,300 370,190" stroke="var(--red)" stroke-dasharray="3 6" opacity=".4"/>
+        <text x="260" y="300" text-anchor="middle" class="node-label" fill="var(--red)" style="font-size:8.5px" opacity=".65">no code-level call ✕</text>
+
+        <!-- contract node in the seam -->
+        <g id="linkContract" class="node" transform="translate(260,155)">
+          <polygon class="node-body contract-shape" points="-42,-21 42,-21 52,0 42,21 -42,21 -52,0" fill="rgba(255,207,107,.06)" stroke="var(--line2)"/>
+          <text class="node-label" x="0" y="-3" text-anchor="middle" fill="var(--muted)" style="font-size:9px">contract</text>
+          <text class="node-label" x="0" y="9" text-anchor="middle" fill="var(--dim)" style="font-size:8px">/api/logs</text>
+          <text class="node-label" x="0" y="-30" text-anchor="middle" fill="var(--cyan)" style="font-size:8px" opacity=".8">WIRE →</text>
+        </g>
+
+        <!-- edge-app producer nodes -->
+        <g id="linkProd" class="node" transform="translate(150,168)">
+          <circle class="node-body" cx="0" cy="0" r="22" stroke="var(--violet)"/>
+          <text class="node-label" x="0" y="3" text-anchor="middle" fill="var(--ink)" style="font-size:8px">postJson()</text>
+          <text class="node-label" x="0" y="42" text-anchor="middle" fill="var(--dim)" style="font-size:8px">producer</text>
+        </g>
+        <g class="node" transform="translate(75,140)"><circle class="node-body" cx="0" cy="0" r="15" stroke="var(--violet)"/><text class="node-label" x="0" y="3" text-anchor="middle" fill="var(--ink)" style="font-size:7px">upload</text></g>
+
+        <!-- log-server consumer nodes -->
+        <g id="linkCons" class="node" transform="translate(370,168)">
+          <circle class="node-body" cx="0" cy="0" r="22" stroke="var(--green)"/>
+          <text class="node-label" x="0" y="0" text-anchor="middle" fill="var(--ink)" style="font-size:7px">handle</text>
+          <text class="node-label" x="0" y="9" text-anchor="middle" fill="var(--ink)" style="font-size:7px">Logs()</text>
+          <text class="node-label" x="0" y="42" text-anchor="middle" fill="var(--dim)" style="font-size:8px">consumer</text>
+        </g>
+        <g class="node" transform="translate(445,140)"><circle class="node-body" cx="0" cy="0" r="15" stroke="var(--green)"/><text class="node-label" x="0" y="3" text-anchor="middle" fill="var(--ink)" style="font-size:7px">router</text></g>
+
+        <!-- mutual link double-arrow -->
+        <line x1="60" y1="292" x2="460" y2="292" stroke="var(--line2)" stroke-width="1.4" stroke-dasharray="2 5" marker-start="url(#mutHead)" marker-end="url(#mutHead)"/>
+        <rect x="196" y="282" width="128" height="20" rx="6" fill="var(--bg)" stroke="var(--line2)"/>
+        <text x="260" y="295" text-anchor="middle" class="node-label" fill="var(--muted)" style="font-size:8px">mutual link · initiator = edge-app</text>
+
+        <g id="linkPulses"></g>
+      </svg>
+    </div>
+    <p class="link-caption reveal d2">Before linking, <b>path_between</b> returns nothing across the boundary. After <b>/wiregraph-link</b>, the <b>/api/logs</b> seam threads producer → contract → consumer — across two separate databases.</p>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
+      <div>The seam fires only on a <b>shared distinctive literal token</b> — at least 5 characters, not a generic like <code>/api</code> or <code>/health</code>, and not a dynamically-built URL. <code>/api/logs</code> qualifies, and it must appear as a literal on <b>both</b> sides. Every link and unlink ends in a <b>full rebuild + re-infer</b>, never an incremental — cross-member WIRE is a full-rebuild backstop, so the two mirrored databases are eventually consistent, not lock-step.</div>
+    </div>
+
+    <div class="guard-row reveal d1" aria-label="Link-time guard outcomes">
+      <span class="chip catch">✓ disjoint paths</span>
+      <span class="chip miss">✕ ancestor of self</span>
+      <span class="chip miss">✕ descendant of self</span>
+      <span class="chip miss">✕ basename collision</span>
+      <span class="chip miss">✕ nested in another index</span>
+    </div>
+    <p class="body reveal d1" style="font-size:14px">Basename uniqueness is a <b>hard requirement</b>: compartment ids are <code class="inline">compartment:&lt;basename&gt;</code>, so two members named <code class="inline">api</code> would silently merge — the guard blocks it rather than warn.</p>
+  </section>
+
+  <!-- ============ FLAGSHIP WALKTHROUGH ============ -->
+  <section id="walkthrough" aria-label="Walkthrough: edge-app linked to log-server">
+    <p class="eyebrow reveal">Walkthrough</p>
+    <h2 class="reveal">Two repos, no shared code — <span class="accent">joined by a wire.</span></h2>
+    <p class="lead reveal d1">edge-app is an edge terminal that uploads logs over HTTP to <code class="inline">/api/logs</code>; log-server is the server that defines that route. Nothing calls across — only the wire connects them. Indexed separately, <code class="inline">path_between</code> returns nothing. Here's how linking joins them.</p>
+
+    <div class="flow">
+      <div class="step reveal d1">
+        <span class="sn">1</span>
+        <h3>Index the edge repo</h3>
+        <p>Stand edge-app's own graph up first. Linking never auto-initializes the <i>near</i> side — the directory you're standing in must already be indexed.</p>
+        <div class="term" role="group" aria-label="Init edge-app">
+          <div class="term-bar"><i></i><i></i><i></i><span class="t">~/edge-app</span></div>
+          <div class="term-body">
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/wiregraph-init</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="term-out" aria-hidden="true"><span class="l"><span class="cyn">scope: SINGLE</span> (1 compartment: edge-app)</span><span class="l">built · 88 files · 640 symbols · <span class="dim">0 contracts</span></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step reveal d1">
+        <span class="sn">2</span>
+        <h3>Link the server graph</h3>
+        <p>From inside edge-app, link <code>~/log-server</code>. The guard checks the paths, a dry-run preview states plainly that a second, unrelated repo will be written to, the peer graph is auto-created if it has no <code>.wiregraph/</code>, mutual link records are written to <b>both</b> sides, then contracts re-infer over the union and each graph full-rebuilds.</p>
+        <div class="term" role="group" aria-label="Link log-server">
+          <div class="term-bar"><i></i><i></i><i></i><span class="t">~/edge-app</span></div>
+          <div class="term-body">
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/wiregraph-link ~/log-server</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="term-out" aria-hidden="true"><span class="l"><span class="dim">guard:</span> paths disjoint <span class="grn">✓</span>  no nested .wiregraph <span class="grn">✓</span>  basenames distinct <span class="grn">✓</span></span><span class="l"><span class="dim">preview:</span></span><span class="l">  edge-app      +1 link, rebuild over 2 members</span><span class="l">  log-server   <span class="amb">no .wiregraph yet → CREATE .wiregraph/, edit .gitignore, index 412 files</span></span><span class="l">            <span class="dim">(writing to a second, unrelated repo)</span></span><span class="l">proceed? › <span class="grn">yes</span></span><span class="l">auto-initialized log-server graph <span class="dim">(autoCreated)</span></span><span class="l">wrote mutual link records <span class="dim">(initiator=edge-app)</span> on both sides</span><span class="l">re-inferred contracts over the union → <span class="amb">1 wire seam  /api/logs</span></span><span class="l">rebuilt edge-app graph   · WIRE: 0 → <span class="cyn">1</span></span><span class="l">rebuilt log-server graph · WIRE: 0 → <span class="cyn">1</span></span><span class="l"><span class="cyn">trace_contract "/api/logs":</span>  producers [edge-app]  consumers [api]</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step reveal d1">
+        <span class="sn">3</span>
+        <h3>The seam traces across separate graphs</h3>
+        <p>Now Claude's graph tools cross the boundary. <code>path_between</code> threads a chain through the contract node, and <code>get_source</code> on the far symbol reads straight out of the external member's real path.</p>
+        <div class="term" role="group" aria-label="Trace across the seam">
+          <div class="term-bar"><i></i><i></i><i></i><span class="t">MCP tools</span></div>
+          <div class="term-body">
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>path_between edge-app:uploadLogs log-server:handleLogsPost</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="term-out" aria-hidden="true"><span class="l"><span class="vio">edge-app:uploadLogs</span> ─CALLS→ edge-app:postJson ─REFERENCES→ <span class="amb">Contract:/api/logs</span></span><span class="l">  ←REFERENCES─ <span class="grn">log-server:handleLogsPost</span>   <span class="dim">(crosses the graph boundary)</span></span></div>
+            <div class="cmd-line" style="margin-top:12px"><span class="prompt"></span><span class="code" data-cmd>get_source log-server:handleLogsPost</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="term-out" aria-hidden="true"><span class="l">→ reads <span class="cyn">/home/dev/log-server/api/routes/logs.js</span>  <span class="dim">(the real external member path)</span></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step reveal d1">
+        <span class="sn">4</span>
+        <h3>Confirm membership</h3>
+        <p><code>/wiregraph-list</code> gives the mutual view <code>graph_stats</code> can't — your own root and its compartments, then each linked root grouped beneath it, with a per-link health flag.</p>
+        <div class="term" role="group" aria-label="List membership">
+          <div class="term-bar"><i></i><i></i><i></i><span class="t">~/edge-app</span></div>
+          <div class="term-body">
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/wiregraph-list</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="term-out" aria-hidden="true"><span class="l"><span class="dim">Own root:</span> /home/dev/edge-app → <span class="vio">edge-app</span></span><span class="l"><span class="dim">Linked:</span>   /home/dev/log-server  <span class="grn">[mutual]</span></span><span class="l">  → api, worker, shared</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step reveal d1">
+        <span class="sn">5</span>
+        <h3>Later, sever it</h3>
+        <p><code>/wiregraph-unlink</code> removes the link from both graphs, prunes the member's shas on both sides, and full-rebuilds each over the reduced union so the seam disappears. Because log-server was auto-created and has no other links, it offers to remove that graph entirely.</p>
+        <div class="term" role="group" aria-label="Unlink log-server">
+          <div class="term-bar"><i></i><i></i><i></i><span class="t">~/edge-app</span></div>
+          <div class="term-body">
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/wiregraph-unlink ~/log-server</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="term-out" aria-hidden="true"><span class="l">unlink log-server from edge-app — both rebuild, the /api/logs seam goes away? › <span class="grn">yes</span></span><span class="l"><span class="dim">removed link on both sides · pruned shas</span></span><span class="l">edge-app:  full reset over 1 member (self only) · <span class="red">0 WIRE</span>   (seam gone)</span><span class="l"><span class="amb">log-server was auto-created by this link and has no other links.</span></span><span class="l">  fully remove the log-server graph? › <span class="grn">yes</span></span><span class="l">removed ~/log-server/.wiregraph/, .gitignore line, directive block</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ MEASURED SAVINGS ============ -->
+  <section id="stats" aria-label="Measured savings">
+    <p class="eyebrow reveal">Measured savings</p>
+    <h2 class="reveal">See what it actually saved. <span class="accent">Measured, not guessed.</span></h2>
+    <p class="lead reveal d1"><code class="inline">/wiregraph-stats</code> prints a local accounting of the tokens wiregraph kept out of your context — built entirely from what your own sessions logged, never a headline guess. It's <b style="color:var(--ink)">100% local</b>: the log lives beside the graph and nothing is uploaded.</p>
+
+    <div class="flow">
+      <div class="step reveal d1">
+        <span class="sn">1</span>
+        <h3>Every graph read logs what it saved</h3>
+        <p>Each time Claude answers from the graph instead of opening files — <code>get_source</code>, <code>trace_callers</code>, <code>path_between</code> — wiregraph appends one line recording the counterfactual: the tokens it <i>would</i> have cost to read the files, minus the tokens the graph actually returned. That difference is the saving for that read.</p>
+      </div>
+
+      <div class="step reveal d1">
+        <span class="sn">2</span>
+        <h3>Turns and boundaries mark the timeline</h3>
+        <p>Each prompt logs a <b>turn</b>; each session start, <code class="inline">/clear</code>, and compaction logs a <b>boundary</b>. A boundary is where resident context resets, so this records how <i>long</i> a saved read stays useful. Reads are <b>segmented per session</b> — a boundary between two sessions stops one session's reads from ever borrowing the next session's turns.</p>
+      </div>
+
+      <div class="step reveal d1">
+        <span class="sn">3</span>
+        <h3>The dashboard replays it into two numbers</h3>
+        <p><b>One-time</b> is what you'd have paid to read that code once. <b>Recurring</b> is that same context re-saved on every turn it stayed resident before the next boundary — because staying out of the prompt saves those tokens again each turn until context resets. The output is deterministic and relayed <b>verbatim</b>.</p>
+        <div class="term" role="group" aria-label="Stats dashboard">
+          <div class="term-bar"><i></i><i></i><i></i><span class="t">~/edge-app</span></div>
+          <div class="term-body">
+            <div class="cmd-line"><span class="prompt"></span><span class="code" data-cmd>/wiregraph-stats</span><button class="copy" aria-label="Copy command">copy</button></div>
+            <div class="term-out" aria-hidden="true"><span class="l">graph-tool calls: 218 · one-time saved: <span class="cyn">~1.24M</span></span><span class="l">recurring context avoided: <span class="cyn">~5.2M</span>  <span class="dim">(measured across 6 sessions)</span></span><span class="l">adoption: <span class="grn">82%</span> of navigation via graph</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p class="body reveal d1" style="margin-top:30px">Where the data lives — plain JSON-lines, one event per line, under the gitignored <code class="inline">.wiregraph/</code> folder:</p>
+    <ul class="facts">
+      <li><b>live log</b> · <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">&lt;project&gt;/.wiregraph/metrics.jsonl</code></li>
+      <li><b>pre-measurement archive</b> · <code style="font-family:var(--mono);color:var(--muted);font-size:12px">metrics.v1.jsonl</code> — written once on update, never counted</li>
+      <li><b>100% local</b> · nothing uploaded · delete the log to reset the tally</li>
+    </ul>
+  </section>
+
+  <!-- ============ COMMAND REFERENCE ============ -->
+  <section id="commands" aria-label="Command reference">
+    <p class="eyebrow reveal">Reference</p>
+    <h2 class="reveal">Every command. <span class="accent">One graph.</span></h2>
+    <p class="lead reveal d1">All 13 slash commands, grouped by lifecycle. Each entry gives what it does, when to reach for it, its arguments, and a representative effect. The three linking commands are marked <b style="color:var(--violet)">NEW</b>.</p>
+
+    <!-- GROUP 1 — SETUP -->
+    <div class="grp g-setup">
+      <div class="grp-head reveal">
+        <span class="gn">01</span><h3>Setup</h3>
+        <span class="gd">Stand a graph up — from nothing to queryable.</span>
+      </div>
+      <div class="cmd-grid">
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-init <span class="arg">[target-dir]</span></div>
+          <div class="k">setup · end-to-end</div>
+          <p class="what">Sets a project up end to end — installs deps, builds the cross-compartment call graph, installs the CLAUDE.md navigation directive, turns on balanced auto-update.</p>
+          <p class="when"><span class="lbl">When</span> First time you point wiregraph at a repo or workspace. Also the command Claude reroutes you to if a graph is missing. Detects an existing setup and offers <b>Rebuild / Update / Re-initialize</b> instead of blindly redoing it.</p>
+          <p class="args"><span class="lbl">Args</span> optional <span style="color:var(--cyan)">target-dir</span> (defaults to $CLAUDE_PROJECT_DIR, else cwd)</p>
+          <div class="ex"><span class="c">$ /wiregraph-init ~/log-server</span>
+scope: MULTI (3 compartments) · 1 contract inferred
+building… 412 files · 5 180 symbols · directive installed</div>
+        </div>
+
+        <div class="card cmd reveal d2">
+          <div class="name">/wiregraph-build <span class="arg">[target-dir]</span></div>
+          <div class="k">setup · raw build</div>
+          <p class="what">Builds or refreshes the graph for a folder into its <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">.wiregraph/graph.db</code> — the raw build step, with none of the directive / state / gitignore ceremony.</p>
+          <p class="when"><span class="lbl">When</span> Scripting or a manual one-off build when you don't want the full init flow. <b>Most users use /wiregraph-init or /wiregraph-update instead.</b></p>
+          <p class="args"><span class="lbl">Args</span> optional <span style="color:var(--cyan)">target-dir</span> (defaults to cwd); <span style="color:var(--cyan)">--reset</span> replaces the graph, omit to merge</p>
+          <div class="ex"><span class="c">$ /wiregraph-build ~/log-server</span>
+3 compartments · 5 180 symbols · 9 214 CALLS · 2 WIRE
+MCP tools now queryable</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- GROUP 2 — DAILY USE -->
+    <div class="grp g-daily">
+      <div class="grp-head reveal">
+        <span class="gn">02</span><h3>Daily use</h3>
+        <span class="gd">Keep it fresh and check on it as you work.</span>
+      </div>
+      <div class="cmd-grid">
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-update</div>
+          <div class="k">daily · incremental</div>
+          <p class="what">Incrementally re-indexes only the files changed since the last index (git diff + uncommitted edits) — not a full rebuild.</p>
+          <p class="when"><span class="lbl">When</span> After normal editing — the cheap, everyday refresh. Hooks do this automatically at <b>balanced+</b>; this is the manual trigger. Prefers the <code style="font-family:var(--mono);color:var(--green);font-size:12px">update_graph</code> tool with no arguments.</p>
+          <p class="args"><span class="lbl">Args</span> none — acts on the active project</p>
+          <div class="ex"><span class="c">$ /wiregraph-update</span>
+re-indexed 4 changed files · advanced git shas</div>
+        </div>
+
+        <div class="card cmd reveal d2">
+          <div class="name">/wiregraph-status</div>
+          <div class="k">daily · doctor</div>
+          <p class="what">Doctor — graph health + freshness, is the directive present, posture, whether hooks are firing, contract coverage; with a one-line fix for anything off.</p>
+          <p class="when"><span class="lbl">When</span> "Is my graph healthy / fresh / wired up correctly?" Triage before trusting a trace.</p>
+          <p class="args"><span class="lbl">Args</span> none — active project</p>
+          <div class="ex"><span class="c">$ /wiregraph-status</span>
+graph: indexed · 412 files · 5 180 symbols
+freshness: STALE: 2 changed → run /wiregraph-update
+posture: balanced · hooks active</div>
+        </div>
+
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-stats</div>
+          <div class="k">daily · savings</div>
+          <p class="what">Prints the measured token-savings dashboard — graph-tool usage, one-time tokens saved, the <b>measured</b> recurring-context savings replayed from your logged sessions, and the adoption gap. Deterministic; relayed <b>verbatim</b>.</p>
+          <p class="when"><span class="lbl">When</span> "How much is wiregraph actually saving me?" Reporting or curiosity. The numbers are local counterfactuals the script itself labels — don't reformat them.</p>
+          <p class="when"><span class="lbl">How</span> Every graph read (<code>get_source</code>, <code>trace_*</code>) logs the tokens it saved versus opening the files; each prompt logs a <b>turn</b>, and each session start, <code>/clear</code>, or compaction logs a <b>boundary</b>. The dashboard replays that log — <b>one-time</b> is reading the code once, <b>recurring</b> is that same context multiplied by how many turns it stayed resident before the next boundary (staying out of the prompt re-saves it on every turn until context resets). Reads are segmented per session, so one session never borrows another's turns.</p>
+          <p class="when"><span class="lbl">Logs</span> Plain JSON-lines at <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">&lt;project&gt;/.wiregraph/metrics.jsonl</code> — gitignored, never leaves your machine. On update, any pre-measurement log is archived once to <code style="font-family:var(--mono);color:var(--muted);font-size:12px">metrics.v1.jsonl</code> and ignored by the dashboard, so measurement starts clean.</p>
+          <p class="args"><span class="lbl">Args</span> none — resolves the workspace itself, works from any subdirectory</p>
+          <div class="ex"><span class="c">$ /wiregraph-stats</span>
+graph-tool calls: 218 · est. tokens saved: <span class="c">~1.24M</span>
+session context: <span class="c">~1.24M</span> once → <span class="c">~5.2M</span> recurring (measured)
+adoption: 82% of navigation via graph</div>
+        </div>
+
+        <div class="card cmd reveal d2">
+          <div class="name">/wiregraph-visualize <span class="arg">[dir] [--functions|--all|--contract "&lt;name&gt;"]</span></div>
+          <div class="k">daily · visualize</div>
+          <p class="what">Renders the graph as a standalone offline HTML page (d3 force layout, one color cluster per repo, <b>Contract nodes as the bridges in the middle</b>) and opens it.</p>
+          <p class="when"><span class="lbl">When</span> You want to <i>see</i> which repos touch which contracts, or a full call graph. Everything is inlined — no network requests.</p>
+          <p class="args"><span class="lbl">Args</span> default (per-repo contract view), <span style="color:var(--cyan)">--functions</span>, <span style="color:var(--cyan)">--all</span>, <span style="color:var(--cyan)">--contract "&lt;name&gt;"</span></p>
+          <div class="ex"><span class="c">$ /wiregraph-visualize --contract "/api/logs"</span>
+42 nodes · 61 links → ~/log-server/.wiregraph/graph.html (opened)</div>
+        </div>
+
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-posture <span class="arg">&lt;off|conservative|balanced|aggressive&gt;</span></div>
+          <div class="k">daily · posture</div>
+          <p class="what">Sets how aggressively the graph self-updates — from <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">off</code> (hooks no-op) through <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">balanced</code> (re-index on edit) to <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">aggressive</code> (adds git commit / merge hooks). Writes <code>state.json</code>; no rebuild.</p>
+          <p class="when"><span class="lbl">When</span> Dial a noisy repo down to <code>conservative</code>, or turn a hot one up to <code>aggressive</code>. Also how a linked peer opts out of fanned-in edits (<code>off</code>).</p>
+          <p class="args"><span class="lbl">Args</span> <span style="color:var(--cyan)">&lt;posture&gt;</span> (required); optional target-dir, else the active project</p>
+          <div class="ex"><span class="c">$ /wiregraph-posture aggressive</span>
+set autoUpdate posture to "aggressive"</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- GROUP 3 — GRAPH & CONTRACT OPS -->
+    <div class="grp g-ops">
+      <div class="grp-head reveal">
+        <span class="gn">03</span><h3>Graph &amp; contract ops</h3>
+        <span class="gd">Rebuilds, seams, and the AsyncAPI draft.</span>
+      </div>
+      <div class="cmd-grid">
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-rebuild <span class="arg">[target-dir]</span></div>
+          <div class="k">ops · full rebuild</div>
+          <p class="what">Full from-scratch rebuild — the correctness backstop. Routes through the <b>union-aware</b> full build, so it preserves linked members.</p>
+          <p class="when"><span class="lbl">When</span> After big refactors or renames (incremental is approximate for <i>incoming</i> edges to renamed / removed symbols), or whenever a trace looks wrong. Prefers <code style="font-family:var(--mono);color:var(--amber);font-size:12px">update_graph { full: true }</code>.</p>
+          <p class="args"><span class="lbl">Args</span> optional <span style="color:var(--cyan)">target-dir</span> (defaults to active project)</p>
+          <div class="ex"><span class="c">$ /wiregraph-rebuild</span>
+full reset over 2 members (log-server + linked edge-app)
+5 180 symbols · 1 contract · 2 WIRE (members preserved)</div>
+        </div>
+
+        <div class="card cmd reveal d2">
+          <div class="name">/wiregraph-contracts <span class="arg">[target-dir]</span></div>
+          <div class="k">ops · infer seams</div>
+          <p class="what">Infers cross-compartment <b>wire seams</b> (an endpoint one compartment defines and another calls) and proposes an AsyncAPI contract linking producer → consumer.</p>
+          <p class="when"><span class="lbl">When</span> A multi-compartment workspace where you want <code style="font-family:var(--mono);color:var(--amber);font-size:12px">trace_contract</code> / <code style="font-family:var(--mono);color:var(--amber);font-size:12px">path_between</code> to follow the wire. Attribution needs the compartments indexed <b>together</b> — repos indexed separately need <code style="font-family:var(--mono);color:var(--amber);font-size:12px">/wiregraph-link</code>.</p>
+          <p class="args"><span class="lbl">Args</span> optional <span style="color:var(--cyan)">target-dir</span>; scan → confirm → apply</p>
+          <div class="ex"><span class="c">$ /wiregraph-contracts</span>
+scan: 1 wire seam · HTTP /api/logs
+wrote contracts/wiregraph-inferred.asyncapi.yaml</div>
+        </div>
+      </div>
+      <div class="how-note reveal d1">
+        <span class="b">⚑</span>
+        <div><b>CALLS edges are within-compartment by design.</b> Cross-compartment links flow only through Contract nodes — so a rename on one side of a seam shows up as the contract's two edges no longer agreeing, which a plain call graph never records.</div>
+      </div>
+    </div>
+
+    <!-- GROUP 4 — LINKING (NEW) -->
+    <div class="grp g-link">
+      <div class="grp-head reveal">
+        <span class="gn">04</span><h3>Linking separate graphs</h3>
+        <span class="gd">Mutual, one-db-per-graph, always full-rebuild + re-infer.</span>
+      </div>
+      <div class="cmd-grid">
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-link <span class="arg">&lt;dir&gt;</span><span class="new">NEW</span></div>
+          <div class="k">link · include a member</div>
+          <p class="what">Includes an external, code-disconnected directory as a <b>member</b> of this graph, so cross-repo wire / contract seams light up across two separately-indexed graphs.</p>
+          <p class="when"><span class="lbl">When</span> Two repos are joined <i>only</i> by a wire — an HTTP call, a topic, a shared-state key — with no direct code calls. Auto-inits the peer graph if it has none, writes symmetric link records to both sides, then re-infers contracts over the union and full-rebuilds each graph.</p>
+          <p class="args"><span class="lbl">Args</span> <span style="color:var(--cyan)">&lt;dir&gt;</span> — the external directory to link (required)</p>
+          <div class="ex"><span class="c">$ /wiregraph-link ~/log-server</span>
+guard ✓ → preview → auto-init peer → mutual write
+re-infer → rebuild both · trace_contract "/api/logs"</div>
+        </div>
+
+        <div class="card cmd reveal d2">
+          <div class="name">/wiregraph-unlink <span class="arg">&lt;dir&gt;</span><span class="new">NEW</span></div>
+          <div class="k">link · remove a member</div>
+          <p class="what">Removes a linked member; both graphs full-rebuild over the reduced union and the seam between them goes away.</p>
+          <p class="when"><span class="lbl">When</span> You linked the wrong thing, or the relationship no longer holds. Removes the entry from <b>both</b> graphs and prunes shas on both sides. If the peer was <b>autoCreated</b> and now has no other links, it offers to remove that graph entirely; a pre-existing peer is only unlinked, never deleted.</p>
+          <p class="args"><span class="lbl">Args</span> <span style="color:var(--cyan)">&lt;dir&gt;</span> — a currently-linked member</p>
+          <div class="ex"><span class="c">$ /wiregraph-unlink ~/log-server</span>
+removed link on both sides · both rebuild · 0 WIRE
+offers to remove the auto-created log-server graph</div>
+        </div>
+
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-list<span class="new">NEW</span></div>
+          <div class="k">link · membership</div>
+          <p class="what">Shows this graph's membership — the <b>mutual</b> view <code style="font-family:var(--mono);color:var(--violet);font-size:12px">graph_stats</code> can't give.</p>
+          <p class="when"><span class="lbl">When</span> Audit what's linked, confirm a link is mutual (not half-written), or spot a member whose directory vanished. Flags each link <b>mutual</b> or <b>one-sided</b> (repair by re-running /wiregraph-link).</p>
+          <p class="args"><span class="lbl">Args</span> none</p>
+          <div class="ex"><span class="c">$ /wiregraph-list</span>
+Own root: /home/dev/edge-app → edge-app
+Linked: /home/dev/log-server <span class="c">[mutual]</span> → api, worker, shared</div>
+        </div>
+
+        <div class="card cmd reveal d2" style="justify-content:center;border-style:dashed">
+          <div class="k" style="margin-top:0;color:var(--violet)">how linking behaves</div>
+          <p class="when" style="margin-top:12px">Linking is <b>symmetric</b> — recorded identically in both graphs' configs. Each graph keeps <b>one db</b> and stores the union under its own project tag (node ids are project-free). Every link / unlink ends in a <b>full rebuild + re-infer</b>, never an incremental — so the two mirror dbs are <b>eventually consistent</b>, not lock-step.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- GROUP 5 — TEARDOWN -->
+    <div class="grp g-down">
+      <div class="grp-head reveal">
+        <span class="gn">05</span><h3>Teardown</h3>
+        <span class="gd">Back out cleanly — pause, or fully uninstall.</span>
+      </div>
+      <div class="cmd-grid">
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-teardown <span class="arg">[target-dir]</span></div>
+          <div class="k">teardown · soft</div>
+          <p class="what">Soft-remove — strips the managed CLAUDE.md block and sets posture <code style="font-family:var(--mono);color:var(--red);font-size:12px">off</code> so hooks no-op; <b>leaves graph.db + state.json</b> for instant re-init.</p>
+          <p class="when"><span class="lbl">When</span> Pausing wiregraph on a project but you'll likely come back — no need to rebuild later.</p>
+          <p class="args"><span class="lbl">Args</span> optional <span style="color:var(--cyan)">target-dir</span></p>
+          <div class="ex"><span class="c">$ /wiregraph-teardown</span>
+removed managed CLAUDE.md block · posture → off
+left intact: .wiregraph/ — re-init is instant</div>
+        </div>
+
+        <div class="card cmd reveal d2">
+          <div class="name">/wiregraph-remove <span class="arg">[target-dir]</span></div>
+          <div class="k">teardown · hard</div>
+          <p class="what">Hard-uninstall — deletes the <code style="font-family:var(--mono);color:var(--red);font-size:12px">.wiregraph/</code> folder, the managed directive block, the .gitignore entry, and a dangling ~/.wiregraph symlink. Nothing else touched.</p>
+          <p class="when"><span class="lbl">When</span> Done with wiregraph on this project entirely. Destructive — previews with <b>--dry-run</b> and requires explicit confirmation.</p>
+          <p class="args"><span class="lbl">Args</span> optional <span style="color:var(--cyan)">target-dir</span></p>
+          <div class="ex"><span class="c">$ /wiregraph-remove</span>
+--dry-run would remove: .wiregraph/ · directive · .gitignore line
+proceed? › yes · source untouched</div>
+        </div>
+      </div>
+
+      <div class="cmp-grid">
+        <div class="card cmp keep reveal d1">
+          <h4>teardown</h4>
+          <div class="sub">pause — you'll come back</div>
+          <ul>
+            <li><span class="m">✓</span> keeps graph.db + state.json</li>
+            <li><span class="m">✓</span> re-init is instant</li>
+            <li><span class="m">✓</span> posture set to off (hooks no-op)</li>
+            <li><span class="m">✓</span> managed CLAUDE.md block removed</li>
+          </ul>
+        </div>
+        <div class="card cmp wipe reveal d2">
+          <h4>remove</h4>
+          <div class="sub">done — uninstall entirely</div>
+          <ul>
+            <li><span class="m">✕</span> deletes the whole .wiregraph/ folder</li>
+            <li><span class="m">✕</span> deletes graph.db, state.json, refresh.log</li>
+            <li><span class="m">✕</span> removes the .gitignore entry</li>
+            <li><span class="m">✕</span> removes the directive block + symlink</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ============ CTA BAND ============ -->
+<div class="cta-band">
+  <div class="cta-inner reveal">
+    <p class="eyebrow" style="justify-content:center">Ready</p>
+    <h2>Index once. <span class="accent">Then link the seams.</span></h2>
+    <p class="body" style="margin-left:auto;margin-right:auto;text-align:center">Stand a graph up with <code class="inline">/wiregraph-init</code>, join separately-indexed repos with <code class="inline">/wiregraph-link</code>, and Claude traces producer → contract → consumer across every boundary — at about half the tokens.</p>
+    <a href="index.html#install" class="btn btn-primary">Install wiregraph &nbsp;→</a>
+  </div>
+</div>
+
+<!-- ============ FOOTER ============ -->
+<footer>
+  <div class="foot-inner">
+    <div class="foot-brand">
+      <svg class="mark" style="width:26px;height:26px" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <line x1="6" y1="6" x2="18" y2="18" stroke="var(--cyan)" stroke-width="1.6"/>
+        <line x1="6" y1="6" x2="18" y2="7" stroke="var(--cyan)" stroke-width="1.6"/>
+        <circle cx="6" cy="6" r="3" fill="var(--bg)" stroke="var(--cyan)" stroke-width="1.6"/>
+        <circle cx="18" cy="18" r="3" fill="var(--bg)" stroke="var(--cyan)" stroke-width="1.6"/>
+        <circle cx="18" cy="7" r="2.4" fill="var(--bg)" stroke="var(--cyan)" stroke-width="1.6"/>
+      </svg>
+      wiregraph
+    </div>
+    <div class="foot-right">
+      <a class="foot-gh" href="https://github.com/kaleLetendre/wiregraph">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        github.com/kaleLetendre/wiregraph
+      </a>
+      <span class="foot-meta">AGPL-3.0 · 100% local · nothing uploaded</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- mobile menu ---------- */
+  var toggle = document.getElementById('menuToggle');
+  var links = document.getElementById('navlinks');
+  if(toggle){
+    toggle.addEventListener('click', function(){
+      var open = links.classList.toggle('open');
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    links.addEventListener('click', function(e){
+      if(e.target.tagName === 'A'){ links.classList.remove('open'); toggle.setAttribute('aria-expanded','false'); }
+    });
+  }
+
+  /* ---------- reveal on scroll ---------- */
+  var reveals = document.querySelectorAll('.reveal');
+  if(reduce){
+    reveals.forEach(function(r){ r.classList.add('in'); });
+  } else if('IntersectionObserver' in window){
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); }
+      });
+    }, {threshold:.16, rootMargin:'0px 0px -8% 0px'});
+    reveals.forEach(function(r){ io.observe(r); });
+  } else {
+    reveals.forEach(function(r){ r.classList.add('in'); });
+  }
+
+  /* ---------- active section in nav + shareable ?section= deep-links ---------- */
+  var navAnchors = Array.prototype.slice.call(document.querySelectorAll('.nav-links a[href^="#"]'));
+  var sections = navAnchors.map(function(a){ return document.querySelector(a.getAttribute('href')); });
+  var sectionIds = sections.filter(Boolean).map(function(s){ return s.id; });
+  function shareSection(id){
+    if(sectionIds.indexOf(id) === -1) return;
+    try {
+      var u = new URL(window.location.href);
+      u.searchParams.set('section', id);
+      u.hash = '';
+      history.replaceState(history.state, '', u.pathname + u.search);
+    } catch(e){ /* history/URL unsupported — leave the address bar alone */ }
+  }
+  if('IntersectionObserver' in window){
+    var so = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(en.isIntersecting){
+          var id = '#'+en.target.id;
+          navAnchors.forEach(function(a){ a.classList.toggle('active', a.getAttribute('href')===id); });
+          shareSection(en.target.id);
+        }
+      });
+    }, {rootMargin:'-45% 0px -50% 0px', threshold:0});
+    sections.forEach(function(s){ if(s) so.observe(s); });
+  }
+  /* nav clicks keep the address bar on ?section= (href="#id" stays the no-JS fallback) */
+  navAnchors.forEach(function(a){
+    a.addEventListener('click', function(e){
+      var id = a.getAttribute('href').slice(1), el = document.getElementById(id);
+      if(!el) return;
+      e.preventDefault();
+      el.scrollIntoView();
+      shareSection(id);
+    });
+  });
+  /* open at a shared ?section= on load */
+  (function(){
+    var want; try { want = new URL(window.location.href).searchParams.get('section'); } catch(e){ return; }
+    if(!want || sectionIds.indexOf(want) === -1) return;
+    var target = document.getElementById(want);
+    if(!target) return;
+    if('scrollRestoration' in history){ try { history.scrollRestoration = 'manual'; } catch(e){} }
+    requestAnimationFrame(function(){ target.scrollIntoView({behavior:'auto'}); });
+  })();
+
+  /* ---------- copy buttons ---------- */
+  document.querySelectorAll('.cmd-line').forEach(function(line){
+    var btn = line.querySelector('.copy');
+    var cmd = line.querySelector('[data-cmd]');
+    if(!btn || !cmd) return;
+    btn.addEventListener('click', function(){
+      var text = cmd.textContent.trim();
+      var done = function(){ btn.textContent='copied'; btn.classList.add('done'); setTimeout(function(){ btn.textContent='copy'; btn.classList.remove('done'); },1400); };
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select();
+        try{ document.execCommand('copy'); }catch(e){} document.body.removeChild(ta); done();
+      }
+    });
+  });
+
+  if(reduce) return; /* no animated pulses under reduced motion */
+
+  /* ---------- pulse engine ---------- */
+  var SVGNS='http://www.w3.org/2000/svg';
+  function makePulse(parent, r){
+    var c=document.createElementNS(SVGNS,'circle');
+    c.setAttribute('r', r||3.2); c.setAttribute('class','pulse');
+    parent.appendChild(c); return c;
+  }
+  function animateAlong(pathEl, dot, dur, delay, loop){
+    var len=pathEl.getTotalLength();
+    var start=null;
+    function frame(ts){
+      if(start===null) start=ts+ (delay||0);
+      var t=(ts-start)/dur;
+      if(t<0){ dot.setAttribute('opacity','0'); requestAnimationFrame(frame); return; }
+      if(t>1){
+        if(loop){ start=ts; t=0; } else { dot.setAttribute('opacity','0'); return; }
+      }
+      dot.setAttribute('opacity', (t<.08? t/.08 : t>.9? (1-t)/.1 : 1).toFixed(2));
+      var p=pathEl.getPointAtLength(t*len);
+      dot.setAttribute('cx',p.x); dot.setAttribute('cy',p.y);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  /* ---------- LINK diagram: light the seam on scroll, then loop pulses ---------- */
+  var linkSvg=document.getElementById('linkSvg');
+  if(linkSvg && 'IntersectionObserver' in window){
+    var started=false;
+    var lio=new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(en.isIntersecting && !started){
+          started=true;
+          var contract=document.getElementById('linkContract');
+          var eA=document.getElementById('linkEdgeA'), eB=document.getElementById('linkEdgeB');
+          var lp=document.getElementById('linkPulses');
+          setTimeout(function(){
+            eA.classList.add('edge-active'); eB.classList.add('edge-active');
+            eA.setAttribute('stroke','var(--cyan)'); eB.setAttribute('stroke','var(--cyan)');
+            eA.setAttribute('stroke-width','2'); eB.setAttribute('stroke-width','2');
+            eA.style.filter='drop-shadow(0 0 4px var(--cyan))'; eB.style.filter='drop-shadow(0 0 4px var(--cyan))';
+            var shape=contract.querySelector('.contract-shape');
+            shape.setAttribute('stroke','var(--amber)');
+            shape.setAttribute('fill','rgba(255,207,107,.14)');
+            shape.style.filter='drop-shadow(0 0 12px rgba(255,207,107,.6))';
+            document.getElementById('linkProd').classList.add('node-lit');
+            document.getElementById('linkCons').classList.add('node-lit');
+          }, 450);
+          var p1=makePulse(lp,4); p1.setAttribute('fill','var(--violet)');
+          var p2=makePulse(lp,4); p2.setAttribute('fill','var(--green)');
+          setTimeout(function(){
+            animateAlong(eA, p1, 1600, 0, true);
+            animateAlong(eB, p2, 1600, 800, true);
+          }, 750);
+        }
+      });
+    }, {threshold:.4});
+    lio.observe(linkSvg);
+  }
+})();
+</script>

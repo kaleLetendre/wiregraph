@@ -24,6 +24,7 @@ import { spawn } from 'node:child_process';
 import { platform } from 'node:os';
 import { connect } from './store/sqlite.js';
 import { gatherHtml } from './store/sqlite-export.js';
+import { contractDriftByName } from './store/sqlite-query.js';
 
 const PLUGIN_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const D3_BUNDLE = join(PLUGIN_DIR, 'node_modules', 'd3', 'dist', 'd3.min.js');
@@ -70,6 +71,8 @@ function openInBrowser(file) {
 // Must match the palette/order in build.js so HTML colors are stable across runs.
 const PALETTE = ['#E15554', '#4D9DE0', '#3BB273', '#7768AE', '#E67E22', '#1B9AAA', '#D81159', '#8F2D56'];
 const CONTRACT_COLOR = '#F2C94C';
+// Contract-edge colors by drift status: a wire you can trust vs one to look at.
+const DRIFT_COLORS = { ok: '#3BB273', 'one-sided': '#E6A23C', drift: '#E15554' };
 
 function parseArgs(argv) {
   const o = { out: null, all: false, tests: false, contract: null, up: 3, down: 1, project: null, db: null, open: false, functions: false, allowCdn: false };
@@ -114,28 +117,65 @@ function collapseLinks(links) {
   return [...m.values()];
 }
 
-// The default contract view: collapse every function->contract reference to ONE
-// arrow per (compartment -> contract), so a big workspace shows which compartments
-// touch which contracts instead of a hairball of per-function edges. Arrow weight
-// = number of distinct functions in that compartment referencing the contract;
-// tokens = union of fields. Symbol nodes are dropped in favor of one hub node per
-// compartment.
-function aggregateByCompartment(built) {
+// The default view: a contract IS an edge, not a node. Compartments are the
+// nodes; each contract becomes an edge between every PAIR of compartments that
+// reference it (a contract spanning N compartments -> C(N,2) edges, one label,
+// curved apart in the renderer). Each edge is colored by the contract's DRIFT
+// status. The exception that proves the rule: a contract NO pair can connect —
+// referenced by 0 or 1 compartment — has no edge to draw, so it surfaces as a red
+// "unwired" node. That a broken contract is the only thing rendered as a node is
+// the point: a healthy contract is a wire; a drifted one is a dangling flag.
+function contractEdges(built, driftByName) {
   const symCompartment = new Map(); const contracts = new Map();
   for (const n of built.nodes) { if (n.kind === 'contract') contracts.set(n.id, n); else symCompartment.set(n.id, n.compartment); }
-  const compartmentNodes = new Map(); const agg = new Map();
+  // contractId -> Map(compartment -> {tokens:Set, funcs:Set})
+  const perContract = new Map();
   for (const l of built.links) {
     if (l.type !== 'REFERENCES') continue;
     const r = symCompartment.get(l.source); const c = l.target;
     if (!r || !contracts.has(c)) continue;
-    if (!compartmentNodes.has(r)) compartmentNodes.set(r, { id: 'compartment::' + r, kind: 'compartment', compartment: r, name: r, file: null, line: null });
-    const key = r + '||' + c; let e = agg.get(key);
-    if (!e) { e = { source: 'compartment::' + r, target: c, type: 'REFERENCES', tokens: new Set(), funcs: new Set() }; agg.set(key, e); }
-    for (const t of l.tokens || []) e.tokens.add(t);
-    e.funcs.add(l.source);
+    if (!perContract.has(c)) perContract.set(c, new Map());
+    const m = perContract.get(c);
+    if (!m.has(r)) m.set(r, { tokens: new Set(), funcs: new Set() });
+    const side = m.get(r);
+    for (const t of l.tokens || []) side.tokens.add(t);
+    side.funcs.add(l.source);
   }
-  const links = [...agg.values()].map((e) => ({ source: e.source, target: e.target, type: 'REFERENCES', tokens: [...e.tokens], count: e.funcs.size }));
-  return { nodes: [...compartmentNodes.values(), ...contracts.values()], links };
+  const compartmentNodes = new Map();
+  const ensure = (r) => { if (!compartmentNodes.has(r)) compartmentNodes.set(r, { id: 'compartment::' + r, kind: 'compartment', compartment: r, name: r, file: null, line: null }); return 'compartment::' + r; };
+  const links = []; const danglers = [];
+  const seenNames = new Set();
+  for (const [cid, cnode] of contracts) {
+    seenNames.add(cnode.name);
+    const sides = perContract.get(cid) || new Map();
+    const drift = driftByName[cnode.name] || null;
+    const comps = [...sides.keys()].sort();
+    if (comps.length >= 2) {
+      for (let i = 0; i < comps.length; i++) for (let j = i + 1; j < comps.length; j++) {
+        const a = sides.get(comps[i]), b = sides.get(comps[j]);
+        links.push({
+          source: ensure(comps[i]), target: ensure(comps[j]), type: 'CONTRACT', contract: cnode.name,
+          tokens: [...new Set([...a.tokens, ...b.tokens])], count: a.funcs.size + b.funcs.size,
+          status: drift ? drift.status : 'ok', drift,
+        });
+      }
+    } else {
+      // 0 or 1 referencing compartment -> unwired. Draw a red node; if exactly one
+      // side touches it, tether that compartment to the node so you can see who.
+      const id = 'contract::' + cnode.id;
+      danglers.push({ id, kind: 'contract', dangling: true, compartment: null, name: cnode.name, file: null, line: null, status: drift ? drift.status : 'one-sided', drift });
+      if (comps.length === 1) links.push({ source: ensure(comps[0]), target: id, type: 'CONTRACT', contract: cnode.name, tokens: [...sides.get(comps[0]).tokens], count: sides.get(comps[0]).funcs.size, status: 'one-sided', drift, toDangler: true });
+    }
+  }
+  // Contracts NO code references at all never made it into built.nodes (gatherHtml
+  // only emits a contract node when some symbol references it). Those are the
+  // fully-drifted contracts — resurrect them as red dangling nodes so they can't
+  // vanish from the picture, which is the whole point of the drift work.
+  for (const [name, drift] of Object.entries(driftByName)) {
+    if (seenNames.has(name)) continue;
+    danglers.push({ id: 'contract::' + name, kind: 'contract', dangling: true, compartment: null, name, file: null, line: null, status: drift.status || 'drift', drift });
+  }
+  return { nodes: [...compartmentNodes.values(), ...danglers], links };
 }
 
 function resolveProject(opts) {
@@ -151,25 +191,27 @@ async function main() {
   if (!existsSync(dbPath)) { process.stderr.write(`No graph db at ${dbPath}. Run /wiregraph-init or build first.\n`); process.exit(1); }
   const db = connect(dbPath, { readonly: true });
 
-  let built;
+  // Default contract view renders contracts AS edges (needs the per-contract drift
+  // status to color them); --functions keeps the per-function detail; --all /
+  // --contract are their own modes.
+  const compartmentMode = !opts.all && !opts.contract && !opts.functions;
+  let built, driftByName = {};
   try {
     built = gatherHtml(db, project, opts);
     if (opts.contract && !built) { process.stderr.write(`No contract matching "${opts.contract}" with references.\n`); process.exit(1); }
+    if (compartmentMode) driftByName = Object.fromEntries(contractDriftByName(db, project));
   } finally {
     db.close();
   }
 
-  // Default contract view aggregates per compartment; --functions keeps the
-  // per-function detail; --all / --contract are their own modes.
-  const compartmentMode = !opts.all && !opts.contract && !opts.functions;
-  if (compartmentMode) built = aggregateByCompartment(built);
+  if (compartmentMode) built = contractEdges(built, driftByName);
   else built.links = collapseLinks(built.links);
   const compartments = [...new Set(built.nodes.map((n) => n.compartment).filter(Boolean))].sort();
   const compartmentColor = {};
   compartments.forEach((r, i) => { compartmentColor[r] = PALETTE[i % PALETTE.length]; });
 
   const title = opts.contract || (opts.all ? 'full graph' : compartmentMode ? 'contracts × compartments' : 'contract references');
-  const data = { nodes: built.nodes, links: built.links, compartments, compartmentColor, contractColor: CONTRACT_COLOR, title, aggregated: compartmentMode };
+  const data = { nodes: built.nodes, links: built.links, compartments, compartmentColor, contractColor: CONTRACT_COLOR, driftColors: DRIFT_COLORS, title, aggregated: compartmentMode };
   writeFileSync(opts.out, renderHtml(data, { allowCdn: opts.allowCdn }));
   process.stderr.write(`wrote ${data.nodes.length} nodes / ${data.links.length} links -> ${opts.out}\n`);
   process.stderr.write('compartments: ' + compartments.map((r) => `${r}=${compartmentColor[r]}`).join(', ') + '\n');
@@ -218,29 +260,32 @@ ${d3ScriptTag(allowCdn)}
 <div id="tip"></div>
 <script>
 const DATA = ${JSON.stringify(data)};
-const color = d => d.kind === 'contract' ? ${JSON.stringify(CONTRACT_COLOR)} : (DATA.compartmentColor[d.compartment] || '#888');
+const DRIFT = DATA.driftColors;
+const contractCol = d => DRIFT[d.status] || ${JSON.stringify(CONTRACT_COLOR)};
+// A contract is drawn as an EDGE now; the only contract NODES are "dangling" ones
+// (a contract nothing — or only one side — references), painted by drift status.
+const color = d => d.kind === 'contract' ? contractCol(d) : (DATA.compartmentColor[d.compartment] || '#888');
 const svg = d3.select('#graph'), g = svg.append('g');
 const W = () => window.innerWidth, H = () => window.innerHeight;
 svg.call(d3.zoom().scaleExtent([0.03, 5]).on('zoom', e => g.attr('transform', e.transform)));
 
-// Directional arrowheads (a CALLS b, symbol REFERENCES contract point at the target).
+// Directional arrowheads for CALLS / REFERENCES (other modes). CONTRACT edges are
+// undirected (a shared seam), so they carry no arrowhead.
 const defs = svg.append('defs');
 function arrow(id, col){ defs.append('marker').attr('id',id).attr('viewBox','0 -5 10 10')
   .attr('refX',10).attr('refY',0).attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
   .append('path').attr('d','M0,-5L10,0L0,5').attr('fill',col); }
 arrow('aRef','#E0A458'); arrow('aCall','#7B8CDE');
-const rOf = d => d.kind==='contract' ? 12 : d.kind==='compartment' ? 16 : 5;
+const rOf = d => d.kind==='contract' ? 11 : d.kind==='compartment' ? 16 : 5;
 
 const centers = {};
 DATA.compartments.forEach((r, i) => { const a = (i/DATA.compartments.length)*2*Math.PI - Math.PI/2; centers[r] = {x:Math.cos(a), y:Math.sin(a)}; });
 const radius = () => Math.min(W(),H())*0.40;
-// Spread contracts around a smaller inner ring (stable index order) instead of
-// pinning every one to the exact center — otherwise all the seams and their
-// labels collapse into a single unreadable blob.
+// Contract nodes only exist as dangling markers now; ring them near the center.
 const contractNodes = DATA.nodes.filter(d=>d.kind==='contract');
 contractNodes.forEach((c,i)=>{ c.__ci = i; });
 const NC = contractNodes.length;
-const innerR = () => NC<=1 ? 0 : Math.min(radius()*0.66, Math.max(Math.min(W(),H())*0.16, NC*10));
+const innerR = () => NC<=1 ? 0 : Math.min(radius()*0.5, Math.max(Math.min(W(),H())*0.14, NC*12));
 const cAngle = d => (d.__ci/NC)*2*Math.PI - Math.PI/2;
 const tx = d => d.kind==='contract' ? W()/2 + Math.cos(cAngle(d))*innerR() : W()/2 + (centers[d.compartment]?.x||0)*radius();
 const ty = d => d.kind==='contract' ? H()/2 + Math.sin(cAngle(d))*innerR() : H()/2 + (centers[d.compartment]?.y||0)*radius();
@@ -249,24 +294,36 @@ const tip = document.getElementById('tip');
 function showTip(e, html){ tip.style.display='block'; tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY+12)+'px'; tip.innerHTML=html; }
 function hideTip(){ tip.style.display='none'; }
 
-const link = g.append('g').attr('stroke-opacity',0.38).selectAll('line')
-  .data(DATA.links).join('line')
-  .attr('stroke', d => d.type==='REFERENCES' ? '#E0A458' : '#7B8CDE')
-  .attr('stroke-width', d => d.type==='REFERENCES' ? Math.min(7, 1 + d.count*0.6) : Math.min(3.5, 0.8 + d.count*0.3))
-  .attr('marker-end', d => d.type==='REFERENCES' ? 'url(#aRef)' : 'url(#aCall)')
-  .on('mousemove', (e,d)=> showTip(e, d.type==='REFERENCES'
-      ? (DATA.aggregated
-          ? '<b>'+d.count+' function(s)</b> in this compartment &rarr; contract<br>'+d.tokens.length+' field(s): '+d.tokens.join(', ')
-          : '<b>REFERENCES</b> &middot; '+d.count+' field(s)<br>'+d.tokens.join(', '))
-      : '<b>CALLS</b> &times;'+d.count))
-  .on('mouseout', hideTip);
+// Curve parallel edges apart: many contracts can join the same compartment pair,
+// so index each link within its unordered pair and bow it by that index.
+const pairIdx = new Map();
+DATA.links.forEach(l=>{ const s=(typeof l.source==='object'?l.source.id:l.source), t=(typeof l.target==='object'?l.target.id:l.target);
+  const k = s<t? s+'|'+t : t+'|'+s; const a=pairIdx.get(k)||[]; a.push(l); pairIdx.set(k,a); });
+pairIdx.forEach(a=>{ const n=a.length; a.forEach((l,i)=>{ l._curv = n===1?0:(i-(n-1)/2); }); });
+
+const driftFlag = d => d.status==='drift' ? ' 🔴 DRIFT' : d.status==='one-sided' ? ' ⚠️ one-sided' : '';
+const linkStroke = d => d.type==='CONTRACT' ? contractCol(d) : (d.type==='REFERENCES' ? '#E0A458' : '#7B8CDE');
+const linkWidth = d => d.type==='CONTRACT' ? Math.min(6, 1.4 + Math.log2(1+d.tokens.length)*1.4)
+  : d.type==='REFERENCES' ? Math.min(7, 1 + d.count*0.6) : Math.min(3.5, 0.8 + d.count*0.3);
+const linkTip = d => d.type==='CONTRACT'
+    ? '<b>'+d.contract+'</b>'+driftFlag(d)+'<br>contract seam &middot; '+d.tokens.length+' field(s)'
+        + (d.drift? '<br>'+d.drift.satisfied+' satisfied &middot; '+d.drift.oneSided+' one-sided &middot; '+d.drift.unreferenced+' unreferenced':'')
+        + '<br>'+d.tokens.slice(0,12).join(', ')+(d.tokens.length>12?' …':'')
+    : d.type==='REFERENCES' ? '<b>REFERENCES</b> &middot; '+d.count+' field(s)<br>'+d.tokens.join(', ')
+    : '<b>CALLS</b> &times;'+d.count;
+
+const link = g.append('g').attr('fill','none').attr('stroke-opacity',0.5).selectAll('path')
+  .data(DATA.links).join('path')
+  .attr('stroke', linkStroke).attr('stroke-width', linkWidth)
+  .attr('marker-end', d => d.type==='CONTRACT' ? null : (d.type==='REFERENCES' ? 'url(#aRef)' : 'url(#aCall)'))
+  .on('mousemove', (e,d)=> showTip(e, linkTip(d))).on('mouseout', hideTip);
 
 const node = g.append('g').selectAll('circle')
   .data(DATA.nodes).join('circle')
   .attr('r', rOf)
   .attr('fill', color).attr('stroke','#1b1d23').attr('stroke-width',d=>d.kind==='compartment'?2:1.2)
   .on('mousemove', (e,d)=> showTip(e, d.kind==='contract'
-      ? '<b>'+d.name+'</b><br>contract'
+      ? '<b>'+d.name+'</b>'+driftFlag(d)+'<br>unwired contract — no code, or only one side, references it'
       : d.kind==='compartment'
       ? '<b>'+d.name+'</b><br>compartment'
       : '<b>'+d.name+'</b><br>'+d.compartment+'<br>'+(d.file||'')+(d.line?(':'+d.line):'')))
@@ -276,26 +333,46 @@ const node = g.append('g').selectAll('circle')
     .on('drag',(e,d)=>{ d.fx=e.x; d.fy=e.y; })
     .on('end',(e,d)=>{ if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
 
+// Node labels (compartments always; dangling contracts when labels are on).
 const label = g.append('g').selectAll('text')
   .data(DATA.nodes.filter(d=>d.kind==='contract'||d.kind==='compartment')).join('text')
-  .text(d=>d.name).attr('fill',d=>d.kind==='compartment'?'#e6e6e6':'#f2e9c0')
-  .attr('font-size',d=>d.kind==='compartment'?'13px':'12px').attr('font-weight',d=>d.kind==='compartment'?'600':'400')
-  .attr('text-anchor','middle').attr('dy',d=>d.kind==='compartment'?-21:-15)
+  .text(d=>d.name).attr('fill',d=>d.kind==='compartment'?'#e6e6e6':'#f2b8b8')
+  .attr('font-size',d=>d.kind==='compartment'?'13px':'11px').attr('font-weight',d=>d.kind==='compartment'?'600':'400')
+  .attr('text-anchor','middle').attr('dy',d=>d.kind==='compartment'?-21:-14)
   .style('pointer-events','none');
 
+// Contract-edge labels: the whole point of the view, so on by default. Placed at
+// each edge's bowed midpoint; the "show all labels" toggle also reveals node names.
+const elabelData = DATA.links.filter(d=>d.type==='CONTRACT' && !d.toDangler);
+const elabel = g.append('g').selectAll('text')
+  .data(elabelData).join('text')
+  .text(d=>d.contract).attr('fill',d=>contractCol(d)).attr('font-size','10px')
+  .attr('text-anchor','middle').attr('dy','-2').style('pointer-events','none').style('opacity',0.9);
+
+// Quadratic-bezier path (bowed by _curv) with endpoints trimmed to node borders.
+function geom(d){
+  const s=d.source, t=d.target, dx=t.x-s.x, dy=t.y-s.y, L=Math.hypot(dx,dy)||1;
+  const nx=-dy/L, ny=dx/L, off=(d._curv||0)*24;
+  const cx=(s.x+t.x)/2+nx*off, cy=(s.y+t.y)/2+ny*off;
+  const gap = d.type==='CONTRACT'?0:4;
+  const sx=s.x+dx/L*(rOf(s)), sy=s.y+dy/L*(rOf(s));
+  const ex=t.x-dx/L*(rOf(t)+gap), ey=t.y-dy/L*(rOf(t)+gap);
+  // midpoint of the quadratic at u=0.5
+  const mx=0.25*sx+0.5*cx+0.25*ex, my=0.25*sy+0.5*cy+0.25*ey;
+  return {sx,sy,cx,cy,ex,ey,mx,my};
+}
+
 const sim = d3.forceSimulation(DATA.nodes)
-  .force('link', d3.forceLink(DATA.links).id(d=>d.id).distance(45).strength(0.08))
-  .force('charge', d3.forceManyBody().strength(-70))
-  .force('x', d3.forceX(tx).strength(d=>d.kind==='contract'?0.5:0.28))
-  .force('y', d3.forceY(ty).strength(d=>d.kind==='contract'?0.5:0.28))
-  .force('collide', d3.forceCollide(d=>d.kind==='contract'?20:d.kind==='compartment'?24:6))
+  .force('link', d3.forceLink(DATA.links).id(d=>d.id).distance(90).strength(0.06))
+  .force('charge', d3.forceManyBody().strength(-160))
+  .force('x', d3.forceX(tx).strength(d=>d.kind==='contract'?0.5:0.22))
+  .force('y', d3.forceY(ty).strength(d=>d.kind==='contract'?0.5:0.22))
+  .force('collide', d3.forceCollide(d=>d.kind==='contract'?18:d.kind==='compartment'?30:6))
   .on('tick', ()=>{
-    // Trim each line to the target node's border so the arrowhead is visible.
-    link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
-      .attr('x2',d=>{ const dx=d.target.x-d.source.x, dy=d.target.y-d.source.y, L=Math.hypot(dx,dy)||1; return d.target.x - dx/L*(rOf(d.target)+4); })
-      .attr('y2',d=>{ const dx=d.target.x-d.source.x, dy=d.target.y-d.source.y, L=Math.hypot(dx,dy)||1; return d.target.y - dy/L*(rOf(d.target)+4); });
+    link.attr('d',d=>{ const p=geom(d); return d._curv? \`M\${p.sx},\${p.sy} Q\${p.cx},\${p.cy} \${p.ex},\${p.ey}\` : \`M\${p.sx},\${p.sy} L\${p.ex},\${p.ey}\`; });
     node.attr('cx',d=>d.x).attr('cy',d=>d.y);
     label.attr('x',d=>d.x).attr('y',d=>d.y);
+    elabel.attr('x',d=>geom(d).mx).attr('y',d=>geom(d).my);
   });
 
 const bind=(id,vid,fn,fmt)=>{ const el=document.getElementById(id);
@@ -305,20 +382,26 @@ bind('charge','vCharge', v=> sim.force('charge').strength(-v), v=>v.toFixed(0));
 bind('link','vLink', v=> sim.force('link').distance(v), v=>v.toFixed(0));
 
 const hidden=new Set();
-const items=[...DATA.compartments.map(r=>({key:r,label:r,col:DATA.compartmentColor[r]})),{key:'__contract',label:'contract',col:${JSON.stringify(CONTRACT_COLOR)}}];
 const legend=d3.select('#legend');
-items.forEach(it=>{ const row=legend.append('div').attr('class','leg').on('click',function(){
+// Compartment swatches (click to hide). Circles => nodes you can toggle.
+DATA.compartments.forEach(r=>{ const it={key:r,col:DATA.compartmentColor[r]};
+  const row=legend.append('div').attr('class','leg').on('click',function(){
     hidden.has(it.key)?hidden.delete(it.key):hidden.add(it.key); d3.select(this).classed('off',hidden.has(it.key)); applyFilter(); });
-  row.append('div').attr('class','sw').style('background',it.col); row.append('div').text(it.label); });
-const isHidden=d=> hidden.has(d.kind==='contract'?'__contract':d.compartment);
-// Labels are OFF by default: with many seams the always-on text is the main source
-// of clutter, and hovering any node already shows its name in the tooltip. The
-// "show all labels" checkbox turns them on for when the user has zoomed into a region.
+  row.append('div').attr('class','sw').style('background',it.col); row.append('div').text(r); });
+// Drift color key for the contract EDGES (non-clickable — it explains, not filters).
+if (DATA.aggregated) {
+  legend.append('div').style('border-top','1px solid #3a3f4b').style('margin-top','6px').style('padding-top','6px').style('font-size','10px').style('color','#7d8492').text('contract edges');
+  [['ok','satisfied'],['one-sided','one-sided'],['drift','has drift']].forEach(([k,lbl])=>{
+    const row=legend.append('div').attr('class','leg').style('cursor','default');
+    row.append('div').attr('class','sw').style('border-radius','2px').style('background',DRIFT[k]); row.append('div').text(lbl); });
+}
+const isHidden=d=> d.kind==='contract' ? false : hidden.has(d.compartment);
 let labelsOn=false;
 document.getElementById('labels').addEventListener('change', e=>{ labelsOn=e.target.checked; applyFilter(); });
 function applyFilter(){ node.attr('display',d=>isHidden(d)?'none':null);
   label.attr('display',d=>((d.kind==='compartment'||labelsOn) && !isHidden(d))?null:'none');
-  link.attr('display',d=>(isHidden(d.source)||isHidden(d.target))?'none':null); }
+  link.attr('display',d=>(isHidden(d.source)||isHidden(d.target))?'none':null);
+  elabel.attr('display',d=>(isHidden(d.source)||isHidden(d.target))?'none':null); }
 applyFilter();
 </script>
 </body>

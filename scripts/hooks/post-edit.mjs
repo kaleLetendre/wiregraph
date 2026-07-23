@@ -11,7 +11,7 @@ import { realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readState, findIndexedRoot } from '../lib/state.mjs';
+import { readState, findIndexedRoot, owningMember } from '../lib/state.mjs';
 import { langForFile } from '../../src/extract/lang.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -43,10 +43,12 @@ async function main() {
   if (posture !== 'balanced' && posture !== 'aggressive') return; // SessionStart-only or off
   if (!state) return; // project not initialized
 
-  // Only re-index source files that live under this project.
+  // Only re-index source files that live under this graph's union — its own root
+  // OR a linked member (membership gate, not a bare subtree check). A file under no
+  // member is not ours to index.
   let abs;
   try { abs = realpathSync(file); } catch { abs = file; }
-  if (!abs.startsWith(PROJECT + '/')) return;
+  if (!owningMember(abs, PROJECT)) return;
   if (!langForFile(abs)) return;
 
   const child = spawn('node', [join(HERE, 'refresh.mjs'), '--files', abs], {

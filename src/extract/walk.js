@@ -2,7 +2,7 @@
 // and yield source files tagged with the compartment they belong to and their
 // language.
 
-import { readdirSync, statSync, existsSync, readFileSync } from 'node:fs';
+import { readdirSync, statSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join, relative, basename } from 'node:path';
 import { IGNORE_DIRS, langForFile } from './lang.js';
 
@@ -76,8 +76,10 @@ function findGitRepos(rootDir) {
   return findRoots(rootDir, (dir, entries) => entries.some((e) => e.name === '.git'));
 }
 
-// Yields { abs, compartment, compartmentRoot, relPath, lang, variant }
-export function* walkSources(rootDir) {
+// Walk one root, attributing files to compartments LOCAL to that root, and skip any
+// file already yielded (shared `seen`, keyed by realpath) so overlapping or
+// symlinked roots never double-yield.
+function* walkOneRoot(rootDir, seen) {
   const rootName = basename(rootDir);
   const compartmentRoots = findCompartmentRoots(rootDir);
 
@@ -99,6 +101,12 @@ export function* walkSources(rootDir) {
       if (!e.isFile()) continue;
       const lang = langForFile(e.name);
       if (!lang) continue;
+      // Dedup on the resolved real path so the same file reached via two roots (one
+      // a symlink to / an ancestor of the other) is yielded exactly once.
+      let real;
+      try { real = realpathSync(abs); } catch { real = abs; }
+      if (seen.has(real)) continue;
+      seen.add(real);
       const { name: compartment, root: compartmentRoot } = compartmentNameFor(abs, compartmentRoots, rootName, rootDir);
       yield {
         abs,
@@ -110,6 +118,16 @@ export function* walkSources(rootDir) {
       };
     }
   }
+}
+
+// Yields { abs, compartment, compartmentRoot, relPath, lang, variant } across ONE
+// root or a UNION of roots. A string is treated as a single root (back-compat); an
+// array walks each root in order with a shared dedup set so overlapping/symlinked
+// members contribute each file once, while attribution stays local to each root.
+export function* walkSources(roots) {
+  const list = Array.isArray(roots) ? roots : [roots];
+  const seen = new Set();
+  for (const rootDir of list) yield* walkOneRoot(rootDir, seen);
 }
 
 export { findCompartmentRoots, compartmentNameFor, findGitRepos };

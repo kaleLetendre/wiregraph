@@ -24,7 +24,10 @@
 import initSqlJs from 'sql.js';
 import { createRequire } from 'node:module';
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, openSync, closeSync, statSync, rmSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, sep } from 'node:path';
+import { readState } from '../../scripts/lib/state.mjs';
+import { walkSources } from '../extract/walk.js';
+import { buildWireEdges } from '../extract/contracts.js';
 
 const require = createRequire(import.meta.url);
 // Resolve the bundled wasm next to the sql.js package (no network, no compile).
@@ -39,7 +42,12 @@ const SQL = await initSqlJs({ locateFile: () => require.resolve('sql.js/dist/sql
 // v3 renames the graph-attribution unit from "repo" to "compartment": the `repos`
 // table -> `compartments`, and the `repo` column on files/symbols -> `compartment`
 // (a compartment is a .git repo OR a module manifest boundary — see walk.js).
-export const SCHEMA_VERSION = 3;
+// v4 adds the `contract_tokens` table: the FULL set of wire tokens each contract
+// defines, persisted so trace_contract can diff defined-vs-referenced and report
+// DRIFT (a contract token no code references, or a token only one side touches).
+// Before v4 the token set was computed at build time, used to mint REFERENCES
+// edges, then discarded — so a drifted-away contract left no trace to detect.
+export const SCHEMA_VERSION = 4;
 
 // better-sqlite3 binds a single object arg as NAMED params (SQL `@key` <- obj.key)
 // and any other args as POSITIONAL (`?`). sql.js wants the `@` sigil in the keys
@@ -163,17 +171,19 @@ CREATE TABLE IF NOT EXISTS compartments(id TEXT PRIMARY KEY, project TEXT, name 
 CREATE TABLE IF NOT EXISTS files       (id TEXT PRIMARY KEY, project TEXT, compartment TEXT, path TEXT, lang TEXT, mtime REAL, size INTEGER);
 CREATE TABLE IF NOT EXISTS symbols     (id TEXT PRIMARY KEY, project TEXT, compartment TEXT, file TEXT, name TEXT, kind TEXT, lang TEXT, startLine INTEGER, endLine INTEGER);
 CREATE TABLE IF NOT EXISTS contracts   (id TEXT PRIMARY KEY, project TEXT, name TEXT, file TEXT);
+CREATE TABLE IF NOT EXISTS contract_tokens(project TEXT, contract TEXT, token TEXT, direction TEXT, producers TEXT, consumers TEXT);
 CREATE TABLE IF NOT EXISTS edges       (type TEXT, src TEXT, dst TEXT, project TEXT, token TEXT, cnt INTEGER, resolution TEXT, evidence TEXT, direction TEXT, contract TEXT);
 CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(project, name);
 CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(project, compartment, file);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(project, type, src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(project, type, dst);
 CREATE INDEX IF NOT EXISTS idx_edges_proj ON edges(project, type);
+CREATE INDEX IF NOT EXISTS idx_ctok ON contract_tokens(project, contract);
 `;
 
-const TABLES = ['compartments', 'files', 'symbols', 'contracts', 'edges', 'meta'];
+const TABLES = ['compartments', 'files', 'symbols', 'contracts', 'contract_tokens', 'edges', 'meta'];
 
-export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
+export function loadGraph(db, graph, { reset = false, log = () => {}, allowReducedUnion = false } = {}) {
   const project = graph.project;
   // If an existing db was written by a different schema version, a full --reset
   // build migrates it by dropping + recreating the tables (the db is per-project,
@@ -186,17 +196,68 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
   if (priorVersion > SCHEMA_VERSION) {
     throw new Error(`refusing to write: db schema v${priorVersion} is newer than this wiregraph (v${SCHEMA_VERSION}). Update wiregraph instead of downgrading the graph.`);
   }
+  if (reset && !project) throw new Error('sqlite loadGraph --reset requires graph.project');
+
+  // Member-losing-reset backstop (last line of defense for the link feature), run
+  // BEFORE any destructive table op (the schema-migration DROP below, and the
+  // in-transaction DELETE further down). A --reset wipes every row tagged with this
+  // project, then reloads only what the incoming graph holds. If this graph has
+  // linked members but the incoming graph was built from a single root (a stray
+  // rebuild that didn't go through the union walk), that wipe would silently erase
+  // the members — so refuse BEFORE dropping/recreating anything. Ordering matters:
+  // if a member-losing reset ALSO crosses a schema version, running this check after
+  // the DROP would empty the tables, then throw, and close() would persist the
+  // emptied db — defeating the backstop exactly when it is needed. A member whose
+  // directory no longer exists is exempt (dropping a vanished member is legitimate),
+  // and so is a member that produces NO indexable source (a docs/proto-only repo, or
+  // a language wiregraph doesn't parse): it contributes no compartments even during
+  // a correct union rebuild, so its absence from the rebuilt graph is expected — not
+  // evidence of a stray reset.
+  //
+  // allowReducedUnion opts OUT of this backstop: the caller passed an EXPLICIT root
+  // union (build's opts.roots override) that is the declared source of truth, so a
+  // member present in state.json but absent from the rebuild is INTENTIONAL — not a
+  // stray narrow reset. unlink relies on this: it rebuilds each graph over the reduced
+  // union (peer dropped) WHILE the link records still exist, retracting them only after
+  // both rebuilds succeed, so a crash leaves a re-runnable fully-linked pair.
+  if (reset && project && !allowReducedUnion) {
+    try {
+      const st = readState(project);
+      const links = (st && Array.isArray(st.links)) ? st.links : [];
+      if (links.length) {
+        const memberRootPaths = links.map((l) => (typeof l === 'string' ? l : l && l.root)).filter(Boolean);
+        const graphRoots = [...graph.compartments.values()].map((c) => c.root).filter(Boolean);
+        const covers = (m) => graphRoots.some((gr) => gr === m || gr.startsWith(m + sep) || m.startsWith(gr + sep));
+        // A member counts as "lost" only if it actually holds indexable code — else a
+        // correct union rebuild would legitimately produce no compartments for it, and
+        // its absence is not a stray-reset symptom. walkSources yields exactly the
+        // parseable files extractCode turns into compartments, so an empty walk ⇔ no
+        // compartments. This walk only runs for members NOT already covered by the
+        // rebuild (the rare/error path), so it costs nothing on a normal union reset.
+        const hasSource = (m) => { try { for (const _ of walkSources(m)) return true; } catch { /* unreadable — treat as no code */ } return false; };
+        const missing = memberRootPaths.filter((m) => existsSync(m) && !covers(m) && hasSource(m));
+        if (missing.length) {
+          throw new Error(`refusing to --reset: the rebuild graph for project ${project} is missing linked member(s) ${missing.join(', ')} — a single-root reset would erase them. Rebuild over the full union (memberRoots).`);
+        }
+      }
+    } catch (e) {
+      if (/refusing to --reset/.test(e.message)) throw e;
+      // A readState/walk failure must not block the reset on the backstop's own error.
+    }
+  }
+
   if (reset && priorVersion !== SCHEMA_VERSION) {
     for (const t of TABLES) db.exec(`DROP TABLE IF EXISTS ${t}`);
     if (priorVersion) log(`  migrating store schema v${priorVersion} -> v${SCHEMA_VERSION} (recreate)`);
   }
   db.exec(SCHEMA);
-  if (reset && !project) throw new Error('sqlite loadGraph --reset requires graph.project');
 
   const insCompartment = db.prepare('INSERT OR REPLACE INTO compartments (id,project,name,root) VALUES (@id,@project,@name,@root)');
   const insFile = db.prepare('INSERT OR REPLACE INTO files (id,project,compartment,path,lang,mtime,size) VALUES (@id,@project,@compartment,@path,@lang,@mtime,@size)');
   const insSym = db.prepare('INSERT OR REPLACE INTO symbols (id,project,compartment,file,name,kind,lang,startLine,endLine) VALUES (@id,@project,@compartment,@file,@name,@kind,@lang,@startLine,@endLine)');
   const insCon = db.prepare('INSERT OR REPLACE INTO contracts (id,project,name,file) VALUES (@id,@project,@name,@file)');
+  const insTok = db.prepare('INSERT INTO contract_tokens (project,contract,token,direction,producers,consumers) VALUES (@project,@contract,@token,@direction,@producers,@consumers)');
+  const delTok = db.prepare('DELETE FROM contract_tokens WHERE project=? AND contract=?');
   const insEdge = db.prepare('INSERT INTO edges (type,src,dst,project,token,cnt,resolution,evidence,direction,contract) VALUES (@type,@src,@dst,@project,@token,@cnt,@resolution,@evidence,@direction,@contract)');
 
   const tx = db.transaction(() => {
@@ -208,15 +269,31 @@ export function loadGraph(db, graph, { reset = false, log = () => {} } = {}) {
     // separate schema-migration DROP path above is exempt: that data is an
     // already-incompatible old schema the server refuses to query anyway.)
     if (reset) {
-      for (const t of ['compartments', 'files', 'symbols', 'contracts', 'edges']) {
-        db.prepare(`DELETE FROM ${t} WHERE project = ?`).run(project);
+      // A graph.db holds exactly ONE project (its own root ∪ members, ALL tagged with
+      // the owning root), so a reset clears EVERY row — not just rows tagged with the
+      // current project path. Scoping to `project` left a renamed/moved project's old
+      // rows (tagged with the now-dead path) behind as a GHOST compartment, doubling
+      // symbols + edges. Any row under a different project value is residue → purge it.
+      for (const t of ['compartments', 'files', 'symbols', 'contracts', 'contract_tokens', 'edges']) {
+        db.prepare(`DELETE FROM ${t}`).run();
       }
     }
     db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
     for (const r of graph.compartments.values()) insCompartment.run(r);
     for (const f of graph.files.values()) insFile.run({ mtime: null, size: null, ...f });
     for (const s of graph.symbols.values()) insSym.run({ lang: null, ...s });
-    for (const c of graph.contracts.values()) insCon.run({ file: null, ...c });
+    for (const c of graph.contracts.values()) {
+      insCon.run({ file: null, ...c });
+      // Persist the contract's full token set (delete-then-insert so an
+      // incremental reload, which re-loads ALL contracts, replaces rather than
+      // duplicates). A contract with no distinctive tokens simply gets no rows.
+      if (Array.isArray(c.tokenMeta)) {
+        delTok.run(project, c.id);
+        for (const t of c.tokenMeta) {
+          insTok.run({ project, contract: c.id, token: t.token, direction: t.direction ?? null, producers: t.producers ?? null, consumers: t.consumers ?? null });
+        }
+      }
+    }
     // Match Neo4j's load semantics exactly:
     //  (a) it MATCHes both endpoints against nodes ALREADY IN THE STORE, so an
     //      edge is kept iff both endpoints exist there now (just-inserted above
@@ -269,6 +346,13 @@ export function loadProjectSymbols(db, project) {
 //     DEFINED_IN), keeping incoming, so the reload recreates exactly one of each
 //     (Neo4j's MERGE deduped these implicitly; SQLite's INSERT is additive, so we
 //     must clear everything the re-extraction will re-add for this file);
+//   - for surviving symbols, ALSO drop any WIRE edge touching them (either
+//     direction). WIRE is a derived cross-compartment seam that the incremental path
+//     never re-derives (a full rebuild is its backstop). Keeping it would leave a
+//     stale WIRE hanging off a symbol whose backing REFERENCES were just re-matched —
+//     a dangling seam with no live backing. Dropping it is honest: the seam simply
+//     goes dark in export/visualize until the next full rebuild (query tools don't
+//     read WIRE). Deleted symbols' WIRE goes with delEdgesOf already.
 //   - clear the file's IN_COMPARTMENT edge for the same reason;
 //   - if keepIds is empty (file deleted on disk), also drop the File node.
 export function pruneFile(db, project, compartment, relPath, keepIds, log = () => {}) {
@@ -283,10 +367,13 @@ export function pruneFile(db, project, compartment, relPath, keepIds, log = () =
   const delOutgoing = db.prepare(
     "DELETE FROM edges WHERE project = ? AND src = ? AND type IN ('CALLS','REFERENCES','DEFINED_IN')",
   );
+  const delWireOf = db.prepare(
+    "DELETE FROM edges WHERE project = ? AND type = 'WIRE' AND (src = ? OR dst = ?)",
+  );
 
   const tx = db.transaction(() => {
     for (const id of toDelete) { delEdgesOf.run(project, id, id); delSym.run(id); }
-    for (const id of keepIds) delOutgoing.run(project, id);
+    for (const id of keepIds) { delOutgoing.run(project, id); delWireOf.run(project, id, id); }
     // The file node's IN_COMPARTMENT edge is re-added on reload too — clear it (and, if
     // the file is gone, the File node itself; its symbols + DEFINED_IN already went).
     const f = db.prepare('SELECT id FROM files WHERE project = ? AND compartment = ? AND path = ?').get(project, compartment, relPath);
@@ -298,4 +385,59 @@ export function pruneFile(db, project, compartment, relPath, keepIds, log = () =
   tx();
   if (!keepIds.length) log(`  pruned deleted file ${compartment}/${relPath}`);
   else log(`  pruned ${compartment}/${relPath} (kept ${keepIds.length} stable symbols' incoming edges)`);
+}
+
+// Incremental WIRE self-heal (Change 1). The incremental path re-matches REFERENCES
+// (M1), but pruneFile deletes every WIRE edge touching a changed/surviving symbol —
+// so the derived producer->consumer seam went DARK in export/visualize until a full
+// rebuild. This re-derives the WHOLE project's WIRE set from the db's now-fresh
+// REFERENCES (no source re-parse; cost is O(references)), running the SAME
+// buildWireEdges the full build uses so orientation matches exactly, then replaces
+// the project's WIRE rows wholesale (delete-all-then-reinsert). Full-union recompute
+// is idempotent and simpler than per-contract scoping, and WIRE is small.
+//
+// `contracts` MUST be the SAME merged contract set the incremental matchContracts
+// used (loadAllContracts output). Returns the number of WIRE rows written. It throws
+// only on a genuine db/SQL error; the caller wraps it so a failure degrades to the
+// old (seam-dark) behavior rather than breaking the incremental update.
+export function rederiveWireEdges(db, project, contracts, log = () => {}) {
+  // ALL symbols, INCLUDING the synthetic <module> symbol: matchContracts attributes a
+  // top-level route reference to <module>, so excluding it (as loadProjectSymbols
+  // does) would drop those seams and break parity with the full build.
+  const symbols = new Map();
+  for (const r of db.prepare('SELECT id, compartment FROM symbols WHERE project = ?').all(project))
+    symbols.set(r.id, { id: r.id, compartment: r.compartment });
+  // The REFERENCES edges buildWireEdges reads, shaped exactly as it expects
+  // (e.from, e.to, e.props.token).
+  const edges = db.prepare("SELECT src, dst, token FROM edges WHERE project = ? AND type = 'REFERENCES'")
+    .all(project).map((r) => ({ type: 'REFERENCES', from: r.src, to: r.dst, props: { token: r.token } }));
+  // A minimal Graph-shaped sink: buildWireEdges reads only .symbols (a Map with .get)
+  // and .edges, and emits via .addEdge(type, from, to, props).
+  const emitted = [];
+  const g = { symbols, edges, addEdge: (type, from, to, props) => emitted.push({ type, from, to, props }) };
+  buildWireEdges(g, contracts, log);
+
+  const del = db.prepare("DELETE FROM edges WHERE project = ? AND type = 'WIRE'");
+  const ins = db.prepare('INSERT INTO edges (type,src,dst,project,token,cnt,resolution,evidence,direction,contract) VALUES (@type,@src,@dst,@project,@token,@cnt,@resolution,@evidence,@direction,@contract)');
+  const tx = db.transaction(() => {
+    del.run(project);
+    // Dedup on (src,dst,token) exactly as loadGraph does for WIRE. buildWireEdges
+    // already dedups; this makes a re-run byte-identical regardless.
+    const seen = new Set();
+    for (const e of emitted) {
+      const tok = e.props?.token ?? null;
+      const key = `${e.from}\0${e.to}\0${tok}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      ins.run({
+        type: 'WIRE', src: e.from, dst: e.to, project,
+        token: tok, cnt: null, resolution: null,
+        evidence: e.props?.evidence ?? null, direction: e.props?.direction ?? null,
+        contract: e.props?.contract ?? null,
+      });
+    }
+  });
+  tx();
+  log(`  re-derived ${emitted.length} WIRE edge(s) from db REFERENCES`);
+  return emitted.length;
 }

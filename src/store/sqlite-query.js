@@ -5,7 +5,8 @@
 // small), which is simpler and faster here than recursive SQL.
 
 import { readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
+import { readState, members, memberRoots } from '../../scripts/lib/state.mjs';
 
 const isTest = (f) => f.includes('tests/') || f.includes('/test/') || f.includes('.test.') || f.includes('_test.') || f.includes('/test_');
 const loc = (n) => `${n.compartment}:${n.file}:${n.startLine} ${n.name}${n.kind && n.kind !== 'function' ? ` (${n.kind})` : ''}`;
@@ -56,15 +57,49 @@ export function graphStats(db, project) {
   const c = (t) => db.prepare(`SELECT count(*) n FROM ${t} WHERE project=?`).get(project).n;
   const nodes = { Compartment: c('compartments'), File: c('files'), Symbol: c('symbols'), Contract: c('contracts') };
   const edges = db.prepare('SELECT type, count(*) n FROM edges WHERE project=? GROUP BY type ORDER BY n DESC').all(project);
-  const compartments = db.prepare("SELECT compartment, count(*) n FROM symbols WHERE project=? AND kind<>'module' GROUP BY compartment ORDER BY n DESC").all(project);
+  // Compartment symbol counts joined to their root dir, so each compartment can be
+  // attributed to the member root that owns it (own root vs a linked member).
+  const compartments = db.prepare(
+    `SELECT s.compartment compartment, count(*) n, ct.root root
+       FROM symbols s LEFT JOIN compartments ct ON ct.project=s.project AND ct.name=s.compartment
+      WHERE s.project=? AND s.kind<>'module' GROUP BY s.compartment ORDER BY n DESC`).all(project);
   if (!nodes.Symbol) return `No wiregraph for this project (${project}).`;
-  return [
+
+  const head = [
     `Project: ${project}`,
     'Nodes: ' + Object.entries(nodes).filter(([, n]) => n).map(([k, n]) => `${k}=${n}`).join(', '),
     'Edges: ' + edges.map((r) => `${r.type}=${r.n}`).join(', '),
-    'Symbols per compartment:',
-    ...compartments.map((r) => `  ${r.compartment}: ${r.n}`),
-  ].join('\n');
+  ];
+
+  // Linked members: read this graph's own config. When there are none the output
+  // stays the flat single-graph shape (byte-compatible with a pre-link graph).
+  const mem = members(readState(project) || {});
+  if (!mem.length) {
+    return [...head, 'Symbols per compartment:', ...compartments.map((r) => `  ${r.compartment}: ${r.n}`)].join('\n');
+  }
+
+  // Group each compartment under the member root (longest-prefix on its root dir)
+  // that owns it, so the local/foreign boundary is UNMISSABLE: get_source on a
+  // "Linked" compartment reads an external repo's file, not this project's tree.
+  const roots = memberRoots(project); // [own, ...members]
+  const ownerRootFor = (compRoot) => {
+    let best = null; // longest member root that is a prefix of compRoot (own root falls out here too)
+    for (const m of roots) if (compRoot === m || (compRoot && compRoot.startsWith(m + sep))) { if (!best || m.length > best.length) best = m; }
+    return best || project;
+  };
+  const byRoot = new Map();
+  for (const r of compartments) {
+    const g = ownerRootFor(r.root);
+    if (!byRoot.has(g)) byRoot.set(g, []);
+    byRoot.get(g).push(r);
+  }
+  const section = (root) => (byRoot.get(root) || []).map((r) => `  ${r.compartment}: ${r.n}`);
+
+  const out = [...head, '', `Members: ${mem.length} linked (${mem.map((l) => l.root).join(', ')})`, '', `Own root: ${project}`, ...section(project)];
+  for (const l of mem) {
+    out.push('', `Linked: ${l.root}`, ...section(l.root));
+  }
+  return out.join('\n');
 }
 
 export function findSymbol(db, project, name, repo) {
@@ -183,6 +218,33 @@ export function traceCallees(db, project, name, repo, file, depth, includeTests)
   return trace(db, project, name, repo, file, depth, 'callees', includeTests).text || `No symbol named "${name}".`;
 }
 
+// Load the FULL token set each matching contract defines (schema v4). Returns a
+// Map(contractName -> Map(token -> {direction, producers[], consumers[]})). On a
+// pre-v4 db (no contract_tokens table) returns null so the caller falls back to a
+// references-only report rather than crashing.
+function definedContractTokens(db, project, contract, token) {
+  let rows;
+  try {
+    let q = `SELECT c.name name, ct.token token, ct.direction direction, ct.producers producers, ct.consumers consumers
+             FROM contract_tokens ct JOIN contracts c ON c.id=ct.contract
+             WHERE ct.project=@project AND lower(c.name) LIKE '%'||lower(@contract)||'%'`;
+    if (token) q += ' AND ct.token=@token';
+    rows = db.prepare(q).all({ project, contract, token });
+  } catch {
+    return null; // contract_tokens table absent (old schema)
+  }
+  const byContract = new Map();
+  for (const r of rows) {
+    if (!byContract.has(r.name)) byContract.set(r.name, new Map());
+    byContract.get(r.name).set(r.token, {
+      direction: r.direction || null,
+      producers: r.producers ? r.producers.split(',') : [],
+      consumers: r.consumers ? r.consumers.split(',') : [],
+    });
+  }
+  return byContract;
+}
+
 export function traceContract(db, project, contract, token, includeTests) {
   let q = `SELECT c.name contract, s.compartment compartment, s.file file, s.name name, s.startLine startLine, e.token token
            FROM edges e JOIN symbols s ON s.id=e.src JOIN contracts c ON c.id=e.dst
@@ -190,13 +252,31 @@ export function traceContract(db, project, contract, token, includeTests) {
   if (token) q += ' AND e.token=@token';
   const rows = db.prepare(q + ' ORDER BY c.name,s.compartment,s.file,s.startLine').all({ project, contract, token });
   const filtered = rows.filter((r) => includeTests || !isTest(r.file));
-  if (!filtered.length) return `No symbols reference a contract matching "${contract}"${token ? ` via token "${token}"` : ''}.`;
-  // aggregate tokens per (contract,compartment,file,name,line)
+
+  const defined = definedContractTokens(db, project, contract, token);
+  // A contract can exist in the graph, define tokens, and be referenced by NO
+  // code — that is the drift we must not stay silent about. So key the "found
+  // anything" check on the set of matching contracts, not on references.
+  const contractNames = defined
+    ? [...defined.keys()]
+    : [...new Set(filtered.map((r) => r.contract))];
+  if (!contractNames.length && !filtered.length) {
+    return `No contract matches "${contract}"${token ? ` (token "${token}")` : ''}.`;
+  }
+
+  // aggregate referencing symbols + per-token referencing compartments
   const byKey = new Map();
+  const refCompartments = new Map(); // contract -> Map(token -> Set(compartment))
   for (const r of filtered) {
     const k = `${r.contract}|${r.compartment}|${r.file}|${r.name}|${r.startLine}`;
     if (!byKey.has(k)) byKey.set(k, { ...r, tokens: [] });
     if (r.token && !byKey.get(k).tokens.includes(r.token)) byKey.get(k).tokens.push(r.token);
+    if (r.token) {
+      if (!refCompartments.has(r.contract)) refCompartments.set(r.contract, new Map());
+      const m = refCompartments.get(r.contract);
+      if (!m.has(r.token)) m.set(r.token, new Set());
+      m.get(r.token).add(r.compartment);
+    }
   }
   const byContract = new Map();
   for (const r of byKey.values()) {
@@ -205,19 +285,103 @@ export function traceContract(db, project, contract, token, includeTests) {
     if (!compartments.has(r.compartment)) compartments.set(r.compartment, []);
     compartments.get(r.compartment).push(r);
   }
+
   const out = [];
-  for (const [cname, compartments] of byContract) {
-    out.push(`Contract: ${cname}`);
-    for (const [compartment, list] of compartments) {
-      out.push(`  [${compartment}]`);
-      for (const r of list) {
-        const toks = r.tokens.slice(0, 10).join(', ') + (r.tokens.length > 10 ? `, +${r.tokens.length - 10} more` : '');
-        out.push(`    ${r.file}:${r.startLine} ${r.name} — ${toks}`);
+  const allNames = new Set([...contractNames, ...byContract.keys()]);
+  for (const cname of [...allNames].sort()) {
+    // --- drift summary (only when we have the defined-token set) --------------
+    const definedTokens = defined ? defined.get(cname) : null;
+    const refMap = refCompartments.get(cname) || new Map();
+    let driftLines = [];
+    if (definedTokens && definedTokens.size) {
+      const unreferenced = [], oneSided = [];
+      let satisfied = 0;
+      for (const [tok] of definedTokens) {
+        const comps = refMap.get(tok);
+        const n = comps ? comps.size : 0;
+        if (n === 0) unreferenced.push(tok);
+        else if (n === 1) oneSided.push([tok, [...comps][0]]);
+        else satisfied++;
+      }
+      const total = definedTokens.size;
+      const flag = unreferenced.length ? ' 🔴 DRIFT' : (oneSided.length ? ' ⚠️' : '');
+      out.push(`Contract: ${cname} — ${satisfied}/${total} tokens satisfied · ${oneSided.length} one-sided · ${unreferenced.length} unreferenced${flag}`);
+      if (unreferenced.length) {
+        driftLines.push('  🔴 unreferenced — defined in the contract, NO code references it (code has drifted off the contract, or the compartment is not indexed):');
+        for (const t of unreferenced.slice(0, 40)) driftLines.push(`       ${t}`);
+        if (unreferenced.length > 40) driftLines.push(`       … +${unreferenced.length - 40} more`);
+      }
+      if (oneSided.length) {
+        driftLines.push('  ⚠️ one-sided — only one compartment references the token (a cross-compartment seam needs both sides; the other half is missing):');
+        for (const [t, comp] of oneSided.slice(0, 40)) driftLines.push(`       ${t} — only [${comp}]`);
+        if (oneSided.length > 40) driftLines.push(`       … +${oneSided.length - 40} more`);
+      }
+    } else {
+      out.push(`Contract: ${cname}`);
+      if (defined && !filtered.length) driftLines.push('  (contract defines no distinctive wire tokens — nothing to drift-check)');
+    }
+    for (const l of driftLines) out.push(l);
+
+    // --- who references it (the seam detail) ---------------------------------
+    const compartments = byContract.get(cname);
+    if (compartments && compartments.size) {
+      out.push('  referenced by:');
+      for (const [compartment, list] of compartments) {
+        out.push(`    [${compartment}]`);
+        for (const r of list) {
+          const toks = r.tokens.slice(0, 10).join(', ') + (r.tokens.length > 10 ? `, +${r.tokens.length - 10} more` : '');
+          out.push(`      ${r.file}:${r.startLine} ${r.name} — ${toks}`);
+        }
       }
     }
   }
   if (!includeTests) out.push('(test files excluded; includeTests=true to show)');
   return out.join('\n');
+}
+
+// Per-contract drift summary across the whole project, for the visualizer to
+// COLOR each contract-edge. Returns Map(contractName -> {total, satisfied,
+// oneSided, unreferenced, status}) where status is 'ok' | 'one-sided' | 'drift'
+// (drift = at least one token no code references; one-sided = a token only one
+// compartment touches). Empty on a pre-v4 db (no contract_tokens table).
+export function contractDriftByName(db, project, includeTests = false) {
+  const out = new Map();
+  let defined;
+  try {
+    defined = db.prepare('SELECT c.name name, ct.token token FROM contract_tokens ct JOIN contracts c ON c.id=ct.contract WHERE ct.project=?').all(project);
+  } catch {
+    return out; // contract_tokens table absent (old schema)
+  }
+  const refs = db.prepare(
+    `SELECT c.name name, s.compartment compartment, s.file file, e.token token
+       FROM edges e JOIN symbols s ON s.id=e.src JOIN contracts c ON c.id=e.dst
+      WHERE e.project=@project AND e.type='REFERENCES'`).all({ project });
+  const refMap = new Map(); // name -> Map(token -> Set(compartment))
+  for (const r of refs) {
+    if (!r.token || (!includeTests && isTest(r.file))) continue;
+    if (!refMap.has(r.name)) refMap.set(r.name, new Map());
+    const m = refMap.get(r.name);
+    if (!m.has(r.token)) m.set(r.token, new Set());
+    m.get(r.token).add(r.compartment);
+  }
+  const byName = new Map(); // name -> Set(token)
+  for (const d of defined) {
+    if (!byName.has(d.name)) byName.set(d.name, new Set());
+    byName.get(d.name).add(d.token);
+  }
+  for (const [name, toks] of byName) {
+    let satisfied = 0, oneSided = 0, unreferenced = 0;
+    const m = refMap.get(name) || new Map();
+    for (const t of toks) {
+      const n = m.get(t)?.size || 0;
+      if (n === 0) unreferenced++;
+      else if (n === 1) oneSided++;
+      else satisfied++;
+    }
+    const status = unreferenced > 0 ? 'drift' : (oneSided > 0 ? 'one-sided' : 'ok');
+    out.set(name, { total: toks.size, satisfied, oneSided, unreferenced, status });
+  }
+  return out;
 }
 
 export function pathBetween(db, project, from, to, fromRepo, toRepo, maxHops = 12) {

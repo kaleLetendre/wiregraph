@@ -24,8 +24,8 @@ import { existsSync, realpathSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { connect, schemaVersion, SCHEMA_VERSION } from '../store/sqlite.js';
 import * as Q from '../store/sqlite-query.js';
-import { runBuild } from '../build.js';
-import { readState, updateState, findIndexedRoot, wiregraphDir } from '../../scripts/lib/state.mjs';
+import { runBuild, reindexFiles } from '../build.js';
+import { readState, updateState, findIndexedRoot, wiregraphDir, owningMember, statusAdvisories } from '../../scripts/lib/state.mjs';
 import { changedSince, projectRepos, upstreamDivergence } from '../../scripts/lib/git.mjs';
 import { record, estTokens } from '../../scripts/lib/metrics.mjs';
 
@@ -146,7 +146,10 @@ async function ensureFresh() {
   lastFreshAt = now; // claim the window up front so concurrent reads don't stampede
   const stale = staleNow();
   if (!stale.length) return;
-  try { await runBuild({ target: PROJECT, project: PROJECT, files: stale }); }
+  // A stale file may live under a linked member — reindexFiles attributes each to
+  // its owning member and fans the update into every graph that includes it, so a
+  // read stays self-healing across the whole union, not just this project's tree.
+  try { await reindexFiles(stale, PROJECT, { fanOut: true }); }
   catch { /* best-effort: serve what we have rather than fail the read */ }
 }
 
@@ -160,7 +163,10 @@ async function ensureFresh() {
 let upstreamBannerSent = false; // once per process — not on every read
 function upstreamCaveatLine() {
   let div;
-  try { div = upstreamDivergence(PROJECT); } catch { return null; }
+  // Home-only: the once-per-process banner flags THIS project's checkout; a linked
+  // member parked on an old branch is not this project's concern (graph_status
+  // reports the full union on demand).
+  try { div = upstreamDivergence(PROJECT, { homeOnly: true }); } catch { return null; }
   const behind = (div || []).filter((d) => d.behind > 0);
   if (!behind.length) return null;
   const parts = behind.map((d) =>
@@ -302,7 +308,7 @@ server.registerTool('trace_callers', {
 
 // --- trace_contract ---------------------------------------------------------
 server.registerTool('trace_contract', {
-  description: 'Cross-compartment wire seam: which code symbols, in which compartments, reference a given contract (matched on its wire tokens — channel paths and payload fields). This links a producer in one compartment to the consumer in another that handles the same wire message. Edges are HEURISTIC (evidence: contract-match): "mentions a token this contract defines", not verified to implement it — confirm the exact field/endpoint with a targeted get_source.',
+  description: 'Cross-compartment wire seam AND code↔contract DRIFT check: which code symbols, in which compartments, reference a given contract (matched on its wire tokens — channel paths and payload fields), PLUS which of the contract\'s tokens are unreferenced or only touched by one side. Every call diffs the contract\'s FULL defined-token set against the code: 🔴 unreferenced = defined in the contract but NO code references it (code drifted off the contract), ⚠️ one-sided = only one compartment references it (a cross-compartment seam missing its other half), satisfied = both sides present. A clean report is EARNED, not assumed — trust the drift lines. Edges are HEURISTIC (evidence: contract-match): "mentions a token this contract defines", not verified to implement it, and a token can be present but with a drifted PAYLOAD SHAPE the string match can\'t see — confirm the exact field/endpoint with a targeted get_source.',
   inputSchema: {
     contract: z.string().describe('Substring of the contract name, e.g. "Heartbeat", "Provisioning"'),
     token: z.string().optional().describe('Restrict to symbols referencing a specific wire token, e.g. "order_id"'),
@@ -310,7 +316,13 @@ server.registerTool('trace_contract', {
   },
 }, async ({ contract, token, includeTests }) =>
   freshRead((db) => {
-    const out = Q.traceContract(db, PROJECT, contract, token, includeTests);
+    let out = Q.traceContract(db, PROJECT, contract, token, includeTests);
+    // traceContract is a pure db fn (reads REFERENCES only); the inference-staleness
+    // flag lives in state, so append its warning HERE rather than contorting the query.
+    const state = readState(PROJECT);
+    if (state?.seamStaleSinceInference) {
+      out += '\n⚠ a route may have changed since the last contract inference — the inferred spec was NOT regenerated, so a newly added/removed endpoint may be missing here. Run /wiregraph-rebuild to re-infer the seams.';
+    }
     recordUse('trace_contract', out);
     return text(out);
   }));
@@ -355,17 +367,21 @@ server.registerTool('graph_status', {
   try { changed = Q.staleAmong(db, PROJECT, changedSince(PROJECT, state?.reposLastSha || {}).files); }
   catch { /* git not available — skip staleness */ }
   if (changed.length) {
-    const preview = changed.slice(0, 5).map((f) => f.replace(PROJECT + '/', '')).join(', ');
+    // Strip the OWNING member's prefix (own root or a linked member), not just
+    // PROJECT's — a stale file under a linked member would otherwise print its full
+    // absolute path here.
+    const strip = (f) => { const m = owningMember(f, PROJECT); return m ? f.slice(f.startsWith(m + '/') ? m.length + 1 : 0) : f; };
+    const preview = changed.slice(0, 5).map(strip).join(', ');
     lines.push(`STALE: ${changed.length} changed source file(s) (${preview}${changed.length > 5 ? ', …' : ''}). Run update_graph to refresh.`);
   } else {
     lines.push('Fresh: no source changes detected since last index.');
   }
-  // Incremental updates that added/removed/renamed symbols can leave cross-file
-  // caller edges (resolved by name) approximate until a full rebuild. Surface it so
-  // "fresh" is not read as "every caller edge is guaranteed correct."
-  if (state?.structuralDriftSinceFullBuild) {
-    lines.push('Note: symbols were added/removed/renamed since the last full build — some cross-file caller edges may be approximate. Run update_graph {full:true} (/wiregraph-rebuild) to reconcile.');
-  }
+  // Honesty flags surfaced after "fresh": incremental updates that added/removed/
+  // renamed symbols can leave cross-file caller edges approximate (structural drift),
+  // and a route added/removed in a contract-bearing compartment is invisible to the
+  // seams until a full rebuild re-infers (seam staleness). statusAdvisories renders the
+  // exact lines from state so "fresh" is never read as "everything is guaranteed correct."
+  lines.push(...statusAdvisories(state));
   // Upstream divergence: the graph mirrors the working tree, so "fresh" can still
   // mean "indexing a branch behind origin". Report ahead/behind vs each repo's
   // @{upstream} — a trust caveat, not a staleness error (no re-index would fix it;
@@ -423,7 +439,9 @@ server.registerTool('update_graph', {
         return text('Graph already current — no changed source files detected.');
       }
     }
-    await runBuild({ target: PROJECT, project: PROJECT, files: targets });
+    // Attribute each file to its owning member and fan the update into every graph
+    // that includes it (a linked member's edit updates both dbs).
+    await reindexFiles(targets, PROJECT, { fanOut: true });
     updateState(PROJECT, { reposLastSha: newShas }, VERSION);
     return text(`Incremental update complete: re-indexed ${targets.length} file(s).`);
   } catch (e) {

@@ -9,10 +9,10 @@
 // The inference is heuristic — a draft to REVIEW and commit, not authoritative.
 // See docs/contracts.md. Works from any subdir of an indexed workspace.
 
-import { readdirSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, copyFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { findIndexedRoot, readState, updateState } from './lib/state.mjs';
-import { extractCandidates, clusterSeams, synthesizeAsyncApi, formatSeams } from '../src/contracts/infer.js';
+import { readdirSync, statSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, copyFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { findIndexedRoot, readState, updateState, memberRoots, wiregraphDir } from './lib/state.mjs';
+import { extractCandidatesAcross, clusterSeams, synthesizeAsyncApi, formatSeams } from '../src/contracts/infer.js';
 
 const SPEC_NAME = 'wiregraph-inferred.asyncapi.yaml';
 
@@ -24,16 +24,33 @@ function resolveRoot(arg) {
   try { return realpathSync(raw); } catch { return raw; }
 }
 
-// Look for an existing contracts home directly under the workspace root: a dir
-// named `contracts`/`asyncapi`, or any `*-contracts` dir (this also catches a
-// sibling repo named `*-contracts`). Mirrors resolveContractsDir in src/build.js
-// so a freshly written spec is auto-detected on the next build. null = none yet.
+// Look for an existing contracts home for the workspace root. Mirrors
+// detectContractsDirs in src/build.js so a freshly written spec is auto-detected on
+// the next build, returning the FIRST home found: `root` itself when its basename
+// looks like a contracts dir or it directly holds *.asyncapi.y(a)ml files (a
+// standalone *-contracts repo), else the first child dir named `contracts`/
+// `asyncapi`/`*-contracts` — matched case-insensitively, following a symlink-to-dir.
+// null = none yet.
+function isContractsDirName(name) {
+  return /^(contracts|asyncapi)$/i.test(name) || /-contracts$/i.test(name);
+}
+function hasTopLevelSpec(dir) {
+  try {
+    for (const f of readdirSync(dir)) if (/\.asyncapi\.ya?ml$/i.test(f)) return true;
+  } catch { /* unreadable */ }
+  return false;
+}
 function contractsHome(root) {
+  if (isContractsDirName(basename(root)) || hasTopLevelSpec(root)) return root;
   try {
     for (const e of readdirSync(root, { withFileTypes: true })) {
-      if (e.isDirectory() && (e.name === 'contracts' || e.name === 'asyncapi' || /-contracts$/.test(e.name))) {
-        return join(root, e.name);
+      if (!isContractsDirName(e.name)) continue;
+      const full = join(root, e.name);
+      let isDir = e.isDirectory();
+      if (!isDir && e.isSymbolicLink()) {
+        try { isDir = statSync(full).isDirectory(); } catch { isDir = false; }
       }
+      if (isDir) return full;
     }
   } catch { /* unreadable root */ }
   return null;
@@ -46,7 +63,9 @@ function main(argv) {
     process.exit(2);
   }
   const root = resolveRoot(projectArg);
-  const seams = clusterSeams(extractCandidates(root));
+  // Span every linked member so /wiregraph-contracts infers across the union, not
+  // just the home root.
+  const seams = clusterSeams(extractCandidatesAcross(memberRoots(root)));
 
   process.stdout.write(formatSeams(seams) + '\n');
   if (!seams.length) return; // formatSeams already explains the likely reasons
@@ -73,11 +92,16 @@ function main(argv) {
   // extended (payload schemas, direction), and committed as the user's own — a
   // re-run that overwrote those edits with regenerated skeletons would destroy
   // real work. If the file exists and differs from what we'd write, back it up
-  // first so the edits are always recoverable.
-  let backedUp = false;
+  // first so the edits are always recoverable. The backup lands under the
+  // gitignored .wiregraph/ (timestamped), NOT as a stray .bak in the tracked
+  // source contracts/ — a committable backup file would be noise in the user's diff.
+  let backupPath = null;
   if (existsSync(out) && readFileSync(out, 'utf8') !== yaml) {
-    copyFileSync(out, out + '.bak');
-    backedUp = true;
+    const backupDir = join(wiregraphDir(root), 'contract-backups');
+    mkdirSync(backupDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    backupPath = join(backupDir, `${basename(out)}.${stamp}.bak`);
+    copyFileSync(out, backupPath);
   }
   writeFileSync(out, yaml);
 
@@ -86,7 +110,7 @@ function main(argv) {
   if (readState(root)) updateState(root, { contractsDir: dir, wireSeams: seams.length });
 
   process.stdout.write(`\nWrote ${seams.length} channel(s) to ${out}${created ? ' (created contracts/)' : ''}.\n`);
-  if (backedUp) process.stdout.write(`Existing draft differed — backed it up to ${out}.bak before overwriting.\n`);
+  if (backupPath) process.stdout.write(`Existing draft differed — backed it up to ${backupPath} before overwriting.\n`);
   process.stdout.write(
     'This is a DRAFT — review/commit it as your own. Refresh the graph (the read tools '
     + 'self-heal, or run /wiregraph-update), then walk the seams with trace_contract / '

@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readState, findIndexedRoot, updateState } from '../lib/state.mjs';
 import { changedSince } from '../lib/git.mjs';
+import { record, migrateMetrics } from '../lib/metrics.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -47,9 +48,31 @@ async function main() {
   let payload = {};
   try { payload = JSON.parse(await readStdin()); } catch { /* tolerate empty */ }
   const PROJECT = project(payload);
+
+  // Soft metrics migration (CHANGE B). SessionStart is the PRIMARY post-update entry
+  // point — it runs first thing every session, so it catches every updating user no
+  // matter their flow. Version-gated + idempotent + best-effort: a no-op once the
+  // project is already at METRICS_VERSION, a no-op on an unindexed dir (no state to
+  // stamp), and it NEVER throws. Run it BEFORE this session's boundary below so that
+  // boundary lands in the FRESH (post-archive) log, not in the archived one. Placed
+  // ahead of the 'off' early-exit so an updating user is migrated regardless of posture.
+  try { migrateMetrics(PROJECT); } catch { /* best-effort */ }
+
   const state = readState(PROJECT);
 
   if (state && state.autoUpdate === 'off') emit('');
+
+  // Context boundary / session segmentation (CHANGE A): a NEW SESSION means the prior
+  // resident context is gone, so a SessionStart CLOSES the residency window for every
+  // get_source before it. Recording a boundary here segments the metrics timeline per
+  // session — a read only accrues turns from its OWN session, and a pre-v2 read with no
+  // following turns correctly scores ~0 recurring. Record for EVERY source
+  // (startup/resume/clear/fork) EXCEPT 'compact': the PreCompact hook already marks
+  // compaction, and a source==='compact' SessionStart would double-count it. reason =
+  // the source. Best-effort append (record() no-ops on an 'off' posture and never throws).
+  if (payload?.source && payload.source !== 'compact') {
+    record(PROJECT, { sessionId: payload?.session_id || null, kind: 'boundary', reason: payload.source });
+  }
 
   if (!state) {
     // Not initialized. Only nudge if a CLAUDE.md directive isn't already pointing

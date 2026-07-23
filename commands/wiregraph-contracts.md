@@ -34,8 +34,9 @@ Do the steps in order:
    which is what cross-compartment contracts depend on: index 2+ compartments
    together under one parent — either related repos cloned side-by-side, OR the
    packages of a monorepo (each with its own manifest) — and `/wiregraph-init` that
-   parent. wiregraph can only see a shared route if both compartments are indexed
-   together. Stop here.
+   parent. If the two services are **already indexed as separate graphs**, connect
+   them with `/wiregraph-link` instead of re-indexing. wiregraph can only see a
+   shared route if both compartments are in one graph. Stop here.
 
 3. **If it found seams**, ask the user with AskUserQuestion whether to write the
    draft contract. Make clear it's a starting point they own and should review/commit.
@@ -54,8 +55,11 @@ Do the steps in order:
    compartments reference the contract) and `path_between` (a producer in one
    compartment to the consumer in another). Summarize what was linked.
 
-Note: cross-compartment attribution needs the compartments indexed **together**
-under one root. A compartment boundary is a `.git` OR a package/module manifest, so
-a monorepo of packages works — but repos indexed *separately* (each its own
-`/wiregraph-init`) can't see a shared route between them; guide the user to the
-workspace model above.
+Note: cross-compartment attribution needs the compartments in **one graph**. There
+are two ways to get that: **either** index them together under one parent (related
+repos side-by-side, or a monorepo's packages — a compartment boundary is a `.git`
+OR a package/module manifest), **or** connect two separately-indexed graphs with
+`/wiregraph-link`, which includes one as a member of the other and re-infers seams
+across the union. Two repos each with their own `/wiregraph-init` and no link
+between them still can't see a shared route — guide the user to link them or index
+them together.
