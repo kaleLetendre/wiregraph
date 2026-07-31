@@ -6,7 +6,7 @@
 // in-repo path_between, query_sql guards, schema versioning + migration, and
 // incremental idempotency. Self-contained — no external workspace needed.
 
-import { mkdtempSync, cpSync, appendFileSync, rmSync, realpathSync, existsSync, writeFileSync, utimesSync, readFileSync, mkdirSync, symlinkSync, renameSync } from 'node:fs';
+import { mkdtempSync, cpSync, appendFileSync, rmSync, realpathSync, existsSync, writeFileSync, utimesSync, readFileSync, mkdirSync, symlinkSync, renameSync, chmodSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +14,7 @@ import { dirname } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { runBuild } from '../src/build.js';
-import { connect, schemaVersion, SCHEMA_VERSION, loadGraph } from '../src/store/sqlite.js';
+import { connect, schemaVersion, SCHEMA_VERSION, loadGraph, shouldStealLock } from '../src/store/sqlite.js';
 import { Graph } from '../src/model.js';
 import * as Q from '../src/store/sqlite-query.js';
 
@@ -80,7 +80,42 @@ async function fixtureTests() {
   // query_sql: valid SELECT + guards
   has(Q.querySql(conn, "SELECT name FROM symbols WHERE name='a_main'"), 'a_main', 'query_sql SELECT works');
   has(Q.querySql(conn, 'DELETE FROM symbols'), 'Refused', 'query_sql rejects DELETE');
+  has(Q.querySql(conn, "UPDATE symbols SET name='x'"), 'Refused', 'query_sql rejects UPDATE (non-SELECT start)');
   has(Q.querySql(conn, 'SELECT 1; DROP TABLE symbols'), 'Refused', 'query_sql rejects multi-statement');
+  has(Q.querySql(conn, "SELECT load_extension('/tmp/x')"), 'Refused', 'query_sql rejects load_extension');
+  // read-only SELECTs that the old broad keyword blocklist wrongly refused: a keyword
+  // inside a LIKE literal, and the scalar replace() function (not the REPLACE statement).
+  ok(!String(Q.querySql(conn, "SELECT name FROM symbols WHERE name LIKE 'create%'")).includes('Refused'),
+    'query_sql allows a keyword inside a LIKE literal');
+  ok(!String(Q.querySql(conn, "SELECT replace(name,'x','y') AS r FROM symbols LIMIT 1")).includes('Refused'),
+    'query_sql allows the scalar replace() function');
+
+  // V2: a leading WITH clause CAN front a data-modifying statement in SQLite
+  // (`WITH t AS (...) DELETE FROM ...`), which the SELECT/WITH-start guard does NOT
+  // catch. `PRAGMA query_only=ON` makes every such write throw ("attempt to write a
+  // readonly database"), surfaced as a "SQL error". Assert the write did NOT execute
+  // by checking the symbols row count is UNCHANGED after each attempt.
+  const symCount = () => conn.prepare('SELECT count(*) AS n FROM symbols').all()[0].n;
+  {
+    const before = symCount();
+    const del = String(Q.querySql(conn, 'WITH t AS (SELECT 1) DELETE FROM symbols'));
+    ok(!del.includes('(no rows)') && del.includes('error'), 'query_sql refuses WITH-prefixed DELETE (errors, not executes)');
+    eq(symCount(), before, 'query_sql WITH-DELETE did not delete any rows');
+
+    const ins = String(Q.querySql(conn, "WITH t AS (SELECT 1) INSERT INTO symbols(name,file,kind) VALUES('x','p','y')"));
+    ok(ins.includes('error'), 'query_sql refuses WITH-prefixed INSERT (errors, not executes)');
+    eq(symCount(), before, 'query_sql WITH-INSERT did not insert any rows');
+
+    const upd = String(Q.querySql(conn, "WITH t AS (SELECT 1) UPDATE symbols SET name='z'"));
+    ok(upd.includes('error'), 'query_sql refuses WITH-prefixed UPDATE (errors, not executes)');
+    // a mass UPDATE would not change the row count, so also confirm no row was renamed to 'z'
+    eq(conn.prepare("SELECT count(*) AS n FROM symbols WHERE name='z'").all()[0].n, 0,
+      'query_sql WITH-UPDATE did not modify any rows');
+    eq(symCount(), before, 'query_sql WITH-UPDATE left the row count unchanged');
+  }
+  // A plain read still works AFTER query_only=ON was set on this connection (the
+  // pragma does not break the read path).
+  has(Q.querySql(conn, "SELECT name FROM symbols WHERE name='a_main'"), 'a_main', 'query_sql SELECT still works after query_only pragma');
 
   const base = edgeCounts(conn, project);
   conn.close();
@@ -109,6 +144,48 @@ async function fixtureTests() {
   conn = connect(db, { readonly: true });
   eq(schemaVersion(conn), SCHEMA_VERSION, 'reset migrates a stale-version db back to current');
   has(Q.findSymbol(conn, project, 'a_main'), 'a.c', 'queries work after migration');
+  conn.close();
+
+  rmSync(work, { recursive: true, force: true });
+}
+
+// Full-build idempotency (M7): loadGraph upserts nodes idempotently but INSERTs edges
+// (deduped only within one batch), so a FULL (non-`files`) build must always reset —
+// otherwise re-running `node src/build.js .` (no --reset) re-inserts every edge on top
+// of the existing rows, doubling edge counts on the 2nd run. runBuild now forces
+// reset:true on the full-build path regardless of the flag. Assert: two full builds
+// with NO reset flag (opts default reset:false) leave edge + symbol counts unchanged,
+// and a known edge (a_main -> a_helper CALLS) exists exactly once — not doubled.
+async function fullBuildIdempotencyTest() {
+  const work = mkdtempSync(join(tmpdir(), 'cg-idem-'));
+  const src = join(work, 'src');
+  cpSync(FIXTURE, src, { recursive: true });
+  const project = realpathSync(src);
+  const db = join(work, 'graph.db');
+
+  const knownEdge = (conn) => conn.prepare(
+    "SELECT count(*) n FROM edges e JOIN symbols s1 ON s1.id=e.src JOIN symbols s2 ON s2.id=e.dst " +
+    "WHERE e.project=? AND e.type='CALLS' AND s1.name='a_main' AND s2.name='a_helper'",
+  ).get(project).n;
+  const totals = (conn) => ({
+    edges: conn.prepare('SELECT count(*) n FROM edges WHERE project=?').get(project).n,
+    symbols: conn.prepare('SELECT count(*) n FROM symbols WHERE project=?').get(project).n,
+  });
+
+  // First full build via the CLI-equivalent path — NO files, NO reset flag.
+  await runBuild({ target: src, project, db });
+  let conn = connect(db, { readonly: true });
+  const first = totals(conn);
+  eq(knownEdge(conn), 1, 'full-build idempotency: a_main->a_helper CALLS exists once after build 1');
+  conn.close();
+
+  // Second identical full build over the same tree — still NO reset flag.
+  await runBuild({ target: src, project, db });
+  conn = connect(db, { readonly: true });
+  const second = totals(conn);
+  eq(second.edges, first.edges, 'full-build idempotency: edge count unchanged after a 2nd non-reset full build');
+  eq(second.symbols, first.symbols, 'full-build idempotency: symbol count unchanged after a 2nd non-reset full build');
+  eq(knownEdge(conn), 1, 'full-build idempotency: a_main->a_helper CALLS still exists exactly once (not doubled)');
   conn.close();
 
   rmSync(work, { recursive: true, force: true });
@@ -193,10 +270,13 @@ async function concurrencyTest() {
   has(Q.findSymbol(conn, project, 'conc_u'), 'util.c', 'concurrent writers: util.c update survived');
   conn.close();
 
-  // A lockfile left by a crashed writer (older than the staleness window) must be
-  // stolen, not block forever / time out — else one dead process wedges all
-  // future writes. Backdate a leftover lock and assert the next build succeeds.
-  writeFileSync(db + '.lock', '999999');
+  // A lockfile left by a crashed writer must be stolen, not block forever / time out
+  // — else one dead process wedges all future writes. Use a guaranteed-dead PID
+  // (above Linux pid_max → process.kill throws ESRCH → the M9 liveness-steal fires
+  // immediately); 999999 could be a LIVE pid on a busy machine and would wait the
+  // full LOCK_TIMEOUT_MS. The mtime backdate below is now irrelevant under
+  // liveness-steal but left as a harmless belt-and-suspenders.
+  writeFileSync(db + '.lock', '2147483647');
   const longAgo = Date.now() / 1000 - 120; // 2 min old, well past LOCK_STALE_MS
   utimesSync(db + '.lock', longAgo, longAgo);
   appendFileSync(join(src, 'a.c'), '\nint after_crash(int n) { return a_helper(n); }\n');
@@ -207,6 +287,104 @@ async function concurrencyTest() {
   ok(!existsSync(db + '.lock'), 'stale lock is cleaned up after the steal');
 
   rmSync(work, { recursive: true, force: true });
+}
+
+// L16: ensureFresh single-flight + advance-on-success. Reads that arrive while a
+// refresh is in flight must COALESCE onto that one reindex (no stampede, no stale
+// serve), and lastFreshAt must advance only on SUCCESS so a failed best-effort
+// reindex is retried on the very next read instead of being suppressed for a full
+// TTL. Drives the real ensureFresh with injected staleNow/reindexFiles — no db or
+// git needed. (Importing server.js is safe: its isCli guard keeps the transport
+// from starting on import, so this does not hang the suite.)
+async function ensureFreshTests() {
+  const { ensureFresh, __setTestHooks, __resetFresh, __getLastFreshAt } = await import('../src/mcp/server.js');
+
+  // 1) Coalescing + no-stale-serve: two calls, the second dispatched while the
+  //    first's reindex is still in flight, share a SINGLE reindex and BOTH stay
+  //    pending until it settles (the second caller must NOT return early serving
+  //    stale data). We assert both are still unresolved while the gate is held, then
+  //    release and confirm a single reindex ran.
+  {
+    __resetFresh();
+    let calls = 0, release;
+    const gate = new Promise((r) => { release = r; });
+    __setTestHooks({ staleNow: () => ['a.c'], reindexFiles: async () => { calls++; await gate; } });
+    const p1 = ensureFresh();
+    const p2 = ensureFresh();   // in-flight → must coalesce, not start a second reindex
+    // Neither ensureFresh may resolve while the reindex is gated: race each against a
+    // short timer sentinel and assert the sentinel wins (both still pending).
+    const sentinel = Symbol('pending');
+    const timer = () => new Promise((r) => setTimeout(() => r(sentinel), 25));
+    const w1 = await Promise.race([p1.then(() => 'resolved'), timer()]);
+    const w2 = await Promise.race([p2.then(() => 'resolved'), timer()]);
+    eq(w1, sentinel, 'ensureFresh: first caller stays pending until the in-flight reindex settles');
+    eq(w2, sentinel, 'ensureFresh: second caller coalesces and waits (no stale early-return)');
+    release();
+    await Promise.all([p1, p2]);
+    eq(calls, 1, 'ensureFresh: concurrent reads coalesce onto a single reindex');
+  }
+
+  // 2) Advance-on-success: after a successful reindex the window is claimed, so an
+  //    immediate follow-up takes the fast path and does NOT re-index.
+  {
+    __resetFresh();
+    let calls = 0;
+    __setTestHooks({ staleNow: () => ['a.c'], reindexFiles: async () => { calls++; } });
+    await ensureFresh();
+    ok(__getLastFreshAt() > 0, 'ensureFresh: lastFreshAt advances after a successful reindex');
+    await ensureFresh();
+    eq(calls, 1, 'ensureFresh: a fresh window skips re-indexing (advance-on-success)');
+  }
+
+  // 3) No-advance-on-failure: a rejecting reindex is swallowed (best-effort), the
+  //    window stays unclaimed, and the next read RE-attempts the reindex.
+  {
+    __resetFresh();
+    let calls = 0;
+    __setTestHooks({ staleNow: () => ['a.c'], reindexFiles: async () => { calls++; throw new Error('boom'); } });
+    let threw = false;
+    try { await ensureFresh(); } catch { threw = true; }
+    ok(!threw, 'ensureFresh: a failed reindex does not throw (best-effort)');
+    eq(__getLastFreshAt(), 0, 'ensureFresh: lastFreshAt NOT advanced after a failed reindex');
+    await ensureFresh();
+    eq(calls, 2, 'ensureFresh: a failed reindex is retried on the next read');
+  }
+
+  __resetFresh(); // leave module state clean
+}
+
+// The db lock steals based on the holder's PID LIVENESS, not a wall-clock timer
+// (bug M9): a LIVE writer — incrementalBuild holds the lock through the whole
+// parse/walk, which can outlast any fixed 30s window — must keep its lock, while
+// a DEAD (crashed) holder is stolen immediately. Exercise the pure predicate with
+// an injected liveness fn so the logic is deterministic and never waits for real.
+function lockStealDecisionTest() {
+  const dead = () => false;   // holder pid resolves to no live process (ESRCH)
+  const alive = () => true;   // holder pid is a live process
+
+  const HARD_MAX = 5 * 60_000; // LOCK_HARD_MAX_MS
+  const STALE = 30_000;        // LOCK_STALE_MS
+
+  // Dead holder, fresh lock -> steal (immediate crash recovery).
+  eq(shouldStealLock({ pid: 999999, ageMs: 10, aliveFn: dead }), 'steal', 'lock: dead holder is stolen');
+
+  // Live holder below the hard-max -> wait. This is the M9 regression: a slow but
+  // live incremental build keeps its lock instead of being robbed.
+  eq(shouldStealLock({ pid: 4242, ageMs: 90_000, aliveFn: alive }), 'wait', 'lock: live slow holder is NOT stolen');
+  eq(shouldStealLock({ pid: 4242, ageMs: HARD_MAX - 1, aliveFn: alive }), 'wait', 'lock: live holder just under hard-max still waits');
+
+  // Live holder past the hard-max backstop -> steal (PID reuse / wedged holder).
+  eq(shouldStealLock({ pid: 4242, ageMs: HARD_MAX + 1, aliveFn: alive }), 'steal', 'lock: live holder past hard-max is stolen (backstop)');
+
+  // No readable PID yet (the openSync-'wx'-won-but-PID-not-written race) -> fall
+  // back to the old mtime staleness check.
+  eq(shouldStealLock({ pid: null, ageMs: STALE - 1, aliveFn: alive }), 'wait', 'lock: unparseable PID below stale window waits');
+  eq(shouldStealLock({ pid: null, ageMs: STALE + 1, aliveFn: alive }), 'steal', 'lock: unparseable PID past stale window is stolen (mtime fallback)');
+
+  // A definitely-dead PID drives the real default liveness probe to steal, and a
+  // live one (this very process) to wait — no aliveFn injected, no real blocking.
+  eq(shouldStealLock({ pid: 2147483647, ageMs: 10 }), 'steal', 'lock: real probe steals a non-existent PID');
+  eq(shouldStealLock({ pid: process.pid, ageMs: 90_000 }), 'wait', 'lock: real probe keeps this live process\' lock');
 }
 
 // A --reset rebuild wipes the project's rows before reloading. If the reload
@@ -246,6 +424,55 @@ async function rebuildDurabilityTest() {
 
   conn = connect(db, { readonly: true });
   has(Q.findSymbol(conn, project, 'keepme'), 'match(es)', 'durability: failed --reset leaves the prior graph intact');
+  conn.close();
+
+  rmSync(work, { recursive: true, force: true });
+}
+
+// M6 — incremental durability. incrementalBuild prunes each changed file (each prune
+// COMMITS in the in-memory db) BEFORE reloading the fresh symbols. If the reload
+// throws, close() must DISCARD the in-memory mutations rather than persist the
+// pruned-but-not-reloaded db over the good file (which would erase the edited file's
+// symbols until a full rebuild). Also assert a NORMAL incremental still persists, so
+// the fix isn't "never persist".
+async function incrementalDurabilityTest() {
+  const work = realpathSync(mkdtempSync(join(tmpdir(), 'cg-incr-dur-')));
+  const project = join(work, 'proj');
+  mkdirSync(project);
+  const db = join(project, '.wiregraph', 'graph.db');
+  const aFile = join(project, 'a.js');
+  writeFileSync(join(project, 'package.json'), '{"name":"proj","type":"module"}');
+  writeFileSync(aFile, 'export function foo(){ return 1; }\n');
+  await runBuild({ target: project, project, db, reset: true });
+
+  let conn = connect(db, { readonly: true });
+  has(Q.findSymbol(conn, project, 'foo'), 'match(es)', 'incr-dur: baseline symbol foo present');
+  conn.close();
+
+  // Positive regression: a normal incremental (no forced error) still persists.
+  writeFileSync(aFile, 'export function bar(){ return 1; }\n');
+  await runBuild({ target: project, project, db, files: [aFile] });
+  conn = connect(db, { readonly: true });
+  has(Q.findSymbol(conn, project, 'bar'), 'match(es)', 'incr-dur: normal incremental persists the rename (bar present)');
+  ok(!String(Q.findSymbol(conn, project, 'foo')).includes('match(es)'), 'incr-dur: normal incremental drops the old symbol (foo gone)');
+  conn.close();
+
+  // Force the reload to fail: stamp a schema version NEWER than this build. incrementalBuild
+  // prunes the changed file, THEN loadGraph's newer-schema guard throws — the exact M6
+  // scenario. On disk the graph currently holds `bar`.
+  const w = connect(db);
+  w.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version',?)").run(String(SCHEMA_VERSION + 1));
+  w.close();
+
+  writeFileSync(aFile, 'export function baz(){ return 1; }\n');
+  let threw = false;
+  try { await runBuild({ target: project, project, db, files: [aFile] }); }
+  catch { threw = true; }
+  ok(threw, 'incr-dur: incremental against a newer-schema db throws (reload guard)');
+
+  conn = connect(db, { readonly: true });
+  has(Q.findSymbol(conn, project, 'bar'), 'match(es)', 'incr-dur: failed incremental preserves the prior symbol (bar NOT pruned to empty)');
+  ok(!String(Q.findSymbol(conn, project, 'baz')).includes('match(es)'), 'incr-dur: failed incremental did not persist the half-applied reload (baz absent)');
   conn.close();
 
   rmSync(work, { recursive: true, force: true });
@@ -457,6 +684,50 @@ async function measuredRecurringTests() {
   const measuredRep = M.formatReport(agg, '/tmp/x', {});
   has(measuredRep, 'measured', 'recur: measured report labels the recurring figure measured');
   has(measuredRep, 'boundaries', 'recur: measured report states the turn/boundary counts');
+}
+
+// Per-session report filter (L14): 'use' events logged by the long-lived MCP server
+// usually carry a null sessionId (it rarely sees the hook's CLAUDE_SESSION_ID) while
+// turn events carry the real hook id. summarize(project, {sessionId}) must therefore
+// KEEP null-session reads in a per-session view (else the report zeroes out), while
+// still filtering events that carry a DIFFERENT real session id. Drives summarize over
+// a synthetic metrics.jsonl written straight to disk, exactly like runCase above.
+async function sessionFilterTests() {
+  const M = await import('../scripts/lib/metrics.mjs');
+  const runCase = async (events, opts) => {
+    const proj = realpathSync(mkdtempSync(join(tmpdir(), 'cg-sessfilter-')));
+    const p = M.metricsPath(proj);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    const agg = await M.summarize(proj, opts);
+    rmSync(proj, { recursive: true, force: true });
+    return agg;
+  };
+  // MCP reads with null sessionId (the common case) + turns carrying the real hook id.
+  const nullRead = (t, saved) => ({ t, sessionId: null, kind: 'use', tool: 'get_source', savedTokens: saved, fileTokens: saved + 100, returnedTokens: 100 });
+  const s1Turn = (t) => ({ t, sessionId: 'S1', kind: 'turn' });
+  const s2Read = (t, saved) => ({ t, sessionId: 'S2', kind: 'use', tool: 'get_source', savedTokens: saved, fileTokens: saved + 100, returnedTokens: 100 });
+
+  const events = [nullRead(100, 500), nullRead(101, 300), s1Turn(102), s1Turn(103), s2Read(104, 999)];
+
+  // (1) Filtering --session S1: the null-session reads are KEPT (unattributable MCP
+  // reads still count toward the session view), while S2's read is excluded.
+  let agg = await runCase(events, { sessionId: 'S1' });
+  eq(agg.getSourceCalls, 2, 'sessionFilter(1): null-session reads counted under --session S1');
+  eq(agg.savedTokens, 800, 'sessionFilter(1): null-session savedTokens summed (500+300), NOT zeroed');
+  ok(agg.savedTokens > 0, 'sessionFilter(1): per-session savedTokens is non-zero (the L14 bug)');
+
+  // (2) Regression: an event with a DIFFERENT real session id stays excluded under
+  // --session S1 — real-id attribution still works; we did not just disable filtering.
+  ok(agg.savedTokens !== 800 + 999, 'sessionFilter(2): S2 read is excluded from the S1 view (real-id filtering intact)');
+  agg = await runCase(events, { sessionId: 'S2' });
+  eq(agg.getSourceCalls, 3, 'sessionFilter(2): under --session S2, S2 read + both null reads count');
+  eq(agg.savedTokens, 500 + 300 + 999, 'sessionFilter(2): S2 view sums S2 read + null reads');
+
+  // (3) Global path (no sessionId) counts every read regardless of session.
+  agg = await runCase(events, {});
+  eq(agg.getSourceCalls, 3, 'sessionFilter(3): global view counts all reads');
+  eq(agg.savedTokens, 500 + 300 + 999, 'sessionFilter(3): global savedTokens sums every read');
 }
 
 // The turn/boundary HOOKS are pure "read stdin JSON → append one event via record()"
@@ -742,6 +1013,59 @@ async function contractsTests() {
   rmSync(work, { recursive: true, force: true });
 }
 
+// M11 word-boundary attribution: a contract identifier token gets a REFERENCES edge
+// attributed to the ENCLOSING symbol of its first WORD-BOUNDED occurrence — not the
+// first raw substring hit. When the token appears earlier embedded inside a larger
+// identifier (superuser_id_map contains user_id, no \b there) and only later as a
+// genuine boundary-delimited token, the edge must attach to the LATER function. The
+// old code took `at = text.indexOf(tok)` (the embedded position) and merely validated
+// existence with a whole-file \b regex, so the later match kept the edge alive while
+// `at` still pointed at the earlier, non-matching site — mis-attributing the edge.
+async function wordBoundaryAttributionTest() {
+  const work = mkdtempSync(join(tmpdir(), 'cg-wb-'));
+  mkdirSync(join(work, '.git'), { recursive: true });
+  // earlyOne: user_id ONLY as a substring of superuser_id_map (no \b match here).
+  // realOne (LATER): a genuine \b-delimited user_id — the correct owner of the edge.
+  writeFileSync(join(work, 'app.js'),
+    'function earlyOne() { const superuser_id_map = {}; return superuser_id_map; }\n' +
+    "function realOne()  { return fetch('/x', { headers: { user_id: 1 } }); }\n");
+  // Hand-written contract defining the field token user_id (underscore + len>=6 =>
+  // isDistinctive). Single compartment: we only care WHICH symbol owns the edge.
+  const cdir = join(work, 'contracts'); mkdirSync(cdir, { recursive: true });
+  writeFileSync(join(cdir, 'ids.asyncapi.yaml'),
+    'asyncapi: 3.0.0\n' +
+    'info: { title: Ids, version: 1.0.0 }\n' +
+    'channels:\n' +
+    '  ids:\n' +
+    '    address: /x\n' +
+    '    messages:\n' +
+    '      m:\n' +
+    '        payload:\n' +
+    '          type: object\n' +
+    '          properties:\n' +
+    '            user_id: { type: integer }\n' +
+    'operations:\n' +
+    '  recv:\n' +
+    '    action: receive\n' +
+    '    channel: { $ref: "#/channels/ids" }\n' +
+    '    messages: [{ $ref: "#/channels/ids/messages/m" }]\n');
+  const project = realpathSync(work);
+  const db = join(work, '.wiregraph', 'graph.db');
+  await runBuild({ target: project, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+  const owners = conn.prepare(
+    "SELECT s.name name FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES' AND e.token=?")
+    .all(project, 'user_id').map((r) => r.name);
+  // The edge must be owned by realOne — the later \b-delimited occurrence — NOT by
+  // earlyOne (the embedded substring's enclosing symbol) nor <module>.
+  ok(owners.includes('realOne'),
+    `m11: user_id REFERENCES attributed to realOne (the \\b-delimited site) — got [${owners.join(', ') || 'none'}]`);
+  ok(!owners.includes('earlyOne') && !owners.includes('<module>'),
+    `m11: user_id NOT mis-attributed to the embedded substring's symbol — got [${owners.join(', ') || 'none'}]`);
+  conn.close();
+  rmSync(work, { recursive: true, force: true });
+}
+
 // Messaging detector: a topic published in one repo and subscribed in another is a
 // cross-repo seam that round-trips to REFERENCES edges, just like an HTTP path.
 async function messagingTest() {
@@ -848,6 +1172,304 @@ async function contractDriftTest() {
   rmSync(work, { recursive: true, force: true });
 }
 
+// H2 wildcard route-match: a parameterized route with a STATIC segment after the
+// param (/orders/{id}/items) must light REFERENCES on BOTH sides and a WIRE seam.
+// Before the fix normalizeAddress dropped every {param} segment (-> /orders/items)
+// and the substring matcher never found it, so every such route was a silently-empty
+// seam. pathTokenRegex now matches the route however source writes the param (:id /
+// ${id} / {id} / a concrete value). A sibling route (/orders/{id}/shipments) proves
+// the two routes are NOT conflated into one prefix. Hand-written spec (like
+// contractDriftTest) with x-wiregraph-* roles so WIRE orients without an env var —
+// the inference stage normalizes ${id} and :id differently, so this targets the
+// matcher directly.
+async function paramRouteMatchTest() {
+  const work = mkdtempSync(join(tmpdir(), 'cg-param-'));
+  const svc = join(work, 'svc'), app = join(work, 'app');
+  mkdirSync(join(svc, '.git'), { recursive: true }); // distinct repos => compartments
+  mkdirSync(join(app, '.git'), { recursive: true });
+  // Server defines both routes with :id params; a static segment FOLLOWS the param.
+  writeFileSync(join(svc, 'routes.js'),
+    'function mount(app) {\n' +
+    "  app.get('/orders/:id/items', (req, res) => res.json(items(req.params.id)));\n" +
+    "  app.get('/orders/:id/shipments', (req, res) => res.json(ships(req.params.id)));\n" +
+    '}\n');
+  // Client calls both — one via a template literal ${id}, one via a concrete id.
+  writeFileSync(join(app, 'client.js'),
+    'async function loadItems(id) { return fetch(`/orders/${id}/items`).then((r) => r.json()); }\n' +
+    'async function loadShipments() { return fetch(`/orders/42/shipments`).then((r) => r.json()); }\n');
+  // Hand-written spec: the {param} addresses + x-wiregraph roles so WIRE orients
+  // producer(app) -> consumer(svc) without WIREGRAPH_SERVER_REPO.
+  const cdir = join(work, 'contracts'); mkdirSync(cdir, { recursive: true });
+  writeFileSync(join(cdir, 'orders.asyncapi.yaml'),
+    'asyncapi: 3.0.0\n' +
+    'info: { title: Orders, version: 1.0.0 }\n' +
+    'channels:\n' +
+    '  items:\n' +
+    '    address: /orders/{id}/items\n' +
+    '    x-wiregraph-producers: [app]\n' +
+    '    x-wiregraph-consumers: [svc]\n' +
+    '    messages: { req: { payload: { type: object, properties: {} } } }\n' +
+    '  shipments:\n' +
+    '    address: /orders/{id}/shipments\n' +
+    '    x-wiregraph-producers: [app]\n' +
+    '    x-wiregraph-consumers: [svc]\n' +
+    '    messages: { req: { payload: { type: object, properties: {} } } }\n' +
+    'operations:\n' +
+    '  recvItems: { action: receive, channel: { $ref: "#/channels/items" }, messages: [{ $ref: "#/channels/items/messages/req" }] }\n' +
+    '  recvShip: { action: receive, channel: { $ref: "#/channels/shipments" }, messages: [{ $ref: "#/channels/shipments/messages/req" }] }\n');
+  const project = realpathSync(work);
+  const db = join(work, '.wiregraph', 'graph.db');
+  await runBuild({ target: project, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+
+  const refRepos = (token) => new Set(conn.prepare(
+    "SELECT DISTINCT s.compartment repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES' AND e.token=?")
+    .all(project, token).map((r) => r.repo));
+
+  // REFERENCES for the parameterized route come from BOTH compartments (before the
+  // fix: zero, because /orders/{id}/items never matched /orders/:id/items).
+  const itemsRepos = refRepos('/orders/{id}/items');
+  ok(itemsRepos.has('svc') && itemsRepos.has('app'),
+    `param-route: /orders/{id}/items REFERENCES from BOTH sides (got ${[...itemsRepos].join(', ') || 'none'})`);
+
+  // WIRE seam exists and is oriented producer(app) -> consumer(svc).
+  const wires = conn.prepare(
+    `SELECT sp.compartment src, dp.compartment dst, e.token token FROM edges e
+       JOIN symbols sp ON sp.id=e.src JOIN symbols dp ON dp.id=e.dst
+      WHERE e.project=? AND e.type='WIRE'`).all(project);
+  ok(wires.some((w) => w.src === 'app' && w.dst === 'svc' && w.token === '/orders/{id}/items'),
+    `param-route: WIRE oriented app -> svc for /orders/{id}/items (got ${wires.map((w) => `${w.src}->${w.dst}:${w.token}`).join(', ') || 'none'})`);
+
+  // Sibling NOT conflated: /orders/{id}/shipments is its OWN both-sided token, and
+  // there are EXACTLY the two distinct WIRE tokens (a merged /orders prefix — the old
+  // bug's shape — would collapse them into one or zero).
+  const shipRepos = refRepos('/orders/{id}/shipments');
+  ok(shipRepos.has('svc') && shipRepos.has('app'),
+    `param-route: sibling /orders/{id}/shipments also seams both sides (got ${[...shipRepos].join(', ') || 'none'})`);
+  const wireTokens = new Set(wires.map((w) => w.token));
+  eq(wireTokens.size, 2, `param-route: two distinct, un-conflated WIRE tokens (got ${[...wireTokens].join(', ') || 'none'})`);
+
+  conn.close();
+  rmSync(work, { recursive: true, force: true });
+}
+
+// V1 prefix-nesting: a bare route token (/orders/{id}) that is a PREFIX of a longer
+// nested route (/orders/{id}/items) must NOT over-match it. The code only ever calls
+// /orders/:id/items and only registers /orders/:id/items — nothing calls the bare
+// /orders/:id. Before the V1 fix the /orders/{id} regex ended in (?![A-Za-z0-9_]) and
+// happily matched /orders/:id/items, minting a phantom REFERENCES edge on both sides
+// and a fabricated WIRE seam for a route nothing calls. With the trailing lookahead
+// now forbidding a following slash, /orders/{id} matches only an exact end-of-route
+// occurrence — here there is none, so it must have ZERO references and NO seam.
+async function prefixNestingMatchTest() {
+  const work = mkdtempSync(join(tmpdir(), 'cg-prefix-'));
+  const svc = join(work, 'svc'), app = join(work, 'app');
+  mkdirSync(join(svc, '.git'), { recursive: true }); // distinct repos => compartments
+  mkdirSync(join(app, '.git'), { recursive: true });
+  // Server registers ONLY the deep route; nothing mounts the bare /orders/:id.
+  writeFileSync(join(svc, 'routes.js'),
+    'function mount(app) {\n' +
+    "  app.get('/orders/:id/items', (req, res) => res.json(items(req.params.id)));\n" +
+    '}\n');
+  // Client calls ONLY the deep route.
+  writeFileSync(join(app, 'client.js'),
+    'async function loadItems(id) { return fetch(`/orders/${id}/items`).then((r) => r.json()); }\n');
+  // Spec declares BOTH the bare route AND the nested route as channels.
+  const cdir = join(work, 'contracts'); mkdirSync(cdir, { recursive: true });
+  writeFileSync(join(cdir, 'orders.asyncapi.yaml'),
+    'asyncapi: 3.0.0\n' +
+    'info: { title: Orders, version: 1.0.0 }\n' +
+    'channels:\n' +
+    '  order:\n' +
+    '    address: /orders/{id}\n' +
+    '    x-wiregraph-producers: [app]\n' +
+    '    x-wiregraph-consumers: [svc]\n' +
+    '    messages: { req: { payload: { type: object, properties: {} } } }\n' +
+    '  items:\n' +
+    '    address: /orders/{id}/items\n' +
+    '    x-wiregraph-producers: [app]\n' +
+    '    x-wiregraph-consumers: [svc]\n' +
+    '    messages: { req: { payload: { type: object, properties: {} } } }\n' +
+    'operations:\n' +
+    '  recvOrder: { action: receive, channel: { $ref: "#/channels/order" }, messages: [{ $ref: "#/channels/order/messages/req" }] }\n' +
+    '  recvItems: { action: receive, channel: { $ref: "#/channels/items" }, messages: [{ $ref: "#/channels/items/messages/req" }] }\n');
+  const project = realpathSync(work);
+  const db = join(work, '.wiregraph', 'graph.db');
+  await runBuild({ target: project, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+
+  // The bare /orders/{id} token has ZERO REFERENCES (nothing calls the bare route).
+  const bareRefs = conn.prepare(
+    "SELECT count(*) AS n FROM edges WHERE project=? AND type='REFERENCES' AND token=?")
+    .all(project, '/orders/{id}')[0].n;
+  eq(bareRefs, 0, 'prefix-nesting: /orders/{id} has NO REFERENCES (the prefix does not over-match the nested route)');
+
+  // The deep /orders/{id}/items token IS referenced from both sides (sanity: the
+  // route that actually exists still seams).
+  const deepRefs = new Set(conn.prepare(
+    "SELECT DISTINCT s.compartment repo FROM edges e JOIN symbols s ON s.id=e.src WHERE e.project=? AND e.type='REFERENCES' AND e.token=?")
+    .all(project, '/orders/{id}/items').map((r) => r.repo));
+  ok(deepRefs.has('svc') && deepRefs.has('app'), 'prefix-nesting: the real nested route /orders/{id}/items still seams both sides');
+
+  // WIRE seams: exactly one token, and it is the nested route — NOT the bare prefix.
+  const wireTokens = new Set(conn.prepare(
+    "SELECT DISTINCT token FROM edges WHERE project=? AND type='WIRE'").all(project).map((r) => r.token));
+  ok(!wireTokens.has('/orders/{id}'), 'prefix-nesting: NO phantom WIRE seam for the bare /orders/{id}');
+  ok(wireTokens.has('/orders/{id}/items'), 'prefix-nesting: the nested /orders/{id}/items still has a WIRE seam');
+  eq(wireTokens.size, 1, `prefix-nesting: exactly one WIRE token (the nested route), got ${[...wireTokens].join(', ') || 'none'}`);
+
+  conn.close();
+  rmSync(work, { recursive: true, force: true });
+}
+
+// M10 role-aware drift: contract drift must be classified the way buildWireEdges
+// orients a WIRE — a token needs BOTH a producer AND a consumer in DIFFERENT
+// compartments. The old count heuristic called a token "satisfied" whenever 2+
+// compartments referenced it, so a token touched by TWO PRODUCERS (server unindexed)
+// looked healthy while buildWireEdges produced zero wire. classifyContractToken and
+// both drift reporters must now call that same-role case one-sided, not satisfied.
+async function roleAwareDriftTest() {
+  // --- direct unit coverage of the classifier -------------------------------
+  const same = Q.classifyContractToken(new Set(['app1', 'app2']), { producers: ['app1', 'app2'], consumers: ['svc'] });
+  eq(same, 'one-sided', `m10: two producers, no consumer -> one-sided (not satisfied); got ${same}`);
+  eq(Q.classifyContractToken(['app1', 'app2'], { producers: ['app1', 'app2'], consumers: ['svc'] }), 'one-sided',
+    'm10: classifier accepts an array of referencing compartments');
+  eq(Q.classifyContractToken(new Set(['app1', 'svc']), { producers: ['app1'], consumers: ['svc'] }), 'satisfied',
+    'm10: one producer + one consumer, distinct compartments -> satisfied');
+  eq(Q.classifyContractToken(new Set(['app1']), { producers: ['app1'], consumers: ['app1'] }), 'one-sided',
+    'm10: lone dual-role compartment -> one-sided (no cross-compartment pair, mirrors buildWireEdges intra-compartment skip)');
+  eq(Q.classifyContractToken(new Set(), { producers: ['app1'], consumers: ['svc'] }), 'unreferenced',
+    'm10: no referencing compartment -> unreferenced');
+  // role-less fallback (hand-written spec, roles not stored): count heuristic preserved
+  eq(Q.classifyContractToken(new Set(['x']), { producers: [], consumers: [] }), 'one-sided',
+    'm10: role-less fallback, 1 compartment -> one-sided');
+  eq(Q.classifyContractToken(new Set(['x', 'y']), {}), 'satisfied',
+    'm10: role-less fallback, 2 compartments -> satisfied');
+  eq(Q.classifyContractToken([], undefined), 'unreferenced',
+    'm10: role-less fallback, no referencer -> unreferenced');
+
+  // --- end-to-end through traceContract + contractDriftByName ---------------
+  const work = mkdtempSync(join(tmpdir(), 'cg-m10-'));
+  const app1 = join(work, 'app1'), app2 = join(work, 'app2'), svc = join(work, 'svc');
+  for (const d of [app1, app2, svc]) mkdirSync(join(d, '.git'), { recursive: true }); // distinct repos => compartments
+  // TWO producer clients both call /api/telemetry; NO consumer references it (svc
+  // handles only /api/config) -> same-role token: 2 compartments but no wire.
+  writeFileSync(join(app1, 'client.js'),
+    "function sendTelemetry() { return fetch('/api/telemetry', { method: 'POST' }); }\n" +
+    "function loadConfig() { return fetch('/api/config'); }\n");
+  writeFileSync(join(app2, 'client.js'),
+    "function alsoTelemetry() { return fetch('/api/telemetry', { method: 'POST' }); }\n");
+  writeFileSync(join(svc, 'server.js'),
+    "function routes(app) { app.get('/api/config', (req, res) => res.json(cfg())); }\n");
+  const cdir = join(work, 'contracts'); mkdirSync(cdir, { recursive: true });
+  // Hand-written spec WITH x-wiregraph roles: telemetry is produced by both clients
+  // and (nominally) consumed by svc; config is produced by app1, consumed by svc.
+  writeFileSync(join(cdir, 'fleet.asyncapi.yaml'),
+    'asyncapi: 3.0.0\n' +
+    'info: { title: Fleet, version: 1.0.0 }\n' +
+    'channels:\n' +
+    '  telemetry:\n' +
+    '    address: /api/telemetry\n' +
+    '    x-wiregraph-producers: [app1, app2]\n' +
+    '    x-wiregraph-consumers: [svc]\n' +
+    '    messages: { m: { payload: { type: object, properties: {} } } }\n' +
+    '  config:\n' +
+    '    address: /api/config\n' +
+    '    x-wiregraph-producers: [app1]\n' +
+    '    x-wiregraph-consumers: [svc]\n' +
+    '    messages: { m: { payload: { type: object, properties: {} } } }\n' +
+    'operations:\n' +
+    '  recvTel: { action: receive, channel: { $ref: "#/channels/telemetry" }, messages: [{ $ref: "#/channels/telemetry/messages/m" }] }\n' +
+    '  recvCfg: { action: receive, channel: { $ref: "#/channels/config" }, messages: [{ $ref: "#/channels/config/messages/m" }] }\n');
+  const project = realpathSync(work);
+  const db = join(work, '.wiregraph', 'graph.db');
+  await runBuild({ target: project, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+
+  const out = Q.traceContract(conn, project, 'Fleet', undefined, false);
+  // Same-role token is one-sided, NOT satisfied: config is the only satisfied token.
+  has(out, '1/2 tokens satisfied', 'm10: same-role token not counted satisfied (config is the lone satisfied token)');
+  ok(!out.includes('2/2 tokens satisfied'), 'm10: two producers do NOT make the seam satisfied');
+  has(out, 'one-sided', 'm10: one-sided bucket present');
+  has(out, '/api/telemetry', 'm10: the same-role token is named');
+  // Improved message names the present side and the missing half.
+  has(out, 'producer side', 'm10: one-sided detail names the producer side that is present');
+  has(out, 'consumer half missing', 'm10: one-sided detail names the consumer half that is missing');
+
+  const drift = Q.contractDriftByName(conn, project, false);
+  const fleet = drift.get('Fleet');
+  ok(fleet, 'm10: contractDriftByName has a Fleet entry');
+  eq(fleet.status, 'one-sided', `m10: contract status is one-sided, NOT ok (same-role token is a gap); got ${fleet?.status}`);
+  eq(fleet.satisfied, 1, `m10: exactly one satisfied token (config); got ${fleet?.satisfied}`);
+  eq(fleet.oneSided, 1, `m10: exactly one one-sided token (telemetry); got ${fleet?.oneSided}`);
+
+  conn.close();
+  rmSync(work, { recursive: true, force: true });
+}
+
+// Pure-unit coverage of the H2 matcher: pathTokenRegex matches a parameterized token
+// however source writes the param, respects segment boundaries, and normalizeAddress
+// keeps the FULL parameterized address as a stable token (only collapsing // and a
+// trailing slash). Positive + negative cases from the design's "behavior to preserve".
+async function pathTokenMatchUnitTest() {
+  const { pathTokenRegex, normalizeAddress } = await import('../src/extract/contracts.js');
+  const items = pathTokenRegex('/orders/{id}/items');
+  // .source is V8's source-escaped form (each `/` shown as `\/`, except inside a
+  // char class); the documented pattern is
+  // /orders/(?::?\$?\{?[A-Za-z0-9_]+\}?)/items(?![A-Za-z0-9_/}]). The trailing
+  // lookahead forbids a following `/` OR `}` so a bare route never over-matches a
+  // LONGER nested route — including the client `${id}/…` form where the `}` would
+  // otherwise be a false terminator (V1).
+  eq(items.source, '\\/orders\\/(?::?\\$?\\{?[A-Za-z0-9_]+\\}?)\\/items(?![A-Za-z0-9_/}])',
+    'pathTokenRegex: /orders/{id}/items compiles to the documented wildcard regex');
+  for (const s of ['/orders/:id/items', '/orders/${id}/items', '/orders/{id}/items', '/orders/42/items']) {
+    ok(items.test(s), `pathTokenRegex: matches source form ${s}`);
+  }
+  ok(!items.test('/orders/:id'), 'pathTokenRegex: does NOT match the param-only sibling /orders/:id');
+  ok(!items.test('/orderstatus/x/items'), 'pathTokenRegex: does NOT match /orderstatus/x/items (static-segment boundary)');
+  ok(!items.test('/orders/:id/itemsExtra'), 'pathTokenRegex: does NOT match /orders/:id/itemsExtra (trailing boundary)');
+
+  // V1: a bare route token must not over-match a LONGER nested sibling route. The
+  // trailing `(?![A-Za-z0-9_/])` forbids a following slash, so `/orders/{id}` matches
+  // an exact end-of-route occurrence but NOT `/orders/:id/items` (a deeper route).
+  const bareId = pathTokenRegex('/orders/{id}');
+  ok(bareId.test('/orders/:id'), 'pathTokenRegex: /orders/{id} still matches the exact route /orders/:id');
+  ok(!bareId.test('/orders/:id/items'), 'pathTokenRegex: /orders/{id} does NOT match the longer route /orders/:id/items');
+  // The client template-literal form: `${id}` ends in `}`, which the lookahead must
+  // also treat as a non-terminator so the bare route does not false-match `/orders/${id`.
+  ok(!bareId.test('/orders/${id}/items'), 'pathTokenRegex: /orders/{id} does NOT match the longer template-literal route /orders/${id}/items');
+  ok(bareId.test('/orders/${id}'), 'pathTokenRegex: /orders/{id} STILL matches an exact template-literal route /orders/${id}');
+  ok(items.test('/orders/:id/items'), 'pathTokenRegex: the deeper /orders/{id}/items still matches its own route');
+  ok(items.test('/orders/${id}/items'), 'pathTokenRegex: the deeper /orders/{id}/items still matches the template-literal client form');
+  const bareOrders = pathTokenRegex('/orders');
+  ok(bareOrders.test("'/orders'"), 'pathTokenRegex: /orders matches a quoted end-of-route literal');
+  ok(!bareOrders.test('/orders/42'), 'pathTokenRegex: /orders does NOT match the longer route /orders/42');
+  // A route ending in a STATIC segment: a trailing `?query` (or nothing) is fine, but
+  // a deeper `/segment` is now excluded.
+  const health = pathTokenRegex('/health');
+  ok(health.test("'/health'"), 'pathTokenRegex: /health matches a bare occurrence');
+  ok(health.test("'/health?x=1'"), 'pathTokenRegex: /health still matches when followed by a query string');
+  ok(!health.test('/healthcheck'), 'pathTokenRegex: /health does not bleed into /healthcheck');
+  ok(!health.test('/health/live'), 'pathTokenRegex: /health does NOT match the longer route /health/live');
+
+  const list = pathTokenRegex('/users/list');
+  ok(list.test('/users/list'), 'pathTokenRegex: plain path /users/list still matches');
+  ok(!list.test('/users/listings'), 'pathTokenRegex: /users/list does not bleed into /users/listings');
+
+  // Mid-segment param: the literal suffix stays literal/escaped.
+  const file = pathTokenRegex('/files/{name}.json');
+  ok(file.test('/files/:name.json'), 'pathTokenRegex: mid-segment param /files/{name}.json matches /files/:name.json');
+  ok(!file.test('/files/reportxjson'), 'pathTokenRegex: the escaped dot in /files/{name}.json is literal');
+
+  // normalizeAddress keeps the full parameterized form (stable token identity),
+  // collapses // and strips a trailing slash, keeps the root, matches topics literally.
+  eq(normalizeAddress('/orders/{id}/items'), '/orders/{id}/items', 'normalizeAddress: keeps the full parameterized path');
+  eq(normalizeAddress('/orders//{id}/items/'), '/orders/{id}/items', 'normalizeAddress: collapses // and strips a trailing slash');
+  eq(normalizeAddress('/'), '/', 'normalizeAddress: the root path is preserved');
+  eq(normalizeAddress('order.created'), 'order.created', 'normalizeAddress: a topic is matched literally');
+  eq(normalizeAddress(''), null, 'normalizeAddress: empty input -> null');
+}
+
 // Shared-state detector: an env var read in 2+ repos is a seam; ubiquitous env
 // vars (NODE_ENV) are filtered so they don't become bogus contracts.
 async function stateTest() {
@@ -878,6 +1500,127 @@ async function stateTest() {
   ok(repos.has('svc-a') && repos.has('svc-b'), `state: round-trip links both env readers (got ${[...repos].join(', ') || 'none'})`);
   conn.close();
   rmSync(work, { recursive: true, force: true });
+}
+
+// M8: TS env-var state detection recognizes both `process.env` and
+// `import.meta.env`. `import.meta` parses as a `meta_property` node (not a
+// member_expression), so the object-type branch in isTsEnvObject must handle it
+// or every import.meta.env.* read is silently dropped.
+async function tsEnvStateTest() {
+  const { parseSource } = await import('../src/extract/parse.js');
+  const tokens = (src) =>
+    parseSource(src, 'typescript', 'typescript').candidates.filter((c) => c.kind === 'state').map((c) => c.token);
+
+  ok(tokens('const x = import.meta.env.API_URL;').includes('API_URL'),
+    `state(ts): import.meta.env.NAME yields a candidate (got ${tokens('const x = import.meta.env.API_URL;').join(', ') || 'none'})`);
+  ok(tokens("const y = import.meta.env['SOME_KEY'];").includes('SOME_KEY'),
+    `state(ts): import.meta.env['KEY'] yields a candidate (got ${tokens("const y = import.meta.env['SOME_KEY'];").join(', ') || 'none'})`);
+  ok(tokens('const z = process.env.MYVAR;').includes('MYVAR'),
+    `state(ts): process.env.NAME still yields a candidate (got ${tokens('const z = process.env.MYVAR;').join(', ') || 'none'})`);
+}
+
+// H1 data-loss guard: writeState is atomic (temp + rename, no torn reads), and
+// updateState distinguishes an ABSENT state.json from a CORRUPT one so a partial/torn
+// read can never be papered over with defaults (which would silently drop links,
+// posture, and the reposLastSha baseline). loadState is the seam that classifies the
+// three cases; these drive state.mjs directly against temp project dirs.
+async function atomicStateTest() {
+  const S = await import('../scripts/lib/state.mjs');
+
+  // atomic write: writeState leaves the FINAL file whole and parseable, and its own
+  // unique temp file is renamed away (no residue from THIS write). We can't cheaply
+  // fault-inject a torn write in this harness (no fs interposition), so this asserts
+  // the observable post-conditions of temp+rename rather than the rename's atomicity
+  // mid-flight — an honest limit noted here rather than a tautological check.
+  {
+    const proj = realpathSync(mkdtempSync(join(tmpdir(), 'cg-atomic-')));
+    S.writeState(proj, S.defaultState(proj));
+    const p = S.stateFilePath(proj);
+    const d = dirname(p);
+    ok(!existsSync(p + '.tmp'), 'atomic: no legacy state.json.tmp remains after writeState');
+    // V3: the temp name is now unique per writer+write; assert this write left no
+    // <pid>.<n>.tmp residue of its own (it was renamed onto state.json, not left).
+    ok(!readdirSync(d).some((f) => f.startsWith('state.json.') && f.endsWith('.tmp')),
+      'atomic: writeState leaves no unique .tmp residue of its own after the rename');
+    const parsed = JSON.parse(readFileSync(p, 'utf8'));
+    eq(parsed.project, proj, 'atomic: state.json parses and holds the project root');
+    rmSync(proj, { recursive: true, force: true });
+  }
+
+  // V5: a pre-existing STALE unique .tmp residue (e.g. from a crashed prior writer of a
+  // DIFFERENT pid) must neither corrupt nor block a subsequent writeState — the unique
+  // naming means the new write never touches that residue, and the final state.json is
+  // still whole and correct. (This exercises the V3 unique-temp-name change: a shared
+  // hardcoded `state.json.tmp` could be clobbered/raced; a foreign unique name cannot.)
+  {
+    const proj = realpathSync(mkdtempSync(join(tmpdir(), 'cg-atomic-stale-')));
+    const p = S.stateFilePath(proj);
+    mkdirSync(dirname(p), { recursive: true });
+    // A junk residue matching the unique-temp shape but from a foreign pid/seq.
+    const stale = p + '.999999.7.tmp';
+    writeFileSync(stale, 'torn junk {{{ not json');
+    S.writeState(proj, { ...S.defaultState(proj), autoUpdate: 'balanced' });
+    const parsed = JSON.parse(readFileSync(p, 'utf8'));
+    eq(parsed.project, proj, 'atomic-stale: state.json is whole and parses despite a stale foreign .tmp residue');
+    eq(parsed.autoUpdate, 'balanced', 'atomic-stale: the written state is correct, not the stale bytes');
+    ok(existsSync(stale) && readFileSync(stale, 'utf8').startsWith('torn junk'),
+      'atomic-stale: the foreign residue is left untouched (unique naming never reuses it)');
+    eq(S.loadState(proj).status, 'ok', 'atomic-stale: the resulting state.json loads cleanly (not corrupt)');
+    rmSync(proj, { recursive: true, force: true });
+  }
+
+  // absent → updateState on a fresh dir yields defaults + patch (unchanged behavior)
+  {
+    const proj = realpathSync(mkdtempSync(join(tmpdir(), 'cg-absent-')));
+    eq(S.loadState(proj).status, 'absent', 'absent: loadState reports absent for a fresh dir');
+    const next = S.updateState(proj, { autoUpdate: 'aggressive' });
+    eq(next.autoUpdate, 'aggressive', 'absent: patch applied');
+    eq(next.metricsVersion, S.METRICS_VERSION, 'absent: defaults filled in (metricsVersion from defaultState)');
+    rmSync(proj, { recursive: true, force: true });
+  }
+
+  // ok round-trip: updateState preserves existing fields while applying the patch
+  {
+    const proj = realpathSync(mkdtempSync(join(tmpdir(), 'cg-ok-')));
+    const link = { root: '/some/peer', peer: '/some/peer', initiator: null, autoCreated: false, linkedAt: null };
+    S.writeState(proj, { ...S.defaultState(proj), links: [link], autoUpdate: 'conservative' });
+    eq(S.loadState(proj).status, 'ok', 'ok: loadState reports ok for a valid file');
+    const next = S.updateState(proj, { inferredSeams: 3 });
+    eq(next.inferredSeams, 3, 'ok: patch applied');
+    eq(next.autoUpdate, 'conservative', 'ok: existing posture preserved through the merge');
+    eq(next.links.length, 1, 'ok: existing links array preserved through the merge');
+    eq(next.links[0].root, '/some/peer', 'ok: link record preserved verbatim');
+    rmSync(proj, { recursive: true, force: true });
+  }
+
+  // corrupt → updateState THROWS, preserves the original bytes in a .corrupt* backup,
+  // and does NOT replace state.json with defaults
+  {
+    const proj = realpathSync(mkdtempSync(join(tmpdir(), 'cg-corrupt-')));
+    const p = S.stateFilePath(proj);
+    mkdirSync(dirname(p), { recursive: true });
+    const garbage = '{ this is not valid json ]]';
+    writeFileSync(p, garbage);
+    eq(S.loadState(proj).status, 'corrupt', 'corrupt: loadState reports corrupt for garbage bytes');
+
+    let threw = false;
+    try { S.updateState(proj, { autoUpdate: 'off' }); } catch { threw = true; }
+    ok(threw, 'corrupt: updateState throws rather than overwriting');
+    ok(!existsSync(p), 'corrupt: the corrupt state.json was moved aside (not left in place)');
+    const backup = p + '.corrupt';
+    ok(existsSync(backup), 'corrupt: original bytes preserved in a state.json.corrupt backup');
+    eq(readFileSync(backup, 'utf8'), garbage, 'corrupt: backup holds the original bytes verbatim');
+
+    // corrupt non-clobber: a SECOND corrupt update must not overwrite the first backup
+    writeFileSync(p, 'more garbage {{{');
+    let threw2 = false;
+    try { S.updateState(proj, { autoUpdate: 'off' }); } catch { threw2 = true; }
+    ok(threw2, 'corrupt: second corrupt updateState also throws');
+    eq(readFileSync(backup, 'utf8'), garbage, 'corrupt: first .corrupt backup left untouched by the second corrupt write');
+    ok(existsSync(p + '.corrupt.2'), 'corrupt: second corrupt file quarantined to a unique .corrupt.2 suffix');
+    eq(readFileSync(p + '.corrupt.2', 'utf8'), 'more garbage {{{', 'corrupt: .corrupt.2 holds the second corrupt bytes');
+    rmSync(proj, { recursive: true, force: true });
+  }
 }
 
 // Recognize-potential: a full build persists the cross-repo seam count + contracts
@@ -940,9 +1683,11 @@ async function exportHtmlTests() {
   // Missing d3 bundle must FAIL LOUD, not silently swap in a CDN <script> (that
   // would break "100% local"). --allow-cdn is the explicit opt-out.
   const { d3ScriptTag } = await import('../src/export-html.js');
-  let threw = false;
-  try { d3ScriptTag(false, '/no/such/d3.min.js'); } catch { threw = true; }
+  let threw = false, missingMsg = '';
+  try { d3ScriptTag(false, '/no/such/d3.min.js'); } catch (e) { threw = true; missingMsg = e.message; }
   ok(threw, 'export-html: missing d3 bundle throws without --allow-cdn');
+  // L27: the error must name the path actually tried, not the default D3_BUNDLE.
+  ok(missingMsg.includes('/no/such/d3.min.js'), `export-html: error names the bundlePath actually tried (got "${missingMsg}")`);
   ok(d3ScriptTag(true, '/no/such/d3.min.js').includes('cdn.jsdelivr'), 'export-html: --allow-cdn falls back to CDN explicitly');
 
   rmSync(proj, { recursive: true, force: true });
@@ -974,6 +1719,52 @@ async function exportContractEdgesTest() {
   has(html, '"status":"drift"', 'viz: the edge carries the contract drift status for coloring');
   has(html, '"contract":"HB"', 'viz: the edge is labeled with the contract name');
   rmSync(work, { recursive: true, force: true });
+}
+
+// Injection safety: renderHtml embeds fully authored strings (node/contract names,
+// file paths, REFERENCES tokens, the CLI search string as data.title) into a
+// self-contained page. None of those are trusted, so all three escaping seams must
+// hold: the DATA <script> blob, the tooltip innerHTML path, and the server-side
+// <title>/<h1>. We drive renderHtml directly with hostile data.
+async function exportHtmlEscapingTest() {
+  const { renderHtml } = await import('../src/export-html.js');
+  const evil = '</script><script>alert(1)</script>';
+  const data = {
+    title: '<img src=x onerror=alert(1)>',
+    nodes: [
+      { id: 'compartment::a', kind: 'compartment', compartment: 'a', name: 'a', file: null, line: null },
+      { id: 'sym1', kind: 'symbol', compartment: 'a', name: evil, file: evil, line: 3 },
+      { id: 'contract::c', kind: 'contract', dangling: true, compartment: null, name: evil, file: null, line: null, status: 'drift', drift: null },
+    ],
+    links: [
+      { source: 'compartment::a', target: 'contract::c', type: 'CONTRACT', contract: evil, tokens: [evil], count: 1, status: 'drift', drift: null, toDangler: true },
+    ],
+    compartments: ['a'],
+    compartmentColor: { a: '#E15554' },
+    contractColor: '#F2C94C',
+    driftColors: { ok: '#3BB273', 'one-sided': '#E6A23C', drift: '#E15554' },
+    aggregated: true,
+  };
+  // allowCdn so a missing d3 bundle can't make renderHtml throw; irrelevant to escaping.
+  const html = renderHtml(data, { allowCdn: true });
+
+  // M12: the </script> in a node/contract name must be neutralized in the DATA blob
+  // by escaping '<' to \u003c (JSON stays valid, the tag can't form). The raw
+  // breakout sequence from the data must never appear verbatim in the output.
+  has(html, '\\u003c/script', 'export-html M12: </script> in data is escaped to \\u003c in the DATA blob');
+  ok(!html.includes('</script><script>alert(1)'), 'export-html M12: raw </script> breakout from data is absent');
+
+  // L26: data.title lands in <title> and <h1> outside the script — must be escaped.
+  has(html, '&lt;img src=x onerror=alert(1)&gt;', 'export-html L26: data.title is HTML-escaped in the head/body');
+  ok(!html.includes('<img src=x onerror'), 'export-html L26: raw <img onerror from data.title is absent');
+
+  // M13: the tooltip innerHTML path must route dynamic fields through the in-page
+  // esc() helper (the tooltip runs client-side, so this is a source-level check that
+  // the escaping is wired — bare d.name/d.contract interpolations would be XSS).
+  has(html, 'const esc =', 'export-html M13: page defines an in-page esc() helper');
+  has(html, 'esc(d.name)', 'export-html M13: node tooltip wraps d.name in esc()');
+  has(html, 'esc(d.contract)', 'export-html M13: link tooltip wraps d.contract in esc()');
+  ok(!html.includes("'<b>'+d.name+'</b>'"), 'export-html M13: no bare d.name interpolation remains in the tooltip');
 }
 
 // Schema safety: a db written by a NEWER wiregraph must never be silently
@@ -1203,6 +1994,41 @@ async function linkGuardTests() {
   mkdirSync(join(hasNested, 'inner', '.wiregraph'), { recursive: true });
   writeFileSync(join(hasNested, 'inner', '.wiregraph', 'state.json'), '{}');
   eq(S.canLink(state, hasNested).ok, false, 'guard: a candidate containing a nested foreign index is rejected');
+
+  rmSync(ws, { recursive: true, force: true });
+}
+
+// previewLink return shape (L20): check-overlap documents itself as "just run the
+// link-time guard", so previewLink must expose the guard verdict (guardOk/guardReason)
+// SEPARATELY from `ok`, which also folds in target writability. A target that passes
+// every guard but is read-only must read guardOk:true / ok:false — the decoupling that
+// keeps check-overlap from reporting a writability problem as a guard REJECTION.
+async function previewLinkShapeTest() {
+  const L = await import('../scripts/lib/links.mjs');
+  const { ws, client, server } = linkFixture('cg-previewshape-');
+  await initGraph(client); // client is the indexed SELF
+
+  // (1) guard-passing disjoint target: guard verdict is a clean pass.
+  const pass = L.previewLink(client, server);
+  eq(pass.guardOk, true, 'previewLink: disjoint target passes the guard (guardOk)');
+  eq(pass.guardReason, null, 'previewLink: a passing guard carries a null guardReason');
+
+  // Read-only decoupling: a guard-passing target that is not writable must still read
+  // guardOk:true while ok:false. chmod is only meaningful if the harness honors mode
+  // bits (root ignores them) — probe previewLink's own `writable`, and only assert the
+  // decoupling when the environment actually made the dir unwritable. Never flaky.
+  chmodSync(server, 0o555);
+  const ro = L.previewLink(client, server);
+  if (ro.writable === false) {
+    eq(ro.guardOk, true, 'previewLink: read-only but guard-passing target still guardOk:true');
+    eq(ro.ok, false, 'previewLink: ok folds in writability (false) — DECOUPLED from guardOk');
+  } // else: running as root / mode bits ignored — skip, cannot make a read-only dir here.
+  chmodSync(server, 0o755); // restore before cleanup
+
+  // (2) guard-FAILING target: an ancestor of self overlaps, a real canLink rejection.
+  const fail = L.previewLink(client, ws);
+  eq(fail.guardOk, false, 'previewLink: an overlapping (ancestor) target fails the guard');
+  ok(typeof fail.guardReason === 'string' && fail.guardReason.length > 0, 'previewLink: a failing guard carries a non-null guardReason');
 
   rmSync(ws, { recursive: true, force: true });
 }
@@ -1503,6 +2329,50 @@ async function reindexRegressionTest() {
   rmSync(ws, { recursive: true, force: true });
 }
 
+// --files parsing: each following argv element is ONE path (never comma-split), so a
+// path that itself contains a comma survives intact — the post-edit hook passes a
+// single absolute path as one argv element, and under the old split-on-comma parser
+// `/a/foo,bar.js` was shredded into two bogus fragments and silently dropped.
+async function filesArgParseTest() {
+  const R = await import('../scripts/hooks/refresh.mjs');
+  const B = await import('../src/build.js');
+
+  // Regression: a comma inside the path is preserved as ONE token (both parsers).
+  eq(JSON.stringify(R.parseArgs(['--files', '/a/foo,bar.js']).files), JSON.stringify(['/a/foo,bar.js']),
+     'refresh --files keeps a comma path as one entry');
+  eq(JSON.stringify(B.parseArgs(['--files', '/a/foo,bar.js']).files), JSON.stringify(['/a/foo,bar.js']),
+     'build --files keeps a comma path as one entry');
+
+  // Multiple files: passed as separate argv elements.
+  eq(JSON.stringify(B.parseArgs(['--files', '/a/x.js', '/a/y.js']).files), JSON.stringify(['/a/x.js', '/a/y.js']),
+     'build --files consumes multiple path args');
+  eq(JSON.stringify(R.parseArgs(['--files', '/a/x.js', '/a/y.js']).files), JSON.stringify(['/a/x.js', '/a/y.js']),
+     'refresh --files consumes multiple path args');
+
+  // A flag after the --files list ends consumption and still parses.
+  const o = B.parseArgs(['/some/dir', '--files', '/a/x.js', '--reset']);
+  eq(JSON.stringify(o.files), JSON.stringify(['/a/x.js']), 'build --files stops at the next --flag');
+  eq(o.reset, true, 'build --reset after a --files list still parses');
+}
+
+// Integration: a real source file whose path contains a comma re-indexes cleanly —
+// its symbol is queryable afterward, proving the comma path was NOT shredded/dropped.
+async function commaPathReindexTest() {
+  const B = await import('../src/build.js');
+  const ws = mkdtempSync(join(tmpdir(), 'cg-comma-'));
+  const A = realpathSync(mkdtempSync(join(ws, 'proj-')));
+  mkdirSync(join(A, '.git'), { recursive: true });
+  writeFileSync(join(A, 'plain.js'), 'export function plain(){ return 0; }\n');
+  await initGraph(A);
+  const commaPath = join(A, 'foo,bar.js');
+  writeFileSync(commaPath, 'export function commaSym(){ return 42; }\n');
+  await B.reindexFiles([commaPath], A, {});
+  const c = connect(join(A, '.wiregraph', 'graph.db'), { readonly: true });
+  has(Q.findSymbol(c, A, 'commaSym'), 'match(es)', 'comma-path file re-indexed (path not shredded)');
+  c.close();
+  rmSync(ws, { recursive: true, force: true });
+}
+
 // findIndexedRoot invariance / sub-repo cwd: with two disjoint indexed graphs A and
 // B, a cwd nested inside B resolves to B, never A — so a refresh fired from a
 // sub-repo targets the right graph (refresh.mjs resolveProject uses this).
@@ -1539,6 +2409,32 @@ async function linkAtomicityTest() {
   eq(ss.links.length, 1, 'atomicity: mirror record created on re-run (converged)');
   eq(cs.links[0].initiator, client, 'atomicity: initiator preserved through reconcile');
   ok(compNamesOf(server, server).includes(basenameOf(client)), 'atomicity: server db now holds the union (no orphan)');
+
+  rmSync(ws, { recursive: true, force: true });
+}
+
+// Initiator is preserved (not flipped) when the pair is re-linked from the OPPOSITE
+// graph. initiator is an immutable fact about the ORIGINAL link ("who conjured whom"),
+// like autoCreated — flipping it makes unlink offer to HARD-REMOVE the real graph and
+// never clean the genuine orphan. Here B conjures A (initiator=B); re-linking from A
+// must keep initiator=B on both records, so cleanup stays targeted at the orphan A.
+async function linkInitiatorPreservedTest() {
+  const L = await import('../scripts/lib/links.mjs');
+  const S = await import('../scripts/lib/state.mjs');
+  const { ws, client: B, server: A } = linkFixture('cg-initflip-');
+  await initGraph(B);
+
+  await L.doLink(B, A); // A has no .wiregraph -> auto-created, initiator = B
+  eq(S.findLink(B, A).initiator, B, 'initflip: original link stamps initiator = B (the conjurer)');
+  eq(S.findLink(A, B).initiator, B, 'initflip: mirror on the auto-created A also names B');
+  eq(S.findLink(A, B).autoCreated, true, 'initflip: A is marked auto-created');
+
+  await L.doLink(A, B); // reconcile from the OPPOSITE side (documented repair path)
+  eq(S.findLink(A, B).initiator, B, 'initflip: reconcile from A must NOT flip initiator — still B');
+  eq(S.findLink(B, A).initiator, B, 'initflip: B-side record still names B after the opposite-side re-link');
+
+  eq(L.previewUnlink(A, B).cleanupEligible, false, 'initflip: unlink from A never offers to remove the real graph B');
+  eq(L.previewUnlink(B, A).cleanupEligible, true, 'initflip: the genuine orphan A is still offered for cleanup');
 
   rmSync(ws, { recursive: true, force: true });
 }
@@ -1707,6 +2603,118 @@ async function memberFreshnessTest() {
   ok(c2.newShas[svcA] && c2.newShas[svcB], 'member-fresh: same-basename members BOTH present in newShas');
   ok(c2.newShas[svcA] !== c2.newShas[svcB] || svcA !== svcB, 'member-fresh: same-basename members are keyed by distinct absolute roots (no key collision)');
   eq([svcA, svcB].filter((k) => k in c2.newShas).length, 2, 'member-fresh: exactly two distinct keys for the colliding-basename members');
+
+  rmSync(ws, { recursive: true, force: true });
+}
+
+// Catch-up escalation (H4 + M5). changedSince flags conditions where an INCREMENTAL
+// apply would silently miss committed code — a freshly-cloned sub-repo never diffed
+// (new repo, no baseline entry) or a stored baseline that's no longer a reachable
+// revision (invalid baseline, e.g. gc'd after a rebase). Both set fullBuildNeeded so
+// an auto-catch-up caller escalates to a full rebuild instead of advancing shas past
+// unindexed history. Also asserts the normal incremental path is undisturbed, and an
+// end-to-end assertion that refresh.mjs's auto path escalates and actually indexes
+// the new repo's code. Uses real git repos.
+async function catchUpEscalationTest() {
+  const S = await import('../scripts/lib/state.mjs');
+  const GIT = await import('../scripts/lib/git.mjs');
+  const gitCommit = async (dir, files, msg = 'init') => {
+    await execFileP('git', ['-C', dir, 'init', '-q']);
+    await execFileP('git', ['-C', dir, 'config', 'user.email', 't@t']);
+    await execFileP('git', ['-C', dir, 'config', 'user.name', 't']);
+    for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+    await execFileP('git', ['-C', dir, 'add', '-A']);
+    await execFileP('git', ['-C', dir, 'commit', '-q', '-m', msg]);
+  };
+  const ws = realpathSync(mkdtempSync(join(tmpdir(), 'cg-catchup-')));
+
+  // --- H4: a NEW repo (no reposLastSha entry) with ONLY committed code ---------
+  const home = realpathSync(mkdtempSync(join(ws, 'home-')));
+  await gitCommit(home, { 'h.js': 'export function h(){ return 1; }\n' });
+  await runBuild({ target: home, project: home, reset: true });
+  const baseShas = {};
+  for (const r of GIT.projectRepos(home)) if (r.head) baseShas[r.root] = r.head;
+
+  // A freshly-cloned sub-repo appears AFTER the baseline: committed source, NO
+  // uncommitted changes → no baseline entry and zero porcelain files, so the old
+  // incremental path would index nothing yet march the sha to HEAD forever.
+  const sub = join(home, 'sub');
+  mkdirSync(sub, { recursive: true });
+  await gitCommit(sub, { 's.js': 'export function subFn(){ return 2; }\n' });
+  const cNew = GIT.changedSince(home, baseShas);
+  ok(cNew.fullBuildNeeded === true, 'catch-up H4: a new sub-repo with only committed code sets fullBuildNeeded');
+  ok(cNew.fullBuildReasons.some((r) => r.includes('new repo') && r.includes('sub')), `catch-up H4: a reason names the new repo (got ${JSON.stringify(cNew.fullBuildReasons)})`);
+
+  // --- M5: a stored baseline that is no longer a reachable revision ------------
+  // 40 hex chars that name no real object → git diff last..HEAD FAILS (git() → null,
+  // distinct from "" for a valid-but-empty diff). Must escalate, not silently skip.
+  const m5 = realpathSync(mkdtempSync(join(ws, 'm5-')));
+  await gitCommit(m5, { 'a.js': 'export function a(){ return 1; }\n' });
+  const bogus = 'deadbeef'.repeat(5);
+  const cBad = GIT.changedSince(m5, { [m5]: bogus });
+  ok(cBad.fullBuildNeeded === true, 'catch-up M5: an unreachable stored sha (failed diff) escalates rather than silently skipping');
+  ok(cBad.fullBuildReasons.some((r) => r.includes('invalid baseline')), `catch-up M5: a reason marks the invalid baseline (got ${JSON.stringify(cBad.fullBuildReasons)})`);
+
+  // --- Negative: a valid baseline with a real commit on top → normal incremental
+  const norm = realpathSync(mkdtempSync(join(ws, 'norm-')));
+  await gitCommit(norm, { 'a.js': 'export function a(){ return 1; }\n' });
+  const normBase = GIT.headSha(norm);
+  writeFileSync(join(norm, 'b.js'), 'export function b(){ return 2; }\n');
+  await execFileP('git', ['-C', norm, 'add', '-A']);
+  await execFileP('git', ['-C', norm, 'commit', '-qm', 'add b']);
+  const cNorm = GIT.changedSince(norm, { [norm]: normBase });
+  ok(cNorm.fullBuildNeeded === false, 'catch-up negative: a valid baseline + real commit stays incremental (no escalation)');
+  ok(cNorm.files.includes(join(norm, 'b.js')), 'catch-up negative: the committed change still surfaces in files');
+
+  // --- Negative: fully up to date (last === head, no edits) → nothing to do ----
+  const cFresh = GIT.changedSince(norm, { [norm]: GIT.headSha(norm) });
+  ok(cFresh.fullBuildNeeded === false, 'catch-up negative: an up-to-date repo does not escalate');
+  eq(cFresh.files.length, 0, 'catch-up negative: an up-to-date repo reports no changed files');
+
+  // --- V7: null diff vs valid-but-effectively-empty diff -----------------------
+  // The M5 case above proves a NULL diff (git() returns null on an unreachable
+  // baseline) escalates to fullBuildNeeded. This is the CONTRAST: a VALID baseline
+  // whose only commit-on-top touches a NON-source file. `git diff` then returns a
+  // non-null, NON-EMPTY string (README.md changed), but langForFile filters every
+  // path out → files is empty. That empty-after-filter case must NOT escalate — it is
+  // "nothing indexable changed", categorically different from a failed (null) diff.
+  const nonsrc = realpathSync(mkdtempSync(join(ws, 'nonsrc-')));
+  await gitCommit(nonsrc, { 'a.js': 'export function a(){ return 1; }\n' });
+  const nonsrcBase = GIT.headSha(nonsrc);
+  writeFileSync(join(nonsrc, 'README.md'), '# docs\n\nsome prose, not source\n');
+  await execFileP('git', ['-C', nonsrc, 'add', '-A']);
+  await execFileP('git', ['-C', nonsrc, 'commit', '-qm', 'docs only']);
+  // Sanity: the raw diff really is non-null and non-empty (names README.md) — so the
+  // FALSE below comes from the source-language filter, not from a null/empty diff.
+  // (git() is module-private, so probe the same range with the git CLI directly.)
+  const rawDiff = (await execFileP('git', ['-C', nonsrc, 'diff', '--name-only', `${nonsrcBase}..HEAD`])).stdout;
+  ok(rawDiff.includes('README.md'),
+    'catch-up V7: the raw diff is a non-null, non-empty string naming the non-source file');
+  const cNonSrc = GIT.changedSince(nonsrc, { [nonsrc]: nonsrcBase });
+  ok(cNonSrc.fullBuildNeeded === false, 'catch-up V7: a valid baseline with only a non-source (non-null, non-empty) diff does NOT escalate');
+  eq(cNonSrc.files.length, 0, 'catch-up V7: the non-source change is filtered out (no indexable files), distinct from a null diff');
+
+  // --- End-to-end: refresh.mjs auto path escalates and indexes the new repo ----
+  // Stamp a baseline via --full (only `home2` in reposLastSha), then add a sub-repo
+  // and run the AUTO path. The escalation must full-rebuild: sub's committed symbol
+  // becomes queryable and its repo sha lands in reposLastSha.
+  const home2 = realpathSync(mkdtempSync(join(ws, 'home2-')));
+  await gitCommit(home2, { 'h.js': 'export function h2(){ return 1; }\n' });
+  await execFileP('node', [REFRESH, '--full'], { env: { ...process.env, CLAUDE_PROJECT_DIR: home2 } });
+  const before = S.readState(home2);
+  ok(before?.reposLastSha?.[home2] && !before.reposLastSha[join(home2, 'nested')], 'catch-up e2e: baseline stamped for home only');
+
+  const nested = join(home2, 'nested');
+  mkdirSync(nested, { recursive: true });
+  await gitCommit(nested, { 'n.js': 'export function nestedFn(){ return 9; }\n' });
+  await execFileP('node', [REFRESH], { env: { ...process.env, CLAUDE_PROJECT_DIR: home2 } });
+
+  const after = S.readState(home2);
+  ok(after?.reposLastSha?.[nested], 'catch-up e2e: auto path restamped the new repo sha (escalated to full rebuild)');
+  ok(after.lastFullBuild && after.lastFullBuild !== before.lastFullBuild, 'catch-up e2e: a fresh full build ran (lastFullBuild advanced)');
+  const conn = connect(join(home2, '.wiregraph', 'graph.db'), { readonly: true });
+  has(Q.findSymbol(conn, home2, 'nestedFn'), 'n.js', 'catch-up e2e: the new repo\'s committed symbol is now indexed');
+  conn.close();
 
   rmSync(ws, { recursive: true, force: true });
 }
@@ -1934,6 +2942,112 @@ async function contractCollisionMergeTest() {
   ok(wireTokens.has('/inf/abc'), 'collision: inferred channel keeps its WIRE edge');
 
   rmSync(work, { recursive: true, force: true });
+}
+
+// L19 — synthesizeAsyncApi channel-key collision. channelKey collapses every
+// non-alphanumeric run to a single '-', so two DISTINCT same-kind tokens differing
+// only by separators (message device:heartbeat vs device.heartbeat) both hash to
+// 'message-device-heartbeat'. clusterSeams keeps them as SEPARATE seams (it groups on
+// the raw normalized token, which never merges .:/-). Under the old unconditional
+// channels[key]=... the second seam OVERWROTE the first — dropping its address, its
+// x-wiregraph-* roles, and every edge it would have produced (only one channel
+// survived). The fix suffixes collisions (-2, -3, …) so each seam keeps its own
+// channel + operation. Seams are hand-built here in the exact shape synthesizeAsyncApi
+// consumes ({kind, token, compartments, inCompartments, outCompartments, labels}),
+// deterministically ordered as clusterSeams would return them.
+async function channelKeyCollisionTest() {
+  const I = await import('../src/contracts/infer.js');
+  const YAML = (await import('yaml')).default;
+  const seams = [
+    { kind: 'message', token: 'device.heartbeat', compartments: ['app', 'worker'], inCompartments: ['worker'], outCompartments: ['app'], labels: [] },
+    { kind: 'message', token: 'device:heartbeat', compartments: ['app', 'worker'], inCompartments: ['worker'], outCompartments: ['app'], labels: [] },
+  ];
+  const doc = YAML.parse(I.synthesizeAsyncApi(seams));
+
+  // 1. BOTH seams survive — two channels, not one (old behavior kept exactly one).
+  const chKeys = Object.keys(doc.channels);
+  eq(chKeys.length, 2, `L19: colliding seams keep separate channels (got ${chKeys.length}: ${chKeys.join(', ')})`);
+
+  // 2. Both original tokens appear as channel addresses (neither was overwritten).
+  const addrs = new Set(chKeys.map((k) => doc.channels[k].address));
+  ok(addrs.has('device.heartbeat') && addrs.has('device:heartbeat'),
+    `L19: both original addresses preserved (got ${[...addrs].join(', ') || 'none'})`);
+
+  // 3. Keys are distinct: first seam keeps the base key, the collider gets '-2'.
+  ok(chKeys.includes('message-device-heartbeat'), 'L19: first seam keeps the base channel key');
+  ok(chKeys.includes('message-device-heartbeat-2'), 'L19: colliding seam gets a numeric suffix');
+
+  // Each channel carries its OWN operation and its own producer/consumer roles.
+  for (const k of chKeys) {
+    ok(doc.operations[`receive-${k}`], `L19: channel ${k} has its own receive operation`);
+    eq(doc.channels[k]['x-wiregraph-producers'].join(','), 'app', `L19: ${k} keeps its producers`);
+    eq(doc.channels[k]['x-wiregraph-consumers'].join(','), 'worker', `L19: ${k} keeps its consumers`);
+  }
+}
+
+// S1 — template-literal client route inference. The canonical JS/TS client form
+// `fetch(`/orders/${orderId}/items`)` must (A) normalize its `${orderId}` param to
+// `{orderId}` in toAsyncApiPath, and (B) cluster with a server route on the SAME
+// pattern but a different param name (`/orders/:id/items`) into ONE cross-compartment
+// seam — because clusterSeams canonicalizes param NAMES in the grouping key only.
+// Before this fix `${orderId}` fell through toAsyncApiPath verbatim AND the param name
+// was part of the group key, so the client `out` and server `in` never met: the
+// inference->build round-trip was dead for the most idiomatic client route.
+async function templateLiteralSeamTest() {
+  const I = await import('../src/contracts/infer.js');
+
+  // (A) toAsyncApiPath normalizes `${name}` params, whole-segment and intra-segment,
+  // while keeping the existing `:id`/`{id}`/`<id>` forms and leaving a non-path topic
+  // (no `${...}`) untouched apart from the wire leading slash it always adds.
+  eq(I.toAsyncApiPath('/orders/${orderId}/items'), '/orders/{orderId}/items',
+    'S1: toAsyncApiPath normalizes a whole-segment template-literal param');
+  eq(I.toAsyncApiPath('/files/${name}.json'), '/files/{name}.json',
+    'S1: toAsyncApiPath normalizes an intra-segment template-literal param');
+  eq(I.toAsyncApiPath('/orders/:id/items'), '/orders/{id}/items',
+    'S1: toAsyncApiPath still normalizes the classic :id form');
+  eq(I.toAsyncApiPath('order.created'), '/order.created',
+    'S1: toAsyncApiPath leaves a non-param token unchanged (no `{}` introduced)');
+
+  // (B) clustering: a CLIENT wire `out` on `/orders/${orderId}/items` and a SERVER
+  // wire `in` on `/orders/:id/items` — same endpoint pattern, different param names,
+  // different compartments — must cluster into exactly ONE seam spanning both. Two
+  // genuinely different routes (`/orders/:id` vs `/users/:id`) must stay separate.
+  const candidates = [
+    { kind: 'wire', token: '/orders/${orderId}/items', role: 'out', label: 'get', compartment: 'mobile-app', file: 'client.js', line: 1 },
+    { kind: 'wire', token: '/orders/:id/items', role: 'in', label: 'get', compartment: 'svc-api', file: 'server.js', line: 1 },
+    { kind: 'wire', token: '/orders/:id', role: 'in', label: 'get', compartment: 'svc-api', file: 'server.js', line: 2 },
+    { kind: 'wire', token: '/users/:id', role: 'in', label: 'get', compartment: 'svc-api', file: 'server.js', line: 3 },
+  ];
+  const seams = I.clusterSeams(candidates);
+  const itemsSeam = seams.filter((s) => s.token.includes('/items'));
+  eq(itemsSeam.length, 1,
+    `S1: client ${'`${orderId}`'} + server :id cluster into exactly one /items seam (got ${itemsSeam.map((s) => s.token).join(', ') || 'none'})`);
+  const seam = itemsSeam[0];
+  eq(seam.compartments.join(','), 'mobile-app,svc-api', 'S1: the seam spans both compartments');
+  eq(seam.inCompartments.join(','), 'svc-api', 'S1: server compartment learned as in');
+  eq(seam.outCompartments.join(','), 'mobile-app', 'S1: client compartment learned as out');
+  ok(/^\/orders\/\{[A-Za-z0-9_]+\}\/items$/.test(seam.token),
+    `S1: seam address keeps a readable {param} form (got ${seam.token})`);
+  // The two param-only siblings on distinct static segments must NOT wrongly merge:
+  // `/orders/{id}` and `/users/{id}` collapse to `/orders/{}` and `/users/{}` — different
+  // keys — so each stays its own (single-compartment => dropped) group, never one seam.
+  const bareOrders = seams.filter((s) => /^\/orders\/\{[^/]*\}$/.test(s.token));
+  const bareUsers = seams.filter((s) => /^\/users\/\{[^/]*\}$/.test(s.token));
+  ok(bareOrders.length + bareUsers.length === 0,
+    'S1: single-compartment /orders/{id} and /users/{id} did not wrongly merge into a seam');
+
+  // (C) round-trip proof without a full build: synthesizeAsyncApi emits the seam as a
+  // channel whose address the name-agnostic H2 pathTokenRegex matches against BOTH the
+  // client `${orderId}` source form AND the server `:id` source form — so buildWireEdges
+  // WOULD mint REFERENCES on both sides and a WIRE seam from this inferred spec.
+  const YAML = (await import('yaml')).default;
+  const { pathTokenRegex } = await import('../src/extract/contracts.js');
+  const doc = YAML.parse(I.synthesizeAsyncApi(seams));
+  const addr = Object.values(doc.channels).map((c) => c.address).find((a) => String(a).includes('/items'));
+  ok(addr, `S1: synthesized spec carries the /items channel address (got ${addr || 'none'})`);
+  const re = pathTokenRegex(addr);
+  ok(re.test('/orders/${orderId}/items'), 'S1: inferred channel matches the client template-literal source form');
+  ok(re.test('/orders/:id/items'), 'S1: inferred channel matches the server :id source form');
 }
 
 // M1 — incremental parity: a body-only edit to a producer, routed through the
@@ -2243,6 +3357,245 @@ async function formerLinksTombstoneTest() {
   }
 }
 
+// find_symbol truncation (L17/L18): symbolMatches is capped at 100 rows before the
+// header is built, so the header MUST report the TRUE total (not the capped count) and
+// flag the truncation — otherwise an agent trusts "100 match(es)" as complete and stops
+// narrowing. Build a real project with >100 same-named defs (the header count is the
+// bug's whole surface), plus a small name to lock the non-truncated header exactly.
+async function findSymbolTruncationTest() {
+  const work = realpathSync(mkdtempSync(join(tmpdir(), 'cg-findsym-cap-')));
+  const project = join(work, 'proj');
+  mkdirSync(project);
+  const db = join(project, '.wiregraph', 'graph.db');
+  writeFileSync(join(project, 'package.json'), '{"name":"proj","type":"module"}');
+  // 150 files each defining dupName → 150 matches (> the 100 cap).
+  for (let i = 0; i < 150; i++) writeFileSync(join(project, `f${i}.js`), 'export function dupName(){}\n');
+  // 3 files defining triName → an exact 3-match header, below the cap.
+  for (let i = 0; i < 3; i++) writeFileSync(join(project, `t${i}.js`), 'export function triName(){}\n');
+  await runBuild({ target: project, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+
+  const trunc = String(Q.findSymbol(conn, project, 'dupName'));
+  // TRUE total, not the capped 100 (the old code printed "100 match(es)" here).
+  has(trunc, '150 match(es)', 'find_symbol reports the true total when matches exceed the cap');
+  has(trunc, 'showing first 100', 'find_symbol flags truncation when matches exceed the cap');
+  const listed = trunc.split('\n').filter((ln) => ln.startsWith('  ')).length;
+  eq(listed, 100, 'find_symbol lists exactly the capped 100 result lines when truncated');
+
+  const small = String(Q.findSymbol(conn, project, 'triName'));
+  has(small, '3 match(es) for "triName":', 'find_symbol header is the exact count below the cap');
+  ok(!small.includes('showing first'), 'find_symbol omits the truncation note below the cap');
+  conn.close();
+  rmSync(work, { recursive: true, force: true });
+}
+
+// Legacy-codegraph cleanup (L23/L24/L25): a project initialized before the
+// codegraph→wiregraph rename must uninstall cleanly — the legacy CLAUDE.md block and
+// the .codegraph/ .gitignore entry — WITHOUT rewriting the user's unrelated whitespace.
+async function legacyCleanupTests() {
+  const CM = await import('../scripts/lib/claudemd.mjs');
+  const RM = await import('../scripts/remove.mjs');
+
+  // --- L23: legacy-only CLAUDE.md block is seen by the removal gate --------
+  const legacyBlock = '<!-- BEGIN codegraph (managed) -->\n## codegraph directive body\n<!-- END codegraph -->';
+  const legacyCm = `# My project\n\nSome user prose here.\n\n${legacyBlock}\n\nMore user prose after.\n`;
+  ok(CM.presentAny(legacyCm), 'L23: presentAny sees a legacy-only codegraph block (removal gate fires)');
+  ok(!CM.present(legacyCm), 'L23: present (new-sentinel only) misses the legacy block — the gap the fix closes');
+  const strippedCm = CM.withoutBlock(legacyCm);
+  ok(!strippedCm.includes('BEGIN codegraph'), 'L23: withoutBlock removes the legacy block');
+  ok(!strippedCm.includes('codegraph directive body'), 'L23: withoutBlock removes the legacy block body');
+  has(strippedCm, 'Some user prose here.', 'L23: withoutBlock preserves user prose before the block');
+  has(strippedCm, 'More user prose after.', 'L23: withoutBlock preserves user prose after the block');
+
+  // Current-block content still gates and strips as before.
+  const curCm = `# Proj\n\n${CM.block()}\n\ntail\n`;
+  ok(CM.presentAny(curCm), 'L23: presentAny sees a current wiregraph block too');
+  ok(CM.present(curCm), 'L23: present still true for a current block (apply/diff wording unchanged)');
+  ok(!CM.presentAny('# just prose\n'), 'L23: presentAny false when no block is present');
+
+  // --- L24: legacy .codegraph/ .gitignore entry (+ its comment) is dropped --
+  const legacyGi = 'node_modules/\ndist/\n\n# wiregraph (managed) — the graph db lives here\n.codegraph/\n\n*.log\n';
+  const strippedGi = RM.stripGitignore(legacyGi);
+  ok(!strippedGi.includes('.codegraph/'), 'L24: stripGitignore drops the legacy .codegraph/ line');
+  ok(!strippedGi.includes('# wiregraph'), 'L24: stripGitignore drops the legacy entry comment');
+  has(strippedGi, 'node_modules/', 'L24: stripGitignore keeps unrelated entries (node_modules/)');
+  has(strippedGi, 'dist/', 'L24: stripGitignore keeps unrelated entries (dist/)');
+  has(strippedGi, '*.log', 'L24: stripGitignore keeps unrelated entries (*.log)');
+
+  // The current .wiregraph/ case still works.
+  const curGi = 'src/\n\n# wiregraph (managed)\n.wiregraph/\n\nbuild/\n';
+  const strippedCurGi = RM.stripGitignore(curGi);
+  ok(!strippedCurGi.includes('.wiregraph/'), 'L24: stripGitignore still drops the current .wiregraph/ line');
+  ok(!strippedCurGi.includes('# wiregraph'), 'L24: stripGitignore still drops the current entry comment');
+  has(strippedCurGi, 'src/', 'L24: stripGitignore keeps unrelated entries around the current line');
+  has(strippedCurGi, 'build/', 'L24: stripGitignore keeps unrelated entries after the current line');
+
+  // --- L25: seam-only whitespace normalization -----------------------------
+  // An intentional triple-blank run ELSEWHERE in the file must survive.
+  const farApart = `head line\n\n\n\nintentional triple-blank section above\n\n${CM.block()}\n\ntail\n`;
+  const strippedFar = CM.withoutBlock(farApart);
+  has(strippedFar, 'head line\n\n\n\nintentional triple-blank section above', 'L25: unrelated triple-blank run is preserved (not collapsed)');
+  ok(!strippedFar.includes(BEGIN_MARK(CM)), 'L25: the block itself is removed');
+
+  // Block in the middle → exactly one blank line at the seam.
+  const mid = `before\n\n${CM.block()}\n\nafter\n`;
+  eq(CM.withoutBlock(mid), 'before\n\nafter\n', 'L25: block in the middle leaves exactly one blank line at the seam');
+
+  // Block at file start → no leading blank line.
+  const atStart = `${CM.block()}\n\nafter\n`;
+  eq(CM.withoutBlock(atStart), 'after\n', 'L25: block at file start leaves no leading blank line');
+
+  // Block at file end → a single trailing newline.
+  const atEnd = `before\n\n${CM.block()}\n`;
+  eq(CM.withoutBlock(atEnd), 'before\n', 'L25: block at file end keeps a single trailing newline');
+
+  // stripGitignore preserves an unrelated multi-blank run after stripping an entry.
+  const giBlanks = 'a/\n\n\n\nb/\n\n# wiregraph (managed)\n.wiregraph/\n';
+  const strippedGiBlanks = RM.stripGitignore(giBlanks);
+  has(strippedGiBlanks, 'a/\n\n\n\nb/', 'L25: stripGitignore preserves an unrelated multi-blank run');
+  ok(!strippedGiBlanks.includes('.wiregraph/'), 'L25: stripGitignore still removed the entry');
+}
+
+// Small helper so the L25 assertion above doesn't hard-code the sentinel string.
+function BEGIN_MARK(CM) { return CM.block().split('\n')[0]; }
+
+// GEXF export (parallel to exportHtmlTests). Two things must hold: the file is
+// well-formed GEXF whose node count matches the exporter's kept-symbol set, and —
+// mirroring the export-html XSS tests — every string that lands in the XML is run
+// through the xml() escaper so a hostile symbol/token/contract name can't break out
+// of a tag or attribute. We inject a symbol + WIRE edge carrying XML-hostile chars
+// (a literal </node>, &, ", <script>) straight into the db and prove the CLI escapes
+// them. --all mode is used so every symbol + CALLS + WIRE lands in the output.
+async function exportGexfTests() {
+  const proj = realpathSync(mkdtempSync(join(tmpdir(), 'cg-gexf-')));
+  cpSync(FIXTURE, join(proj, 'repo'), { recursive: true });
+  mkdirSync(join(proj, 'repo', '.git'), { recursive: true });
+  const db = join(proj, '.wiregraph', 'graph.db');
+  await runBuild({ target: proj, project: proj, db, reset: true });
+  const EXPORT = join(HERE, '..', 'src', 'export-gexf.js');
+  const out = join(proj, 'graph.gexf');
+
+  // --- well-formed GEXF + node/edge counts --------------------------------
+  await execFileP('node', [EXPORT, '--all', '--project', proj, '--db', db, out]);
+  const gexf = readFileSync(out, 'utf8');
+  has(gexf, '<?xml version="1.0"', 'export-gexf: emits an XML prolog');
+  has(gexf, '<gexf xmlns="http://gexf.net/1.3"', 'export-gexf: root <gexf> element with namespace');
+  has(gexf, 'defaultedgetype="directed"', 'export-gexf: the graph is directed');
+  has(gexf, '<nodes>', 'export-gexf: opens a <nodes> section');
+  has(gexf, '</nodes>', 'export-gexf: closes the <nodes> section');
+  has(gexf, '<edges>', 'export-gexf: opens an <edges> section');
+  has(gexf, '</edges>', 'export-gexf: closes the <edges> section');
+  has(gexf, '</gexf>', 'export-gexf: closes the root element');
+
+  // The <node> count must equal the exporter's kept-symbol set. We mirror its own
+  // isTest predicate so a regression on either side (dropped nodes, leaked test
+  // symbols) is caught, not just "some XML came out".
+  const conn = connect(db, { readonly: true });
+  const isTestF = (f) => !!f && (f.includes('tests/') || f.includes('/test/') || f.includes('.test.') || f.includes('_test.') || f.includes('/test_'));
+  const expectedNodes = conn.prepare('SELECT file FROM symbols WHERE project=?').all(proj).filter((r) => !isTestF(r.file)).length;
+  conn.close();
+  ok(expectedNodes > 0, `export-gexf: the fixture produced symbols to export (got ${expectedNodes})`);
+  eq((gexf.match(/<node /g) || []).length, expectedNodes, 'export-gexf: exactly one <node> per kept symbol');
+  ok((gexf.match(/<edge /g) || []).length > 0, 'export-gexf: the fixture CALLS edges are emitted as <edge> elements');
+  has(gexf, 'id="e0"', 'export-gexf: edges carry sequential ids');
+
+  // --- escaping: hostile name / attrs / edge tokens must be XML-escaped ----
+  const evil = '</node> & "q" <script>x</script>';
+  const w = connect(db, {});
+  w.prepare('INSERT INTO symbols (id,project,compartment,file,name,kind,lang,startLine,endLine) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run('EVIL', proj, 'c<&>', 'e<v>.js', evil, 'function', 'js', 1, 2);
+  w.prepare('INSERT INTO edges (type,src,dst,project,token,cnt,resolution,evidence,direction,contract) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run('WIRE', 'EVIL', 'EVIL', proj, evil, 1, null, null, evil, evil);
+  w.close();
+  await execFileP('node', [EXPORT, '--all', '--project', proj, '--db', db, out]);
+  const hostile = readFileSync(out, 'utf8');
+  has(hostile, 'id="EVIL"', 'export-gexf: the injected hostile symbol is exported');
+  has(hostile, '&lt;/node&gt;', 'export-gexf: a </node> in a name is escaped so it cannot close the node early');
+  has(hostile, '&amp;', 'export-gexf: a bare & is escaped to &amp;');
+  has(hostile, '&quot;', 'export-gexf: a double-quote is escaped to &quot; so it cannot break an attribute');
+  ok(!hostile.includes('</node> &'), 'export-gexf: the raw </node> breakout sequence from the name is absent');
+  ok(!hostile.includes('<script>'), 'export-gexf: no unescaped <script> tag leaks into the XML');
+  rmSync(proj, { recursive: true, force: true });
+}
+
+// contracts.mjs CLI (scan / apply). Drive the real script over a scratch two-repo
+// workspace with a genuine cross-repo wire seam (svc-api defines /api/register, the
+// mobile-app calls it). scan must report the seam and write NOTHING; apply must write
+// the draft AsyncAPI spec into a fresh contracts/ home; a re-apply over a hand-edited
+// draft must back the old one up before overwriting (the never-silently-clobber rule).
+async function contractsCliTests() {
+  const CONTRACTS = join(HERE, '..', 'scripts', 'contracts.mjs');
+  const work = realpathSync(mkdtempSync(join(tmpdir(), 'cg-contracts-cli-')));
+  cpSync(join(FIXTURE_CONTRACTS, 'svc-api'), join(work, 'svc-api'), { recursive: true });
+  cpSync(join(FIXTURE_CONTRACTS, 'mobile-app'), join(work, 'mobile-app'), { recursive: true });
+  mkdirSync(join(work, 'svc-api', '.git'), { recursive: true });   // distinct git repos => cross-repo seam
+  mkdirSync(join(work, 'mobile-app', '.git'), { recursive: true });
+  const specPath = join(work, 'contracts', 'wiregraph-inferred.asyncapi.yaml');
+
+  // --- scan: report the seam, print a draft, write nothing ----------------
+  const scan = await execFileP('node', [CONTRACTS, 'scan', work]);
+  has(scan.stdout, '/api/register', 'contracts-cli scan: reports the cross-repo seam token');
+  has(scan.stdout, 'NOT written', 'contracts-cli scan: labels the proposed contract as unwritten');
+  has(scan.stdout, 'address: /api/register', 'contracts-cli scan: prints the draft channel address');
+  ok(!existsSync(specPath), 'contracts-cli scan: is a dry run — no spec file written');
+
+  // --- apply: write the draft into a fresh contracts/ home ----------------
+  const apply = await execFileP('node', [CONTRACTS, 'apply', work]);
+  has(apply.stdout, 'Wrote', 'contracts-cli apply: reports it wrote the channel(s)');
+  ok(existsSync(specPath), 'contracts-cli apply: writes contracts/wiregraph-inferred.asyncapi.yaml');
+  const spec = readFileSync(specPath, 'utf8');
+  has(spec, 'asyncapi:', 'contracts-cli apply: the written file is an AsyncAPI spec');
+  has(spec, 'address: /api/register', 'contracts-cli apply: the spec carries the inferred channel address');
+
+  // --- re-apply over a hand-edited draft backs the old one up -------------
+  writeFileSync(specPath, spec + '\n# hand edit\n');
+  const reapply = await execFileP('node', [CONTRACTS, 'apply', work]);
+  has(reapply.stdout, 'backed it up', 'contracts-cli apply: a differing existing draft is backed up, not silently clobbered');
+  const backupDir = join(work, '.wiregraph', 'contract-backups');
+  ok(existsSync(backupDir) && readdirSync(backupDir).some((f) => f.endsWith('.bak')), 'contracts-cli apply: the prior draft is preserved as a timestamped .bak under .wiregraph/');
+  ok(!readFileSync(specPath, 'utf8').includes('# hand edit'), 'contracts-cli apply: the spec is regenerated (the hand edit is overwritten after backup)');
+
+  rmSync(work, { recursive: true, force: true });
+}
+
+// workspace.mjs `repos` scope classifier (drives the init scope guidance). The three
+// classes: MULTI (>=2 compartments — cross-compartment contracts possible), SINGLE
+// (one compartment / lone git repo), NO-GIT (a manifest-less non-git folder indexed
+// as one unit). Each is asserted through the CLI's `scope:` line.
+async function workspaceScopeTests() {
+  const WS = join(HERE, '..', 'scripts', 'lib', 'workspace.mjs');
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'cg-wspace-')));
+
+  // (a) MULTI — a parent holding two separate git repos = two compartments.
+  const multi = join(base, 'multi');
+  mkdirSync(join(multi, 'alpha', '.git'), { recursive: true });
+  mkdirSync(join(multi, 'beta', '.git'), { recursive: true });
+  writeFileSync(join(multi, 'alpha', 'a.js'), 'export function a(){ return 1; }\n');
+  writeFileSync(join(multi, 'beta', 'b.js'), 'export function b(){ return 2; }\n');
+  const mOut = (await execFileP('node', [WS, 'repos', multi])).stdout;
+  has(mOut, 'scope: MULTI (compartments=2)', 'workspace: two git repos under a parent classify as MULTI with 2 compartments');
+  has(mOut, 'alpha', 'workspace: the MULTI listing names the alpha compartment');
+  has(mOut, 'beta', 'workspace: the MULTI listing names the beta compartment');
+
+  // (b) SINGLE — one git repo is its own lone compartment.
+  const single = join(base, 'single');
+  mkdirSync(join(single, '.git'), { recursive: true });
+  writeFileSync(join(single, 's.js'), 'export function s(){ return 3; }\n');
+  const sOut = (await execFileP('node', [WS, 'repos', single])).stdout;
+  has(sOut, 'scope: SINGLE (compartments=1)', 'workspace: a lone git repo classifies as SINGLE');
+  has(sOut, 'Target is itself a git repo: yes', 'workspace: the SINGLE target is reported as a git repo');
+
+  // (c) NO-GIT — a plain source folder with neither .git nor a module manifest.
+  const plain = join(base, 'plain');
+  mkdirSync(plain, { recursive: true });
+  writeFileSync(join(plain, 'p.js'), 'export function p(){ return 4; }\n');
+  const pOut = (await execFileP('node', [WS, 'repos', plain])).stdout;
+  has(pOut, 'scope: NO-GIT (compartments=0)', 'workspace: a non-git, manifest-less folder classifies as NO-GIT');
+  has(pOut, 'Compartments found: 0', 'workspace: NO-GIT reports zero compartments');
+
+  rmSync(base, { recursive: true, force: true });
+}
+
 // Isolate the global-project registry: builds during the suite would otherwise
 // register temp /tmp projects into the real ~/.wiregraph-projects.json. Point it at a
 // throwaway file for the whole run (cleaned up before exit).
@@ -2252,26 +3605,39 @@ process.env.WIREGRAPH_LINKS_HISTORY = join(tmpdir(), `cg-test-links-history-${pr
 
 console.log('wiregraph regression test');
 await fixtureTests();
+await fullBuildIdempotencyTest();
 await pythonTests();
 await jvmLangTests('java', FIXTURE_JAVA, 'App.java');
 await jvmLangTests('kotlin', FIXTURE_KOTLIN, 'App.kt');
 await freshnessTests();
 await concurrencyTest();
+await ensureFreshTests();
+lockStealDecisionTest();
 await rebuildDurabilityTest();
+await incrementalDurabilityTest();
 await metricsTests();
 await measuredRecurringTests();
+await sessionFilterTests();
 await hookAppendTests();
 await metricsMigrationTests();
 await globalStatsTests();
 await resolutionTests();
 await contractsTests();
 await contractDriftTest();
+await wordBoundaryAttributionTest();
+await paramRouteMatchTest();
+await prefixNestingMatchTest();
+await roleAwareDriftTest();
+await pathTokenMatchUnitTest();
 await messagingTest();
 await stateTest();
+await tsEnvStateTest();
+await atomicStateTest();
 await potentialTest();
 await importsTest();
 await exportHtmlTests();
 await exportContractEdgesTest();
+await exportHtmlEscapingTest();
 await schemaGuardTest();
 await structuralDriftTest();
 await distinctivenessTest();
@@ -2280,9 +3646,12 @@ await wireCrossCompartmentOnlyTest();
 await contractDiscoveryTest();
 await topLevelSpecSeamTest();
 await contractCollisionMergeTest();
+await channelKeyCollisionTest();
+await templateLiteralSeamTest();
 await gitReposTest();
 await linkStateTests();
 await linkGuardTests();
+await previewLinkShapeTest();
 await walkSourcesTests();
 await inferAcrossTest();
 await idIndependenceTest();
@@ -2291,11 +3660,15 @@ await linkMutualAutoInitTest();
 await unlinkPurgeCleanupTest();
 await fanOutAttributionTest();
 await reindexRegressionTest();
+await filesArgParseTest();
+await commaPathReindexTest();
 await findIndexedRootInvarianceTest();
 await linkAtomicityTest();
+await linkInitiatorPreservedTest();
 await linkAutoCreatedCrashTest();
 await resetEntryPointsTest();
 await memberFreshnessTest();
+await catchUpEscalationTest();
 await graphStatsGroupingTest();
 await e2eLinkSeamTest();
 await incrementalContractRematchTest();
@@ -2306,6 +3679,11 @@ await linkPreviewFatalTest();
 await staleProjectHealTest();
 await renameGhostCompartmentTest();
 await formerLinksTombstoneTest();
+await findSymbolTruncationTest();
+await legacyCleanupTests();
+await exportGexfTests();
+await contractsCliTests();
+await workspaceScopeTests();
 rmSync(process.env.WIREGRAPH_REGISTRY, { force: true }); // drop the throwaway registry
 rmSync(process.env.WIREGRAPH_LINKS_HISTORY, { force: true }); // and the throwaway tombstone
 console.log(`\n${pass} passed, ${fail} failed`);
