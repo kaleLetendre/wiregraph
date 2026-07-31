@@ -399,6 +399,12 @@ export function loadGraph(db, graph, { reset = false, log = () => {}, allowReduc
 // the authoritative tiebreaker for a mtime+size MATCH (see reconcileRepoByContent); it is
 // NULL on any row indexed before v5 stamped it → the caller treats a null hash as "cannot
 // confirm" and reindexes that file (superset-safe).
+//
+// The JOIN is on compartment NAME (files store the compartment by name, not id), so two
+// compartments that share a basename within one project cross-join — one file row yields
+// one row per same-named compartment root. This predates this helper (files/pruneFile are
+// name-keyed project-wide) and the reconcile's `startsWith(root+sep)` scope guard filters
+// the stray root out in every realistic case; a note for the maintainer, not a live bug.
 export function listIndexedFiles(db, project) {
   // The reconcile connects READONLY, and this SELECT runs with no schema gate ahead of it
   // — so a pre-v5 db (files table without the hash column) would throw here on the upgrade

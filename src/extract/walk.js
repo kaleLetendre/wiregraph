@@ -119,6 +119,11 @@ function findGitRepos(rootDir) {
     // A linked worktree nested under the root is an alternate checkout of a repo we
     // already cover — never a separate repo (avoids duplicate-branch pollution and the
     // "new repo" full-rebuild escalation). The root itself is kept even if it IS one.
+    // Corollary: pointing init at a bare-repo CONTAINER whose only children are worktrees
+    // (repo/{main,feature}/) yields an EMPTY graph — none of them is the scan root, so all
+    // are skipped. That's intended: the old behavior indexed each as a separate repo and
+    // collided their same-named symbols. Index one worktree (or the bare repo's main
+    // checkout) directly, not the container.
     if (dir !== rootDir && isLinkedWorktree(dir)) return false;
     return true;
   });
