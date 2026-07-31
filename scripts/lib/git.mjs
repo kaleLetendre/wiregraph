@@ -72,23 +72,34 @@ export function projectRepos(project) {
 // uncommitted working-tree changes (git status --porcelain). Returns absolute
 // paths so build.js --files resolves them unambiguously.
 //   { files: [abs...], newShas: { root: head }, repos: [{name,root,head}],
-//     fullBuildNeeded: bool, fullBuildReasons: [str...] }
+//     fullBuildNeeded: bool, fullBuildReasons: [str...],
+//     invalidBaselineRepos: [{name,root,head}...] }
 //
 // fullBuildNeeded signals that an INCREMENTAL apply would silently miss code, so
 // an auto-catch-up caller must escalate to a full rebuild instead of trusting
-// `files`/`newShas`. Two conditions trip it:
-//   - NEW REPO (no reposLastSha entry): its committed history was never diffed, so
-//     an incremental apply indexes nothing yet the sha jumps to HEAD — after which
-//     last === HEAD forever and the code is never picked up.
-//   - INVALID BASELINE: the stored sha is no longer a reachable revision (e.g. gc'd
-//     after an amend/rebase), so `git diff last..HEAD` FAILS (git() returns null,
-//     distinct from "" for a valid-but-empty diff). Advancing past a failed range
-//     would permanently drop the last..HEAD commits.
+// `files`/`newShas`. It trips on a NEW REPO (no reposLastSha entry): its committed
+// history was never diffed, so an incremental apply indexes nothing yet the sha jumps
+// to HEAD — after which last === HEAD forever and the code is never picked up.
+//
+// INVALID BASELINE is surfaced SEPARATELY (invalidBaselineRepos), NOT as
+// fullBuildNeeded: the stored sha is no longer a reachable revision (e.g. gc'd after an
+// amend/rebase), so `git diff last..HEAD` FAILS (git() returns null, distinct from ""
+// for a valid-but-empty diff) and the last..HEAD file list is unknowable. This used to
+// force a whole-PROJECT teardown+rebuild — catastrophic on a big repo and recurring
+// every rebase+gc cycle, even when a message-only `git commit --amend` never touched a
+// single working-tree file. But the lost diff does NOT mean the code is unknowable: the
+// working tree already reflects the new HEAD, and the store records each file's
+// mtime+size, so the affected repo can be reconciled by CONTENT (reindex only files
+// that actually differ, prune vanished ones) and restamped — leaving the rest of the
+// graph intact. The caller (refresh.mjs) does that per-repo reconcile; here we merely
+// name which repos need it. (If the caller can't establish a reliable content
+// comparison it still falls back to a full rebuild — safety over cleverness.)
 export function changedSince(project, reposLastSha = {}) {
   const repos = projectRepos(project);
   const files = new Set();
   const newShas = {};
   const fullBuildReasons = [];
+  const invalidBaselineRepos = [];
 
   for (const repo of repos) {
     if (repo.head) newShas[repo.root] = repo.head;
@@ -100,9 +111,10 @@ export function changedSince(project, reposLastSha = {}) {
       fullBuildReasons.push(`new repo: ${repo.name}`);
     } else if (last && repo.head && last !== repo.head) {
       // Call git ONCE and test === null: null is a failed revision range (the stored
-      // baseline is gone), "" is a valid range with no changes. Only the former escalates.
+      // baseline is gone), "" is a valid range with no changes. A null diff no longer
+      // escalates the WHOLE project — it flags THIS repo for a content-reconcile instead.
       const diff = git(repo.root, ['diff', '--name-only', `${last}..${repo.head}`]);
-      if (diff === null) fullBuildReasons.push(`invalid baseline: ${repo.name}`);
+      if (diff === null) invalidBaselineRepos.push(repo);
       else diff.split('\n').filter(Boolean).forEach((f) => rels.add(f));
     }
     // Uncommitted changes (porcelain: "XY path" or rename "XY old -> new").
@@ -120,7 +132,7 @@ export function changedSince(project, reposLastSha = {}) {
     }
   }
 
-  return { files: [...files], newShas, repos, fullBuildNeeded: fullBuildReasons.length > 0, fullBuildReasons };
+  return { files: [...files], newShas, repos, fullBuildNeeded: fullBuildReasons.length > 0, fullBuildReasons, invalidBaselineRepos };
 }
 
 // Per-repo divergence from the configured upstream tracking branch.

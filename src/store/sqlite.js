@@ -384,6 +384,21 @@ export function loadGraph(db, graph, { reset = false, log = () => {}, allowReduc
   log(`  loaded ${n.symbols} symbols, ${n.files} files, ${n.edges} edges into sqlite`);
 }
 
+// Every indexed source file for `project` with the on-disk stamp recorded at index
+// time (mtime+size, schema v2) and its compartment ROOT, so an absolute path can be
+// reconstructed as join(root, path). Used by the invalid-baseline content-reconcile
+// (build.js) to compare disk-vs-graph WITHOUT a git diff — the diff is exactly what's
+// unavailable once the baseline sha was gc'd. mtime/size may be null on a file indexed
+// before v2 populated them; the caller treats a null stamp as "differs" (reindex) and
+// bails to a full rebuild if NO file under the repo carries a usable stamp.
+export function listIndexedFiles(db, project) {
+  return db.prepare(
+    'SELECT f.compartment AS compartment, f.path AS path, f.mtime AS mtime, f.size AS size, c.root AS root ' +
+    'FROM files f JOIN compartments c ON c.name = f.compartment AND c.project = f.project ' +
+    'WHERE f.project = ?',
+  ).all(project);
+}
+
 // Read this project's existing symbol definitions (for incremental call
 // resolution): a changed file's outgoing calls resolve against the whole project,
 // not just the re-parsed file. Mirrors neo4j.js loadProjectSymbols.

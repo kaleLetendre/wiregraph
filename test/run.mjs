@@ -2711,13 +2711,17 @@ async function catchUpEscalationTest() {
 
   // --- M5: a stored baseline that is no longer a reachable revision ------------
   // 40 hex chars that name no real object → git diff last..HEAD FAILS (git() → null,
-  // distinct from "" for a valid-but-empty diff). Must escalate, not silently skip.
+  // distinct from "" for a valid-but-empty diff). This must NOT force a whole-project
+  // full rebuild (bug B): it surfaces the ONE repo in invalidBaselineRepos so the
+  // caller can content-reconcile just that repo. fullBuildNeeded stays false — only a
+  // NEW repo (H4) escalates the whole project.
   const m5 = realpathSync(mkdtempSync(join(ws, 'm5-')));
   await gitCommit(m5, { 'a.js': 'export function a(){ return 1; }\n' });
   const bogus = 'deadbeef'.repeat(5);
   const cBad = GIT.changedSince(m5, { [m5]: bogus });
-  ok(cBad.fullBuildNeeded === true, 'catch-up M5: an unreachable stored sha (failed diff) escalates rather than silently skipping');
-  ok(cBad.fullBuildReasons.some((r) => r.includes('invalid baseline')), `catch-up M5: a reason marks the invalid baseline (got ${JSON.stringify(cBad.fullBuildReasons)})`);
+  ok(cBad.fullBuildNeeded === false, 'catch-up M5: an unreachable stored sha does NOT force a whole-project full rebuild (content-reconcile instead)');
+  ok(cBad.invalidBaselineRepos.some((r) => r.root === m5), `catch-up M5: the repo with the invalid baseline is surfaced in invalidBaselineRepos (got ${JSON.stringify(cBad.invalidBaselineRepos.map((r) => r.name))})`);
+  ok(!cBad.fullBuildReasons.some((r) => r.includes('invalid baseline')), 'catch-up M5: invalid baseline is no longer lumped into fullBuildReasons');
 
   // --- Negative: a valid baseline with a real commit on top → normal incremental
   const norm = realpathSync(mkdtempSync(join(ws, 'norm-')));
@@ -2779,6 +2783,146 @@ async function catchUpEscalationTest() {
   const conn = connect(join(home2, '.wiregraph', 'graph.db'), { readonly: true });
   has(Q.findSymbol(conn, home2, 'nestedFn'), 'n.js', 'catch-up e2e: the new repo\'s committed symbol is now indexed');
   conn.close();
+
+  rmSync(ws, { recursive: true, force: true });
+}
+
+// Invalid-baseline CONTENT RECONCILE (bug B). A git worktree that gets rebased/amended
+// then gc'd loses the stored baseline sha (git diff last..HEAD fails). The old code
+// escalated to a whole-PROJECT teardown+rebuild on EVERY such cycle — a massive needless
+// rebuild that fired even when a message-only `git commit --amend` never touched a file.
+// The fix reconciles the ONE affected repo by on-disk content (mtime+size vs what was
+// indexed, schema v2): reindex only files that actually differ, prune vanished ones,
+// restamp the repo, and LEAVE the rest of the graph intact. Falls back to a full rebuild
+// only when the store can't support a content comparison (safety over cleverness).
+// Uses real git repos + the real refresh.mjs auto path end-to-end.
+async function invalidBaselineReconcileTest() {
+  const S = await import('../scripts/lib/state.mjs');
+  const GIT = await import('../scripts/lib/git.mjs');
+  const B = await import('../src/build.js');
+  const gitCommit = async (dir, files, msg = 'init') => {
+    await execFileP('git', ['-C', dir, 'init', '-q']);
+    await execFileP('git', ['-C', dir, 'config', 'user.email', 't@t']);
+    await execFileP('git', ['-C', dir, 'config', 'user.name', 't']);
+    for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+    await execFileP('git', ['-C', dir, 'add', '-A']);
+    await execFileP('git', ['-C', dir, 'commit', '-q', '-m', msg]);
+  };
+  // Orphan a repo's baseline: rewrite HEAD then gc away the old (now unreachable) commit,
+  // so its stored sha no longer names a reachable revision — the exact bug trigger.
+  const orphanHead = async (dir) => {
+    await execFileP('git', ['-C', dir, 'reflog', 'expire', '--expire=now', '--all']);
+    await execFileP('git', ['-C', dir, 'gc', '--prune=now', '-q']);
+  };
+  const symCount = (dbPath) => { const db = connect(dbPath, { readonly: true }); const n = db.prepare('SELECT COUNT(*) c FROM symbols').get().c; db.close(); return n; };
+  const runRefresh = (proj, args = []) => execFileP('node', [REFRESH, ...args], { env: { ...process.env, CLAUDE_PROJECT_DIR: proj } });
+  const ws = realpathSync(mkdtempSync(join(tmpdir(), 'cg-invbase-')));
+
+  // ---- Case 1: message-only amend + gc → CONTENT NO-OP, no full rebuild --------
+  // The working tree never changed, so every file's mtime+size still matches what was
+  // indexed → zero files reindexed, zero symbols disturbed, and NO whole-project rebuild.
+  const p1 = realpathSync(mkdtempSync(join(ws, 'noop-')));
+  await gitCommit(p1, { 'a.js': 'export function alpha(){ return 1; }\n' });
+  await runRefresh(p1, ['--full']);
+  const db1 = join(p1, '.wiregraph', 'graph.db');
+  const st1 = S.readState(p1);
+  const fullBefore1 = st1.lastFullBuild;
+  const symsBefore1 = symCount(db1);
+  // Rewrite ONLY the commit message (never a working-tree file) and gc, so the baseline
+  // sha is orphaned but every file's mtime+size is untouched. A new message guarantees a
+  // fresh sha regardless of timing (--no-edit can reproduce the same sha within one second).
+  await execFileP('git', ['-C', p1, 'commit', '--amend', '-m', 'amended: message only', '-q']);
+  await orphanHead(p1);
+  // changedSince now flags the invalid baseline WITHOUT a whole-project escalation.
+  const cInv = GIT.changedSince(p1, st1.reposLastSha);
+  ok(cInv.fullBuildNeeded === false && cInv.invalidBaselineRepos.length === 1 && cInv.invalidBaselineRepos[0].root === p1,
+    'inv-base noop: amend+gc surfaces the repo in invalidBaselineRepos with no whole-project fullBuildNeeded');
+  await runRefresh(p1);
+  const log1 = readFileSync(S.refreshLogPath(p1), 'utf8');
+  has(log1, 'content no-op', 'inv-base noop: refresh logs a content no-op after the invalid baseline');
+  const st1b = S.readState(p1);
+  eq(st1b.lastFullBuild, fullBefore1, 'inv-base noop: NO full rebuild ran (lastFullBuild unchanged)');
+  eq(symCount(db1), symsBefore1, 'inv-base noop: the graph symbols are undisturbed (nothing reindexed)');
+  eq(st1b.reposLastSha[p1], GIT.headSha(p1), 'inv-base noop: the repo sha was restamped to the new HEAD');
+  await runRefresh(p1);
+  has(readFileSync(S.refreshLogPath(p1), 'utf8').trim().split('\n').pop(), 'nothing changed',
+    'inv-base noop: the restamp sticks — the next refresh is a plain no-op (not a re-escalation)');
+
+  // ---- Case 2: content DID change under an invalid baseline; only the changed file
+  //      is reindexed, an unrelated SUB-REPO (its own compartment) stays intact, and
+  //      NO whole-project reset runs -----------------------------------------------
+  const home = realpathSync(mkdtempSync(join(ws, 'home-')));
+  await gitCommit(home, { 'h.js': 'export function homeFn(){ return 1; }\n' });
+  const nested = join(home, 'nested');
+  mkdirSync(nested, { recursive: true });
+  await gitCommit(nested, { 'n.js': 'export function nestedFn(){ return 2; }\n' });
+  await runRefresh(home, ['--full']); // indexes home + the nested sub-repo; stamps BOTH baselines
+  const dbH = join(home, '.wiregraph', 'graph.db');
+  const st2 = S.readState(home);
+  ok(st2.reposLastSha[home] && st2.reposLastSha[nested], 'inv-base changed: baselines stamped for both the home repo and its nested sub-repo');
+  { const db = connect(dbH, { readonly: true }); has(Q.findSymbol(db, home, 'nestedFn'), 'n.js', 'inv-base changed: the nested sub-repo symbol is indexed'); db.close(); }
+
+  // Change home's OWN file, then AMEND its baseline commit (rewriting history) and gc —
+  // so home's stored baseline sha is orphaned while the working tree carries the new
+  // code. (A plain commit keeps the baseline reachable as an ancestor; only a rewrite
+  // orphans it — the actual bug trigger, a rebase/amend the dev repeats often.) The
+  // nested sub-repo is left completely untouched, so its baseline stays valid.
+  writeFileSync(join(home, 'h.js'), 'export function homeFn(){ return 1; }\nexport function addedFn(){ return 9; }\n');
+  await execFileP('git', ['-C', home, 'commit', '--amend', '--no-edit', '-a', '-q']);
+  await orphanHead(home);
+  const cChg = GIT.changedSince(home, st2.reposLastSha);
+  ok(cChg.invalidBaselineRepos.some((r) => r.root === home) && !cChg.invalidBaselineRepos.some((r) => r.root === nested),
+    'inv-base changed: ONLY the home repo has an invalid baseline; the nested sub-repo stays valid');
+  const fullBefore2 = st2.lastFullBuild;
+  await runRefresh(home);
+  const log2 = readFileSync(S.refreshLogPath(home), 'utf8');
+  has(log2, 'by content (1 file', 'inv-base changed: exactly the one changed file was reconciled by content');
+  ok(!/escalated to full rebuild/.test(log2.trim().split('\n').slice(-3).join('\n')), 'inv-base changed: no whole-project escalation was logged for this reconcile');
+  const st2b = S.readState(home);
+  eq(st2b.lastFullBuild, fullBefore2, 'inv-base changed: NO whole-project rebuild ran (lastFullBuild unchanged)');
+  const dbAfter = connect(dbH, { readonly: true });
+  has(Q.findSymbol(dbAfter, home, 'addedFn'), 'h.js', 'inv-base changed: the newly-committed symbol was reindexed');
+  has(Q.findSymbol(dbAfter, home, 'nestedFn'), 'n.js', 'inv-base changed: the unrelated nested sub-repo is left intact');
+  has(Q.findSymbol(dbAfter, home, 'homeFn'), 'h.js', 'inv-base changed: the surviving same-file symbol is kept');
+  dbAfter.close();
+  eq(st2b.reposLastSha[home], GIT.headSha(home), 'inv-base changed: home restamped to its new HEAD');
+  eq(st2b.reposLastSha[nested], st2.reposLastSha[nested], 'inv-base changed: the untouched nested sub-repo keeps its baseline');
+
+  // ---- Case 3: a VANISHED file is pruned on reconcile --------------------------
+  const p3 = realpathSync(mkdtempSync(join(ws, 'vanish-')));
+  await gitCommit(p3, { 'keep.js': 'export function keeper(){ return 1; }\n', 'gone.js': 'export function goner(){ return 2; }\n' });
+  await runRefresh(p3, ['--full']);
+  const db3 = join(p3, '.wiregraph', 'graph.db');
+  { const db = connect(db3, { readonly: true }); has(Q.findSymbol(db, p3, 'goner'), 'gone.js', 'inv-base vanish: goner is indexed before removal'); db.close(); }
+  const fullBefore3 = S.readState(p3).lastFullBuild;
+  await execFileP('git', ['-C', p3, 'rm', '-q', 'gone.js']);
+  await execFileP('git', ['-C', p3, 'commit', '--amend', '--no-edit', '-q']); // rewrite the baseline commit to drop gone.js
+  await orphanHead(p3);
+  await runRefresh(p3);
+  eq(S.readState(p3).lastFullBuild, fullBefore3, 'inv-base vanish: reconcile did not full-rebuild');
+  const db3after = connect(db3, { readonly: true });
+  has(Q.findSymbol(db3after, p3, 'goner'), 'No symbol named "goner"', 'inv-base vanish: the vanished file\'s symbol was pruned');
+  has(Q.findSymbol(db3after, p3, 'keeper'), 'keep.js', 'inv-base vanish: the surviving file is untouched');
+  db3after.close();
+
+  // ---- Case 4: no usable content stamp → FALL BACK to a full rebuild -----------
+  // If the store lacks mtime/size for the repo's files, a content comparison can't be
+  // trusted, so the reconcile must refuse and preserve correctness via a full rebuild.
+  const p4 = realpathSync(mkdtempSync(join(ws, 'fallback-')));
+  await gitCommit(p4, { 'a.js': 'export function fa(){ return 1; }\n' });
+  await runRefresh(p4, ['--full']);
+  const db4 = join(p4, '.wiregraph', 'graph.db');
+  // Wipe the recorded stamps to simulate a pre-v2 / unstamped db.
+  { const db = connect(db4); db.prepare('UPDATE files SET mtime = NULL, size = NULL').run(); db.close(); }
+  const recNo = B.reconcileRepoByContent(p4, p4);
+  ok(recNo.ok === false, 'inv-base fallback: reconcileRepoByContent refuses (ok:false) when no file carries a usable mtime/size');
+  const fullBefore4 = S.readState(p4).lastFullBuild;
+  await execFileP('git', ['-C', p4, 'commit', '--amend', '-m', 'amended: orphan the baseline', '-q']); // message-only rewrite → fresh sha
+  await orphanHead(p4);
+  await runRefresh(p4);
+  const log4 = readFileSync(S.refreshLogPath(p4), 'utf8');
+  has(log4, 'no content comparison', 'inv-base fallback: refresh logs the full-rebuild fallback reason');
+  ok(S.readState(p4).lastFullBuild !== fullBefore4, 'inv-base fallback: a full rebuild actually ran (lastFullBuild advanced)');
 
   rmSync(ws, { recursive: true, force: true });
 }
@@ -3734,6 +3878,7 @@ await linkAutoCreatedCrashTest();
 await resetEntryPointsTest();
 await memberFreshnessTest();
 await catchUpEscalationTest();
+await invalidBaselineReconcileTest();
 await graphStatsGroupingTest();
 await e2eLinkSeamTest();
 await incrementalContractRematchTest();

@@ -15,7 +15,7 @@
 import { realpathSync, appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runBuild, reindexFiles } from '../../src/build.js';
+import { runBuild, reindexFiles, reconcileRepoByContent } from '../../src/build.js';
 import { readState, updateState, refreshLogPath, findIndexedRoot } from '../lib/state.mjs';
 import { changedSince, projectRepos } from '../lib/git.mjs';
 
@@ -94,6 +94,39 @@ async function main() {
     await fullRebuildAndRestamp(`auto: escalated to full rebuild (${c.fullBuildReasons.join('; ')})`);
     return;
   }
+
+  // INVALID BASELINE (amend/rebase then `git gc` orphaned the stored sha). Do NOT nuke
+  // the whole project as the old code did — reconcile each affected repo by on-disk
+  // CONTENT (mtime+size vs what was indexed) and restamp it, leaving every other repo /
+  // linked member of the graph untouched. A message-only amend that never changed a file
+  // becomes a true no-op (no reindex, no rebuild), and a rebase that DID change a file
+  // reindexes only that file. Only if a repo's content can't be compared reliably (store
+  // lacks usable mtime/size) do we fall back to the full rebuild — safety over cleverness.
+  if (c.invalidBaselineRepos && c.invalidBaselineRepos.length) {
+    for (const repo of c.invalidBaselineRepos) {
+      const rec = reconcileRepoByContent(repo.root, PROJECT);
+      if (!rec.ok) {
+        // No reliable content comparison for this repo → preserve full correctness by
+        // rebuilding the whole project (the original behavior), rather than guessing.
+        await fullRebuildAndRestamp(`auto: escalated to full rebuild (invalid baseline: ${repo.name}, no content comparison)`);
+        return;
+      }
+      if (rec.files.length) {
+        const rebuilt = await reindexFiles(rec.files, PROJECT, { fanOut: true });
+        logLine(`auto: reconciled ${repo.name} by content (${rec.files.length} file(s)) after invalid baseline into ${rebuilt.length} graph(s)`);
+      } else {
+        logLine(`auto: reconciled ${repo.name} by content (0 files, content no-op) after invalid baseline`);
+      }
+    }
+    // Any NORMAL changes changedSince also found (a sibling repo with a valid baseline, or
+    // uncommitted edits) still get indexed. c.newShas already carries every repo's HEAD —
+    // including the reconciled ones — so restamping past them stops the next refresh from
+    // re-escalating on the same orphaned baseline.
+    if (c.files.length) await reindexFiles(c.files, PROJECT, { fanOut: true });
+    updateState(PROJECT, { reposLastSha: { ...(state.reposLastSha || {}), ...c.newShas } });
+    return;
+  }
+
   if (!c.files.length) { logLine('auto: nothing changed'); return; }
   const rebuilt = await reindexFiles(c.files, PROJECT, { fanOut: true });
   updateState(PROJECT, { reposLastSha: { ...(state.reposLastSha || {}), ...c.newShas } });

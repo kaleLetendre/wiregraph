@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect, schemaVersion, SCHEMA_VERSION } from '../store/sqlite.js';
 import * as Q from '../store/sqlite-query.js';
-import { runBuild, reindexFiles } from '../build.js';
+import { runBuild, reindexFiles, reconcileRepoByContent } from '../build.js';
 import { readState, updateState, findIndexedRoot, wiregraphDir, owningMember, statusAdvisories } from '../../scripts/lib/state.mjs';
 import { changedSince, projectRepos, upstreamDivergence } from '../../scripts/lib/git.mjs';
 import { record, estTokens } from '../../scripts/lib/metrics.mjs';
@@ -467,9 +467,8 @@ server.registerTool('update_graph', {
     if (!targets || !targets.length) {
       const c = changedSince(PROJECT, state?.reposLastSha || {});
       if (c.fullBuildNeeded) {
-        // A new repo or an invalid stored baseline makes an incremental apply
-        // unreliable — it would index nothing yet advance the sha past unindexed
-        // history. Escalate to a full rebuild exactly like the `full` branch.
+        // A NEW repo makes an incremental apply unreliable — it would index nothing yet
+        // advance the sha past unindexed history. Escalate to a full rebuild like `full`.
         await runBuild({ target: PROJECT, project: PROJECT, reset: true });
         const rebuiltShas = {};
         for (const r of projectRepos(PROJECT)) if (r.head) rebuiltShas[r.root] = r.head;
@@ -477,8 +476,29 @@ server.registerTool('update_graph', {
         const n = withDbCount();
         return text(`Full rebuild (auto-escalated: ${c.fullBuildReasons.join('; ')}): ${n} symbols indexed. Graph is fresh.`);
       }
+      // INVALID BASELINE (amend/rebase then gc orphaned the stored sha): the failed git
+      // diff means staleNow's candidate set (changedSince.files) CANNOT see this repo's
+      // committed changes, so advancing the sha here would silently drop them. Reconcile
+      // the affected repo(s) by on-disk content instead — the same cheap, surgical path
+      // refresh.mjs uses — rather than tearing down the whole project. Fall back to a full
+      // rebuild only if a repo's content can't be compared (no usable mtime/size).
+      const reconciledFiles = [];
+      for (const repo of (c.invalidBaselineRepos || [])) {
+        const rec = reconcileRepoByContent(repo.root, PROJECT);
+        if (!rec.ok) {
+          await runBuild({ target: PROJECT, project: PROJECT, reset: true });
+          const rebuiltShas = {};
+          for (const r of projectRepos(PROJECT)) if (r.head) rebuiltShas[r.root] = r.head;
+          updateState(PROJECT, { lastFullBuild: now, reposLastSha: rebuiltShas }, VERSION);
+          const n = withDbCount();
+          return text(`Full rebuild (auto-escalated: invalid baseline ${repo.name}, no content comparison): ${n} symbols indexed. Graph is fresh.`);
+        }
+        reconciledFiles.push(...rec.files);
+      }
       newShas = { ...newShas, ...c.newShas };
-      targets = staleNow();
+      // Union the content-reconciled files (invalid-baseline repos) with the ordinary
+      // stale set (valid-baseline repos + uncommitted edits), deduped.
+      targets = [...new Set([...reconciledFiles, ...staleNow()])];
       if (!targets.length) {
         updateState(PROJECT, { reposLastSha: newShas }, VERSION); // advance shas; nothing to re-index
         return text('Graph already current — no changed source files detected.');

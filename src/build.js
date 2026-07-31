@@ -28,8 +28,8 @@ import { Graph } from './model.js';
 import { extractCode } from './extract/index.js';
 import { resolveCalls } from './extract/resolve.js';
 import { loadAllContracts, matchContracts, buildWireEdges } from './extract/contracts.js';
-import { findCompartmentRoots, compartmentNameFor } from './extract/walk.js';
-import { connect, loadGraph, loadProjectSymbols, pruneFile, rederiveWireEdges } from './store/sqlite.js';
+import { findCompartmentRoots, compartmentNameFor, walkSources } from './extract/walk.js';
+import { connect, loadGraph, loadProjectSymbols, pruneFile, rederiveWireEdges, listIndexedFiles } from './store/sqlite.js';
 import { wiregraphDir, updateState, readState, owningMember, graphsListing, memberRoots as memberRootsFromState, registerProject } from '../scripts/lib/state.mjs';
 import { migrateMetrics } from '../scripts/lib/metrics.mjs';
 import { colorEnabled } from '../scripts/lib/color.mjs';
@@ -500,6 +500,70 @@ export async function reindexFiles(files, editingProject, { fanOut = false } = {
     }
   }
   return [...rebuilt];
+}
+
+// --- invalid-baseline content reconcile -------------------------------------
+// After a history rewrite (amend/rebase) whose orphaned commit was pruned by `git
+// gc`, a repo's stored baseline sha is no longer reachable, so `git diff last..HEAD`
+// fails and the last..HEAD file list is UNKNOWABLE. changedSince flags such a repo in
+// `invalidBaselineRepos`. The old behavior tore down and rebuilt the ENTIRE project
+// (all repos AND linked members) — a massive, needless rebuild that recurred on every
+// rebase+gc cycle, firing even when a message-only `git commit --amend` never touched a
+// working-tree file.
+//
+// This computes the MINIMAL reconcile for ONE repo WITHOUT any git diff: the working
+// tree already reflects the new HEAD, and the store recorded each file's on-disk
+// mtime+size at index time (schema v2), so "what changed" is precisely "the working
+// tree differs from what was indexed". We walk the repo's current sources, compare each
+// file's disk mtime+size against the recorded stamp, and return the abs paths that are
+// NEW / DIFFER (reindex) or VANISHED (prune) — a superset-safe comparison: any content
+// change rewrites the file with a fresh mtime, so this never UNDER-reports a real
+// change (correctness), and a message-only amend leaves every mtime untouched → an
+// empty set → a true content no-op. Only THIS repo's files are considered (compartment
+// root under repoRoot), so sibling repos/members stay untouched.
+//
+// Returns { ok, files }. ok:false means the store lacks a usable stamp for this repo's
+// files (e.g. a pre-v2 db, or none populated) — the caller MUST fall back to a full
+// rebuild rather than risk silently dropping a committed change (safety over
+// cleverness). files is the abs paths to hand to reindexFiles (which routes a
+// no-longer-existing path through pruneFile, deleting the vanished file's nodes).
+export function reconcileRepoByContent(repoRoot, project) {
+  const root = (() => { try { return realpathSync(repoRoot); } catch { return repoRoot; } })();
+  const dbPath = resolveDbPath({}, project);
+  if (!existsSync(dbPath)) return { ok: false, files: [] };
+
+  // Recorded stamps for files under THIS repo, keyed by reconstructed abs path.
+  const db = connect(dbPath, { readonly: true });
+  let indexed;
+  try { indexed = listIndexedFiles(db, project); } finally { db.close(); }
+  const recorded = new Map();
+  let anyStamped = false;
+  for (const r of indexed) {
+    const abs = join(r.root, r.path);
+    if (abs !== root && !abs.startsWith(root + sep)) continue; // sibling repo/member — leave it alone
+    recorded.set(abs, { mtime: r.mtime, size: r.size });
+    if (r.mtime != null && r.size != null) anyStamped = true;
+  }
+  // No usable stamp on ANY of this repo's indexed files → we cannot compare by content.
+  // Fall back to the full rebuild. (A repo with NO indexed files at all is fine: every
+  // on-disk file below reads as "new" and gets reindexed.)
+  if (recorded.size && !anyStamped) return { ok: false, files: [] };
+
+  const files = new Set();
+  const onDisk = new Set();
+  for (const f of walkSources(root)) {
+    onDisk.add(f.abs);
+    let mtime = null, size = null;
+    try { const st = statSync(f.abs); mtime = st.mtimeMs; size = st.size; } catch { /* unreadable → treat as differing, reindex */ }
+    const rec = recorded.get(f.abs);
+    // NEW file (never indexed) or any mtime/size divergence → reindex. A null recorded
+    // stamp counts as "differs" so a partially-stamped repo still reconciles correctly.
+    if (!rec || rec.mtime == null || rec.size == null || rec.mtime !== mtime || rec.size !== size) files.add(f.abs);
+  }
+  // VANISHED: recorded under this repo but gone from disk → prune.
+  for (const abs of recorded.keys()) if (!onDisk.has(abs)) files.add(abs);
+
+  return { ok: true, files: [...files] };
 }
 
 async function main() {
