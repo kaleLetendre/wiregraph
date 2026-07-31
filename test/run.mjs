@@ -2065,6 +2065,70 @@ async function walkSourcesTests() {
   rmSync(ws, { recursive: true, force: true });
 }
 
+// Nested git worktrees (bug: a `git worktree add` inside an indexed project). A linked
+// worktree's `.git` is a FILE reading `gitdir: .../.git/worktrees/<name>`, so the old
+// repo-discovery accepted it as a brand-new repo — polluting the graph with a duplicate
+// branch's symbols AND forcing a spurious "new repo" full rebuild on every worktree add.
+// isLinkedWorktree must detect it (and NOT a submodule, whose `.git` file reads
+// `.../.git/modules/<name>`); findGitRepos/walkSources must skip it when nested but keep
+// it when it IS the scan root; and changedSince must not see it as a "new repo".
+async function nestedWorktreeTests() {
+  const W = await import('../src/extract/walk.js');
+  const GIT = await import('../scripts/lib/git.mjs');
+  const ws = realpathSync(mkdtempSync(join(tmpdir(), 'cg-wt-')));
+
+  // A real repo with a REAL nested worktree via `git worktree add`.
+  const main = join(ws, 'main');
+  mkdirSync(join(main, 'src'), { recursive: true });
+  await execFileP('git', ['-C', main, 'init', '-q']);
+  await execFileP('git', ['-C', main, 'config', 'user.email', 't@t']);
+  await execFileP('git', ['-C', main, 'config', 'user.name', 't']);
+  writeFileSync(join(main, 'src', 'a.js'), 'export function fa(){}\n');
+  await execFileP('git', ['-C', main, 'add', '-A']);
+  await execFileP('git', ['-C', main, 'commit', '-q', '-m', 'init']);
+  // A linked worktree nested INSIDE the project tree, on a new branch, with its own file.
+  await execFileP('git', ['-C', main, 'worktree', 'add', '-q', '-b', 'feature', join(main, 'wt', 'feature')]);
+  writeFileSync(join(main, 'wt', 'feature', 'src', 'b.js'), 'export function fb(){}\n');
+  const worktree = join(main, 'wt', 'feature');
+
+  // --- isLinkedWorktree discriminator ---
+  ok(W.isLinkedWorktree(worktree), 'worktree: isLinkedWorktree is true for a nested `git worktree add` dir');
+  ok(!W.isLinkedWorktree(main), 'worktree: isLinkedWorktree is false for a normal repo (.git is a directory)');
+
+  // A SUBMODULE has a `.git` FILE too, but pointing at `.../.git/modules/<name>` — must
+  // read false, else we would wrongly skip legitimately-separate submodule repos.
+  const sub = join(ws, 'submod');
+  mkdirSync(sub, { recursive: true });
+  writeFileSync(join(sub, '.git'), 'gitdir: /somewhere/.git/modules/submod\n');
+  ok(!W.isLinkedWorktree(sub), 'worktree: isLinkedWorktree is false for a submodule (.git file → /modules/, not /worktrees/)');
+
+  // --- findGitRepos skips the nested worktree, keeps the root ---
+  const repos = W.findGitRepos(main).map((r) => r.dir);
+  eq(repos.length, 1, 'worktree: findGitRepos(root) returns exactly one repo — the root, not the nested worktree');
+  ok(repos.includes(main), 'worktree: findGitRepos(root) includes the root repo');
+  ok(!repos.includes(worktree), 'worktree: findGitRepos(root) excludes the nested linked worktree');
+
+  // Index-a-worktree-as-project: when the worktree IS the scan root, it must be kept.
+  const asRoot = W.findGitRepos(worktree).map((r) => r.dir);
+  ok(asRoot.includes(worktree), 'worktree: findGitRepos(worktree) keeps the worktree when it IS the scan root');
+
+  // --- the walk does not yield the worktree's files, but does yield the root's ---
+  const walked = [...W.walkSources(main)].map((f) => f.abs);
+  ok(walked.includes(join(main, 'src', 'a.js')), 'worktree: walk yields the root repo file');
+  ok(!walked.some((p) => p.startsWith(worktree + '/')), 'worktree: walk yields NO files from the nested worktree');
+
+  // --- regression guard: the worktree must not surface as a "new repo" in changedSince,
+  // which is exactly what forced the full-rebuild escalation on every worktree add.
+  await runBuild({ target: main, project: main, reset: true });
+  const baseShas = {};
+  for (const r of GIT.projectRepos(main)) if (r.head) baseShas[r.root] = r.head;
+  ok(!(worktree in baseShas), 'worktree: projectRepos does not key the nested worktree as its own repo');
+  const c = GIT.changedSince(main, baseShas);
+  ok(!c.fullBuildReasons.some((r) => r.includes('new repo')), `worktree: no "new repo" escalation for the nested worktree (got ${JSON.stringify(c.fullBuildReasons)})`);
+
+  rmSync(ws, { recursive: true, force: true });
+}
+
 // Union inference: inferSeamsAcross over two DISJOINT roots (a client that calls a
 // literal route, a server that defines it) produces exactly one wire seam with the
 // correct in/out roles — the clusterSeams-over-two-roots case link/unlink relies on.
@@ -3653,6 +3717,7 @@ await linkStateTests();
 await linkGuardTests();
 await previewLinkShapeTest();
 await walkSourcesTests();
+await nestedWorktreeTests();
 await inferAcrossTest();
 await idIndependenceTest();
 await unionBuildTest();

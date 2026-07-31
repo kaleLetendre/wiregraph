@@ -14,6 +14,26 @@ import { IGNORE_DIRS, langForFile } from './lang.js';
 // inside a monorepo, not only across separately-cloned repos.
 const MODULE_MANIFESTS = new Set(['go.mod', 'Cargo.toml', 'pyproject.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts']);
 
+// A LINKED WORKTREE (`git worktree add`) is an alternate checkout of a repo we may
+// ALREADY be indexing. Its `.git` is a regular FILE reading `gitdir: <...>/.git/worktrees/<name>`
+// — the `/worktrees/` segment is the tell. (A SUBMODULE's `.git` file instead reads
+// `.../.git/modules/<name>`; a normal repo / main worktree has a `.git` DIRECTORY.)
+// We skip a linked worktree nested under the scan root for two reasons: (a) it holds a
+// different branch's copy of the same code, so indexing it pollutes the graph with
+// phantom, name-colliding duplicate symbols; (b) each nested worktree has no
+// reposLastSha entry, so it's classified "new repo" and forces a spurious full rebuild
+// on every `git worktree add`. Submodules stay (legitimately separate repos); the scan
+// root itself stays (index-a-worktree-as-project must still work).
+function isLinkedWorktree(dir) {
+  const dotgit = join(dir, '.git');
+  let st;
+  try { st = statSync(dotgit); } catch { return false; }
+  if (!st.isFile()) return false; // a directory → normal repo / main worktree
+  let content;
+  try { content = readFileSync(dotgit, 'utf8'); } catch { return false; }
+  return /^gitdir:\s*.*\/worktrees\//m.test(content);
+}
+
 function isCompartmentBoundary(dir, entries) {
   // A git repo is always a boundary.
   if (entries.some((e) => e.name === '.git')) return true;
@@ -73,7 +93,14 @@ function findCompartmentRoots(rootDir) {
 // and reposLastSha are genuinely per-git-repo, NOT per-compartment — a package
 // inside a repo has no HEAD of its own. So this is a distinct, .git-only scan.
 function findGitRepos(rootDir) {
-  return findRoots(rootDir, (dir, entries) => entries.some((e) => e.name === '.git'));
+  return findRoots(rootDir, (dir, entries) => {
+    if (!entries.some((e) => e.name === '.git')) return false;
+    // A linked worktree nested under the root is an alternate checkout of a repo we
+    // already cover — never a separate repo (avoids duplicate-branch pollution and the
+    // "new repo" full-rebuild escalation). The root itself is kept even if it IS one.
+    if (dir !== rootDir && isLinkedWorktree(dir)) return false;
+    return true;
+  });
 }
 
 // Walk one root, attributing files to compartments LOCAL to that root, and skip any
@@ -92,6 +119,11 @@ function* walkOneRoot(rootDir, seen) {
     } catch {
       continue;
     }
+    // Skip a nested linked worktree wholesale — neither its files nor its subtree.
+    // It's an alternate checkout of a repo we already index, so descending would
+    // duplicate that repo's symbols under a phantom branch. Only read the `.git` file
+    // when one is actually present (no stat-storm on ordinary dirs).
+    if (dir !== rootDir && entries.some((e) => e.name === '.git' && e.isFile()) && isLinkedWorktree(dir)) continue;
     for (const e of entries) {
       const abs = join(dir, e.name);
       if (e.isDirectory()) {
@@ -130,4 +162,4 @@ export function* walkSources(roots) {
   for (const rootDir of list) yield* walkOneRoot(rootDir, seen);
 }
 
-export { findCompartmentRoots, compartmentNameFor, findGitRepos };
+export { findCompartmentRoots, compartmentNameFor, findGitRepos, isLinkedWorktree };
