@@ -103,9 +103,14 @@ export function graphStats(db, project) {
 }
 
 export function findSymbol(db, project, name, repo) {
-  const rows = symbolMatches(db, project, name, repo).slice(0, 100);
-  if (!rows.length) return `No symbol named "${name}"${repo ? ` in ${repo}` : ''}.`;
-  return `${rows.length} match(es) for "${name}":\n` + rows.map((r) => '  ' + loc(r)).join('\n');
+  const all = symbolMatches(db, project, name, repo);
+  if (!all.length) return `No symbol named "${name}"${repo ? ` in ${repo}` : ''}.`;
+  const CAP = 100;
+  const rows = all.slice(0, CAP);
+  const header = all.length > CAP
+    ? `${all.length} match(es) for "${name}" (showing first ${CAP}; narrow with compartment/file):`
+    : `${rows.length} match(es) for "${name}":`;
+  return header + '\n' + rows.map((r) => '  ' + loc(r)).join('\n');
 }
 
 export function getSource(db, project, name, repo, file, context = 0) {
@@ -245,6 +250,56 @@ function definedContractTokens(db, project, contract, token) {
   return byContract;
 }
 
+// Classify a contract token's drift the way buildWireEdges (src/extract/contracts.js)
+// orients a WIRE. A cross-compartment wire needs BOTH a producer AND a consumer, in
+// DIFFERENT compartments — so a token referenced only by same-role compartments (e.g.
+// two clients, the server unindexed) is a GAP, not a satisfied seam, even though 2+
+// compartments touch it. The old count heuristic (n>=2 => satisfied) called that
+// healthy while buildWireEdges produced zero wire. This mirrors buildWireEdges' role
+// filter (pubs/cons) and its intra-compartment skip.
+//   refComps: Set/array of compartment names that reference the token
+//   meta: { producers:[], consumers:[] } (compartment names; may be empty/absent)
+// Returns 'unreferenced' | 'one-sided' | 'satisfied'.
+export function classifyContractToken(refComps, meta) {
+  const refSet = refComps instanceof Set ? refComps : new Set(refComps || []);
+  if (refSet.size === 0) return 'unreferenced';
+  const hasRoles = (meta?.producers?.length || meta?.consumers?.length);
+  if (hasRoles) {
+    const producers = new Set(meta.producers || []);
+    const consumers = new Set(meta.consumers || []);
+    const refP = [...refSet].filter((c) => producers.has(c));
+    const refC = [...refSet].filter((c) => consumers.has(c));
+    // Both role sides referenced AND at least two DISTINCT compartments — so a
+    // cross-compartment producer->consumer pair exists. buildWireEdges skips
+    // intra-compartment pairs, so a lone dual-role compartment is NOT a wire.
+    if (refP.length && refC.length && new Set([...refP, ...refC]).size >= 2) return 'satisfied';
+    return 'one-sided';
+  }
+  // Role-less token: a hand-written spec oriented at build via WIREGRAPH_SERVER_REPO,
+  // whose server compartment is NOT stored in the db — orientation can't be
+  // reconstructed here, so fall back to the count heuristic (preserves prior
+  // best-effort behavior for this case).
+  return refSet.size === 1 ? 'one-sided' : 'satisfied';
+}
+
+// Human-readable detail for a one-sided token in trace_contract. When role metadata
+// exists, name which side is present and which half is missing (so a 2-same-role case
+// reads as "producer side present, consumer half missing" rather than the old,
+// misleading "only [comp]"); for a role-less token just name the compartment(s).
+function oneSidedDetail(refComps, meta) {
+  const comps = [...(refComps instanceof Set ? refComps : new Set(refComps || []))];
+  const hasRoles = (meta?.producers?.length || meta?.consumers?.length);
+  if (!hasRoles) return `only [${comps.join(', ')}]`;
+  const producers = new Set(meta.producers || []);
+  const consumers = new Set(meta.consumers || []);
+  const refP = comps.filter((c) => producers.has(c));
+  const refC = comps.filter((c) => consumers.has(c));
+  if (refP.length && refC.length) return `only [${comps.join(', ')}] (same compartment produces & consumes — no cross-compartment seam)`;
+  if (refP.length) return `only producer side [${refP.join(', ')}] — consumer half missing`;
+  if (refC.length) return `only consumer side [${refC.join(', ')}] — producer half missing`;
+  return `only [${comps.join(', ')}] (no compartment matches the contract's producer/consumer roles)`;
+}
+
 export function traceContract(db, project, contract, token, includeTests) {
   let q = `SELECT c.name contract, s.compartment compartment, s.file file, s.name name, s.startLine startLine, e.token token
            FROM edges e JOIN symbols s ON s.id=e.src JOIN contracts c ON c.id=e.dst
@@ -296,11 +351,11 @@ export function traceContract(db, project, contract, token, includeTests) {
     if (definedTokens && definedTokens.size) {
       const unreferenced = [], oneSided = [];
       let satisfied = 0;
-      for (const [tok] of definedTokens) {
-        const comps = refMap.get(tok);
-        const n = comps ? comps.size : 0;
-        if (n === 0) unreferenced.push(tok);
-        else if (n === 1) oneSided.push([tok, [...comps][0]]);
+      for (const [tok, meta] of definedTokens) {
+        const comps = refMap.get(tok) || new Set();
+        const verdict = classifyContractToken(comps, meta);
+        if (verdict === 'unreferenced') unreferenced.push(tok);
+        else if (verdict === 'one-sided') oneSided.push([tok, oneSidedDetail(comps, meta)]);
         else satisfied++;
       }
       const total = definedTokens.size;
@@ -313,7 +368,7 @@ export function traceContract(db, project, contract, token, includeTests) {
       }
       if (oneSided.length) {
         driftLines.push('  ⚠️ one-sided — only one compartment references the token (a cross-compartment seam needs both sides; the other half is missing):');
-        for (const [t, comp] of oneSided.slice(0, 40)) driftLines.push(`       ${t} — only [${comp}]`);
+        for (const [t, detail] of oneSided.slice(0, 40)) driftLines.push(`       ${t} — ${detail}`);
         if (oneSided.length > 40) driftLines.push(`       … +${oneSided.length - 40} more`);
       }
     } else {
@@ -348,7 +403,7 @@ export function contractDriftByName(db, project, includeTests = false) {
   const out = new Map();
   let defined;
   try {
-    defined = db.prepare('SELECT c.name name, ct.token token FROM contract_tokens ct JOIN contracts c ON c.id=ct.contract WHERE ct.project=?').all(project);
+    defined = db.prepare('SELECT c.name name, ct.token token, ct.producers producers, ct.consumers consumers FROM contract_tokens ct JOIN contracts c ON c.id=ct.contract WHERE ct.project=?').all(project);
   } catch {
     return out; // contract_tokens table absent (old schema)
   }
@@ -364,18 +419,23 @@ export function contractDriftByName(db, project, includeTests = false) {
     if (!m.has(r.token)) m.set(r.token, new Set());
     m.get(r.token).add(r.compartment);
   }
-  const byName = new Map(); // name -> Set(token)
+  // name -> Map(token -> {producers[], consumers[]}) — role metadata per token so the
+  // SAME role-aware classifier trace_contract uses can decide each token's verdict.
+  const byName = new Map();
   for (const d of defined) {
-    if (!byName.has(d.name)) byName.set(d.name, new Set());
-    byName.get(d.name).add(d.token);
+    if (!byName.has(d.name)) byName.set(d.name, new Map());
+    byName.get(d.name).set(d.token, {
+      producers: d.producers ? d.producers.split(',') : [],
+      consumers: d.consumers ? d.consumers.split(',') : [],
+    });
   }
   for (const [name, toks] of byName) {
     let satisfied = 0, oneSided = 0, unreferenced = 0;
     const m = refMap.get(name) || new Map();
-    for (const t of toks) {
-      const n = m.get(t)?.size || 0;
-      if (n === 0) unreferenced++;
-      else if (n === 1) oneSided++;
+    for (const [t, meta] of toks) {
+      const verdict = classifyContractToken(m.get(t) || new Set(), meta);
+      if (verdict === 'unreferenced') unreferenced++;
+      else if (verdict === 'one-sided') oneSided++;
       else satisfied++;
     }
     const status = unreferenced > 0 ? 'drift' : (oneSided > 0 ? 'one-sided' : 'ok');
@@ -439,18 +499,29 @@ export function pathBetween(db, project, from, to, fromRepo, toRepo, maxHops = 1
 // for structural questions the shaped tools don't cover. The db is per-project so
 // every row already belongs to this project (no scoping needed). Only a single
 // read-only SELECT/WITH…SELECT is allowed; anything that could mutate is rejected.
-// This regex guard is the real protection: the server's "readonly" sql.js handle
-// only means "don't persist on close" (the in-memory WASM db is itself writable),
-// so a write that slipped past here would still be discarded on close — but we
-// reject it up front rather than rely on that.
+// Read-only is enforced at the ENGINE level via `PRAGMA query_only=ON` (below), so
+// no SQL cleverness can write — the string guards (single-statement, must start
+// SELECT/WITH, load_extension block) are a first line, but the pragma is what makes
+// a write impossible regardless of statement shape.
 export function querySql(db, sql) {
   const q = String(sql || '').trim().replace(/;\s*$/, '');
   if (!q) return 'Empty query.';
   if (/;/.test(q)) return 'Refused: only a single statement is allowed (no ";").';
   if (!/^(SELECT|WITH)\b/i.test(q)) return 'Refused: only read-only SELECT (or WITH … SELECT) queries are allowed.';
-  if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|LOAD_EXTENSION)\b/i.test(q)) {
-    return 'Refused: query contains a write/admin keyword. This tool is read-only.';
+  // The one dangerous thing callable *inside* a SELECT expression is load_extension()
+  // (loads a shared library = arbitrary code execution, which query_only does NOT
+  // stop), so we block just that. A broad keyword blocklist would wrongly refuse
+  // legitimate reads (e.g. LIKE 'create%', or the scalar replace() function).
+  if (/\bload_extension\s*\(/i.test(q)) {
+    return 'Refused: load_extension is not allowed. This tool is read-only.';
   }
+  // Engine-level read-only enforcement. A leading WITH clause CAN front a
+  // data-modifying statement in SQLite (`WITH t AS (...) DELETE FROM ...`), which the
+  // SELECT/WITH-start check does NOT catch — query_only makes every such write throw
+  // "attempt to write a readonly database", caught below. This is a session setting on
+  // the short-lived per-call connection (server.js hands querySql its own freshRead
+  // handle), so it never leaks to writers.
+  try { db.exec('PRAGMA query_only=ON'); } catch { /* ignore */ }
   let rows;
   try { rows = db.prepare(q).all(); }
   catch (e) { return 'SQL error: ' + e.message; }

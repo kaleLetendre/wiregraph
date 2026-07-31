@@ -59,17 +59,55 @@ export function isDistinctive(tok) {
   return false;
 }
 
-// A channel `address` -> the matchable token: a path is trimmed at its first
-// {param} segment to a prefix; a non-path (topic / routing key) is matched
-// literally. Shared by collectTokens and the wire-role reader so both key on the
-// exact same token that lands on REFERENCES edges. null = no matchable token.
-function normalizeAddress(addr) {
+// A channel `address` -> the matchable token: a path keeps its FULL parameterized
+// form (params already in AsyncAPI `{name}` form) as a stable identity — only
+// collapsing duplicate slashes and stripping a trailing slash (except the root
+// `/`); a non-path (topic / routing key / env var) is matched literally. Shared by
+// collectTokens and the wire-role reader so both key on the exact same token that
+// lands on REFERENCES edges (and drift). Path tokens are matched via pathTokenRegex,
+// so each `{param}` segment matches the route however source writes it (`:id`,
+// `${id}`, `{id}`, or a concrete value). null = no matchable token.
+export function normalizeAddress(addr) {
   if (typeof addr !== 'string' || !addr) return null;
   if (addr.startsWith('/')) {
-    const prefix = addr.split('/').filter((s) => s && !s.includes('{')).join('/');
-    return prefix ? '/' + prefix : null;
+    const norm = addr.replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+    return norm || '/';
   }
   return addr;
+}
+
+// Escape the literal (non-param) parts of a path segment for use inside a RegExp.
+const escapePathLiteral = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// One source path segment written as a parameter: `:id`, `${id}`, `{id}`, or a bare
+// concrete value like `123` / `id`.
+const PARAM_WILDCARD = '(?::?\\$?\\{?[A-Za-z0-9_]+\\}?)';
+
+// Build a RegExp that matches a path token (e.g. `/orders/{id}/items`) against the
+// same route as written in source — `{param}` segments become one-segment wildcards
+// (a param can also be only PART of a segment, e.g. `/files/{name}.json` keeps
+// `.json` literal). A trailing boundary lookahead keeps `/orders/{id}/items` from
+// matching `/orders/:id/itemsFoo`; the literal `/` between statics already stops
+// `/orders` matching `/orderstatus`, so no leading anchor is needed. The lookahead
+// also forbids a trailing `/` OR `}`, so a bare route never matches a LONGER nested
+// route: `/orders/{id}` must match neither the server form `/orders/:id/items` (the
+// `/` blocks it) nor the client template literal `/orders/${id}/items` (where the `}`
+// of `${id}` would otherwise read as a false route terminator). Otherwise a phantom
+// REFERENCES edge — and, when both sides hit, a WIRE seam — is minted for a route
+// nothing actually calls. A route that truly ENDS in `${id}` still matches: `\}?`
+// consumes the closing brace and the real terminator (quote/backtick/end) follows.
+export function pathTokenRegex(tok) {
+  const segments = tok.split('/').filter(Boolean).map((seg) => {
+    let out = '';
+    let last = 0;
+    const param = /\{[^}]*\}/g;
+    let m;
+    while ((m = param.exec(seg)) !== null) {
+      out += escapePathLiteral(seg.slice(last, m.index)) + PARAM_WILDCARD;
+      last = m.index + m[0].length;
+    }
+    return out + escapePathLiteral(seg.slice(last));
+  });
+  return new RegExp('/' + segments.join('/') + '(?![A-Za-z0-9_/}])');
 }
 
 // Walk a parsed YAML doc collecting every key that sits under a "properties"
@@ -323,12 +361,26 @@ export function matchContracts(graph, rootDir, contracts, log = () => {}, fileFi
     const moduleIdOf = `sym:${f.compartment}:${f.relPath}:<module>:0`;
 
     for (const tok of allTokens) {
-      const at = text.indexOf(tok);
-      if (at < 0) continue;
-      // For identifier tokens, require a word boundary to avoid substring hits.
-      if (!tok.includes('/')) {
+      let at;
+      if (tok.includes('/')) {
+        // Path token: match the whole parameterized route (each `{param}` segment
+        // matches the route however source writes it) via pathTokenRegex.
+        const m = pathTokenRegex(tok).exec(text);
+        if (!m) continue;
+        at = m.index;
+      } else {
+        // Identifier token: use the first WORD-BOUNDED occurrence for BOTH existence and
+        // position. indexOf alone points `at` at a substring embedded in a larger
+        // identifier (e.g. user_id inside superuser_id_map), mis-attributing the edge to
+        // the wrong enclosing symbol (M11). exec gives the first \b-delimited match's index.
+        // Identifier token: use the first WORD-BOUNDED occurrence for BOTH existence and
+        // position. indexOf alone points `at` at a substring embedded in a larger
+        // identifier (e.g. user_id inside superuser_id_map), mis-attributing the edge to
+        // the wrong enclosing symbol (M11). exec gives the first \b-delimited match's index.
         const re = new RegExp(`\\b${tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-        if (!re.test(text)) continue;
+        const m = re.exec(text);
+        if (!m) continue;
+        at = m.index;
       }
       const line = text.slice(0, at).split('\n').length;
       const fromId = enclosingSymbol(fileIntervals, line, moduleIdOf);

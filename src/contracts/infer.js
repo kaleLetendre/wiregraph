@@ -58,7 +58,10 @@ export function toAsyncApiPath(p) {
     if (seg.startsWith(':')) return `{${seg.slice(1)}}`;
     if (seg.startsWith('{') && seg.endsWith('}')) return seg;
     if (seg.startsWith('<') && seg.endsWith('>')) return `{${seg.slice(1, -1)}}`;
-    return seg;
+    // template-literal params: `${name}` -> `{name}`, whole-segment and
+    // intra-segment (e.g. `/files/${name}.json` -> `/files/{name}.json`),
+    // mirroring the name-agnostic H2 pathTokenRegex matcher.
+    return seg.replace(/\$\{([A-Za-z0-9_]+)\}/g, '{$1}');
   }).join('/');
 }
 
@@ -76,12 +79,20 @@ function channelKey(kind, token) {
 // single-compartment token is not a contract). Returns
 // [{ kind, token, compartments, inCompartments, outCompartments, labels }].
 export function clusterSeams(candidates) {
+  // Canonicalize param NAMES in the grouping key only: `/orders/{id}` and
+  // `/orders/{orderId}` are the SAME endpoint pattern, so a client route and a
+  // server route that differ only in param name must cluster into one seam. We
+  // collapse every `{anything}` to `{}` for the KEY but KEEP the first-seen real
+  // token as the seam address (readable param name; the name-agnostic H2 matcher
+  // matches both sides). A non-path token has no `{}` so it's unaffected. Distinct
+  // static segments (`/orders/{id}` vs `/users/{id}`) still differ and won't merge.
+  const paramCanon = (tok) => tok.replace(/\{[^/{}]*\}/g, '{}');
   const groups = new Map(); // key -> { kind, token, compartments: Map(compartment->Set(role)), labels: Set }
   for (const c of candidates) {
     if (c.kind === 'import') continue; // imports become IMPORTS edges, not token-matched contracts
     const tok = normToken(c.kind, c.token);
     if (!isDistinctive(tok)) continue;
-    const key = `${c.kind}\0${tok}`;
+    const key = `${c.kind}\0${paramCanon(tok)}`;
     if (!groups.has(key)) groups.set(key, { kind: c.kind, token: tok, compartments: new Map(), labels: new Set() });
     const g = groups.get(key);
     if (!g.compartments.has(c.compartment)) g.compartments.set(c.compartment, new Set());
@@ -109,8 +120,21 @@ export function clusterSeams(candidates) {
 export function synthesizeAsyncApi(seams, title = 'wiregraph-inferred') {
   const channels = {};
   const operations = {};
+  const usedKeys = new Set();
   for (const s of seams) {
-    const key = channelKey(s.kind, s.token);
+    // channelKey collapses every non-alphanumeric run to a single '-', so two
+    // DISTINCT tokens of the same kind differing only by separators (message
+    // device:heartbeat vs device.heartbeat; wire /order/created vs /order-created)
+    // collide on one key. clusterSeams keeps them as separate seams, so assigning
+    // channels[key] unconditionally would let the second seam overwrite the first
+    // (dropping its address + roles, and its edges). Suffix collisions instead.
+    let key = channelKey(s.kind, s.token);
+    if (usedKeys.has(key)) {
+      let n = 2;
+      while (usedKeys.has(`${key}-${n}`)) n++;
+      key = `${key}-${n}`;
+    }
+    usedKeys.add(key);
     channels[key] = { address: s.token, messages: { request: { payload: { type: 'object', properties: {} } } } };
     if (s.outCompartments.length) channels[key]['x-wiregraph-producers'] = s.outCompartments;
     if (s.inCompartments.length) channels[key]['x-wiregraph-consumers'] = s.inCompartments;

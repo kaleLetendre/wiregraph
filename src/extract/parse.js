@@ -401,8 +401,11 @@ function isTsEnvObject(n) {
   if (!n || n.type !== 'member_expression') return false;
   if (field(n, 'property')?.text !== 'env') return false;
   const o = field(n, 'object');
-  const oName = o && (o.type === 'identifier' ? o.text : o.type === 'member_expression' ? field(o, 'property')?.text : null);
-  return oName === 'process' || oName === 'meta';
+  if (!o) return false;
+  if (o.type === 'identifier') return o.text === 'process';                           // process.env
+  if (o.type === 'meta_property') return o.text === 'import.meta';                     // import.meta.env
+  if (o.type === 'member_expression') return field(o, 'property')?.text === 'meta';    // defensive fallback
+  return false;
 }
 function tsState(node) {
   if (node.type === 'member_expression' && isTsEnvObject(field(node, 'object'))) {
