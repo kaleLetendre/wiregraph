@@ -69,21 +69,66 @@ class Stmt {
 }
 
 // Cross-process advisory lock for writable sessions. A lockfile is created with
-// the exclusive 'wx' flag (atomic create-or-fail); contenders spin with a blocking
-// sleep until it frees. A lock older than STALE_MS is assumed to belong to a
-// crashed writer and is stolen — the writable session is short (only the SQLite
-// load + export + rename, never the parse/walk), so a live holder never approaches
-// it. ms-scale blocking is fine in these one-shot CLI/worker processes.
+// the exclusive 'wx' flag (atomic create-or-fail) and holds the writer's PID;
+// contenders spin with a blocking sleep until it frees. On contention we decide
+// whether to STEAL the lock by the HOLDER'S LIVENESS, not by a wall-clock timer,
+// because the writable session is NOT always short. fullBuild connects late
+// (after the parse/walk), but incrementalBuild (src/build.js) connects EARLY and
+// holds the lock through extractCode + resolveCalls + loadProjectSymbols +
+// loadAllContracts + matchContracts (which walks every source file in the owner
+// roots) — so a legitimate live writer can hold the lock for well over any fixed
+// 30s window on a big changed file / large contracts dir / loaded machine. An
+// mtime-based steal would rip the lock out from under such a writer and let a
+// second writer's rename clobber its update — the lost update the lock exists to
+// prevent (bug M9).
 //
-// Invariant: TIMEOUT > STALE. A contender must be willing to wait longer than the
-// staleness window, or it would give up and throw before it could ever steal a
-// crashed holder's lock (the steal can only fire once the lock is STALE_MS old).
-const LOCK_STALE_MS = 30_000;
-const LOCK_TIMEOUT_MS = 60_000;
+// So: a lock held by a LIVE pid is a live session (however slow) and is waited
+// out; a lock whose holder is DEAD (crashed) is stolen immediately — which also
+// makes crash recovery instant instead of waiting out a timer. Two backstops:
+//   - LOCK_HARD_MAX_MS: even a live holder is stolen once the lock is this old,
+//     guarding against PID reuse (an unrelated live process now owns the number)
+//     or a wedged holder that never releases.
+//   - LOCK_STALE_MS (mtime): used ONLY when the PID is missing/unparseable — the
+//     tiny race where the lockfile exists (openSync 'wx' won) but its PID has not
+//     been written yet. We don't know the holder, so we fall back to the old
+//     staleness check rather than steal a possibly-fresh live lock.
+// ms-scale blocking is fine in these one-shot CLI/worker processes.
+//
+// Invariant: the wait deadline (LOCK_TIMEOUT_MS) is > LOCK_HARD_MAX_MS, so a
+// contender always waits long enough to either steal a dead holder or outlast a
+// legit long-but-live one — the hard-max steal fires before we give up. (The old
+// 60s timeout was shorter than a long incremental build and would throw early.)
+const LOCK_STALE_MS = 30_000;          // mtime staleness — used only for the unparseable-PID fallback
+const LOCK_HARD_MAX_MS = 5 * 60_000;   // steal even a LIVE holder past this age (PID reuse / wedged holder)
+const LOCK_TIMEOUT_MS = LOCK_HARD_MAX_MS + LOCK_STALE_MS; // absolute wait deadline; > HARD_MAX so a steal can fire first
 
 function sleepSync(ms) {
   // Block the thread without burning CPU (no async context to await in).
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Is `pid` a live process? process.kill(pid, 0) sends no signal, it only probes:
+// success => alive; EPERM => the process EXISTS but we can't signal it (still
+// alive); ESRCH => no such process (dead).
+function defaultAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code === 'EPERM'; }
+}
+
+// Pure steal decision, injectable for tests. Given the parsed holder pid (or null
+// when the lockfile has no readable PID yet), the lock's age in ms, and a liveness
+// probe, return 'steal' or 'wait':
+//   - pid known + holder DEAD     -> 'steal' (crash recovery, immediate)
+//   - pid known + holder ALIVE    -> 'wait', unless ageMs > LOCK_HARD_MAX_MS
+//                                    (PID reuse / wedged holder) -> 'steal'
+//   - pid null/unparseable        -> mtime fallback: 'steal' only if
+//                                    ageMs > LOCK_STALE_MS, else 'wait'
+export function shouldStealLock({ pid, ageMs, aliveFn = defaultAlive }) {
+  if (pid == null || !Number.isInteger(pid)) {
+    return ageMs > LOCK_STALE_MS ? 'steal' : 'wait';
+  }
+  if (ageMs > LOCK_HARD_MAX_MS) return 'steal';
+  return aliveFn(pid) ? 'wait' : 'steal';
 }
 
 function acquireLock(lockPath) {
@@ -96,9 +141,15 @@ function acquireLock(lockPath) {
       return;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
+      // Someone holds the lock. Read its PID + age and decide steal-vs-wait.
+      let pid = null, ageMs = 0;
       try {
-        if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) { rmSync(lockPath, { force: true }); continue; }
-      } catch { continue; /* lock vanished between open and stat — retry immediately */ }
+        const raw = readFileSync(lockPath, 'utf8').trim();
+        const n = Number.parseInt(raw, 10);
+        pid = Number.isInteger(n) && String(n) === raw ? n : null; // reject empty/garbage/partial writes
+        ageMs = Date.now() - statSync(lockPath).mtimeMs;
+      } catch { continue; /* lock vanished between open and read — retry immediately */ }
+      if (shouldStealLock({ pid, ageMs }) === 'steal') { rmSync(lockPath, { force: true }); continue; }
       if (Date.now() > deadline) throw new Error(`wiregraph: timed out waiting for db lock ${lockPath}`);
       sleepSync(50);
     }
@@ -121,9 +172,14 @@ class DB {
       catch (e) { try { this._db.exec('ROLLBACK'); } catch { /* */ } throw e; }
     };
   }
-  close() {
+  // persist:true (default) writes the in-memory db back to disk on a writable
+  // connection; persist:false DISCARDS the in-memory mutations, leaving the
+  // last-good on-disk file untouched — used by the incremental path to bail out
+  // without persisting a half-applied prune+reload after an error. Either way the
+  // WASM db is freed and the lock is always released.
+  close({ persist = true } = {}) {
     try {
-      if (!this._readonly) {
+      if (persist && !this._readonly) {
         const tmp = this._path + '.tmp';
         writeFileSync(tmp, Buffer.from(this._db.export()));
         renameSync(tmp, this._path); // atomic replace, so a concurrent reader never sees a torn file

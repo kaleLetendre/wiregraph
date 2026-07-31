@@ -4,7 +4,7 @@
 // (no daemon to keep alive), so the hook dispatchers stay instant.
 //
 //   node refresh.mjs                 # auto: re-index files changed since last index, advance shas
-//   node refresh.mjs --files a,b     # re-index exactly these (no sha advance — used by post-edit)
+//   node refresh.mjs --files <path> [path ...]   # re-index exactly these (no sha advance — used by post-edit)
 //   node refresh.mjs --full          # full project-scoped rebuild
 //
 // PROJECT comes from CLAUDE_PROJECT_DIR (set for hooks) or cwd. Failures are
@@ -14,6 +14,7 @@
 
 import { realpathSync, appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runBuild, reindexFiles } from '../../src/build.js';
 import { readState, updateState, refreshLogPath, findIndexedRoot } from '../lib/state.mjs';
 import { changedSince, projectRepos } from '../lib/git.mjs';
@@ -36,13 +37,29 @@ function logLine(msg) {
   } catch { /* logging is best-effort */ }
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const o = { files: null, full: false };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--files') o.files = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
+    // --files: each following arg is ONE path (a comma delimiter can't represent a path
+    // that contains a comma). Consume args until the next --flag.
+    if (argv[i] === '--files') {
+      o.files = [];
+      while (i + 1 < argv.length && !argv[i + 1].startsWith('--')) if (argv[++i] !== '') o.files.push(argv[i]);
+    }
     else if (argv[i] === '--full') o.full = true;
   }
   return o;
+}
+
+// Full project-scoped rebuild, then restamp every repo's sha from the fresh HEADs.
+// Shared by the explicit --full path and the auto-catch-up escalation (a new repo
+// or an invalid stored baseline, where an incremental apply would silently miss code).
+async function fullRebuildAndRestamp(logMsg) {
+  await runBuild({ target: PROJECT, project: PROJECT, reset: true });
+  const newShas = {};
+  for (const r of projectRepos(PROJECT)) if (r.head) newShas[r.root] = r.head;
+  updateState(PROJECT, { lastFullBuild: new Date().toISOString(), reposLastSha: newShas });
+  logLine(logMsg);
 }
 
 async function main() {
@@ -54,11 +71,7 @@ async function main() {
   }
 
   if (o.full) {
-    await runBuild({ target: PROJECT, project: PROJECT, reset: true });
-    const newShas = {};
-    for (const r of projectRepos(PROJECT)) if (r.head) newShas[r.root] = r.head;
-    updateState(PROJECT, { lastFullBuild: new Date().toISOString(), reposLastSha: newShas });
-    logLine('full rebuild complete');
+    await fullRebuildAndRestamp('full rebuild complete');
     return;
   }
 
@@ -76,10 +89,19 @@ async function main() {
   // (across the whole union — changedSince now iterates members) and advance the
   // per-repo shas. Fan out so a member's committed change lands in both graphs.
   const c = changedSince(PROJECT, state.reposLastSha || {});
+  if (c.fullBuildNeeded) {
+    // Incremental would advance shas past unindexed history — escalate to a full rebuild.
+    await fullRebuildAndRestamp(`auto: escalated to full rebuild (${c.fullBuildReasons.join('; ')})`);
+    return;
+  }
   if (!c.files.length) { logLine('auto: nothing changed'); return; }
   const rebuilt = await reindexFiles(c.files, PROJECT, { fanOut: true });
   updateState(PROJECT, { reposLastSha: { ...(state.reposLastSha || {}), ...c.newShas } });
   logLine(`auto: reindexed ${c.files.length} changed file(s) into ${rebuilt.length} graph(s)`);
 }
 
-main().catch((e) => { logLine('ERROR: ' + (e.message || e)); process.exit(0); });
+// Only auto-run when invoked directly as a script, not when imported (e.g. by tests).
+const isCli = process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isCli) {
+  main().catch((e) => { logLine('ERROR: ' + (e.message || e)); process.exit(0); });
+}

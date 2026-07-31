@@ -10,7 +10,7 @@
 // refresh (reposLastSha), the SessionStart catch-up, the auto-update posture, and
 // the status doctor.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
 import { join, dirname, basename, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { findCompartmentRoots } from '../../src/extract/walk.js';
@@ -105,9 +105,20 @@ export function defaultState(project, pluginVersion = null) {
   };
 }
 
-export function readState(project) {
+// Load a project's state, DISTINGUISHING an absent file from a corrupt one — the
+// distinction updateState needs so a torn/partial read can never be mistaken for a
+// fresh project and overwritten with defaults (the H1 data-loss bug). Returns
+// { status, state }:
+//   - file missing            → { status: 'absent',  state: null }
+//   - present but unparseable → { status: 'corrupt', state: null }  (JSON.parse or
+//                                 normalizeState threw — a truncated/partial write)
+//   - otherwise               → { status: 'ok',      state: <normalized> }
+// The 'ok' path applies the SAME own-root self-heal + normalizeState readState has
+// always done, so readState (which returns loadState(...).state) is byte-for-byte
+// unchanged for its callers: null on BOTH absent and corrupt.
+export function loadState(project) {
   const p = stateFilePath(project);
-  if (!existsSync(p)) return null;
+  if (!existsSync(p)) return { status: 'absent', state: null };
   try {
     const s = JSON.parse(readFileSync(p, 'utf8'));
     // Own-root self-heal (§rename safety). The state file's LOCATION is the source of
@@ -118,10 +129,14 @@ export function readState(project) {
     // directory we actually read from. In-memory only — it persists on the next
     // updateState (same policy as normalizeState's indexedRoots re-derivation).
     if (s && typeof s === 'object') s.project = realpathish(project);
-    return normalizeState(s);
+    return { status: 'ok', state: normalizeState(s) };
   } catch {
-    return null;
+    return { status: 'corrupt', state: null };
   }
+}
+
+export function readState(project) {
+  return loadState(project).state;
 }
 
 // The exact advisory wording graph_status surfaces off the honesty flags, kept in
@@ -397,19 +412,75 @@ export function findIndexedRoot(startDir, homeDir = homedir()) {
   }
 }
 
+// Per-write sequence counter, combined with the pid, to give each write a UNIQUE
+// temp filename. Two concurrent writers (the long-lived MCP server vs. a detached
+// refresh hook — the exact pair the H1 comment names) must not share one `.tmp`
+// path, or the loser's rename hits a torn/absent file (spurious ENOENT). pid+counter
+// is collision-free across processes and within a process, and deterministic (no
+// Math.random/Date.now).
+let writeSeq = 0;
+
 export function writeState(project, state) {
   const p = stateFilePath(project);
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(state, null, 2) + '\n');
+  // Atomic write: serialize into a sibling UNIQUE temp file, then rename it over the
+  // real path. rename(2) is atomic within one filesystem and .wiregraph/ is always
+  // same-fs as its state.json, so a concurrent reader sees either the whole old file
+  // or the whole new one — never a 0-byte or half-written state.json (the H1
+  // data-loss bug). The temp name is unique per writer+write (pid + counter) so two
+  // concurrent writers never collide on one temp file. A leftover unique .tmp from a
+  // crashed prior write is harmless (it is never reused); we still best-effort rm it
+  // if the rename throws so a failed write leaves no residue.
+  const tmp = p + '.' + process.pid + '.' + (writeSeq++) + '.tmp';
+  writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n');
+  try {
+    renameSync(tmp, p);
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+    throw e;
+  }
   return p;
 }
 
-// Merge updates into existing (or default) state and persist.
+// Merge updates into existing (or default) state and persist. Branches on load
+// status so a CORRUPT read is never mistaken for an absent one and papered over with
+// defaults (the H1 data-loss bug): a torn/partial state.json would otherwise merge the
+// patch onto defaultState and overwrite the real file, permanently dropping links,
+// posture, and the reposLastSha baseline.
+//   - ok      → merge patch onto the loaded state.
+//   - absent  → merge patch onto defaultState (a genuinely fresh project).
+//   - corrupt → preserve the bytes by renaming the file aside to a non-clobbering
+//               state.json.corrupt* backup, then throw. We do NOT write defaults over
+//               it. Callers (hooks) are best-effort and swallow errors, so this fails
+//               loudly in logs without crashing a session — while keeping the data.
 export function updateState(project, patch, pluginVersion = null) {
-  const cur = readState(project) || defaultState(project, pluginVersion);
+  const { status, state } = loadState(project);
+  if (status === 'corrupt') {
+    const p = stateFilePath(project);
+    const moved = quarantineCorrupt(p);
+    throw new Error(
+      moved
+        ? `wiregraph: state.json at ${p} is corrupt (unparseable); moved aside to ${moved} to preserve it. ` +
+          `Refusing to overwrite it with defaults. Investigate the backup, or delete it to let a fresh state be created.`
+        : `wiregraph: state.json at ${p} is corrupt (unparseable) and could not be moved aside. ` +
+          `Refusing to overwrite it with defaults. Investigate the file manually.`,
+    );
+  }
+  const cur = status === 'ok' ? state : defaultState(project, pluginVersion);
   const next = { ...cur, ...patch };
   writeState(project, next);
   return next;
+}
+
+// Rename a corrupt state file aside to a `.corrupt` backup, never clobbering a prior
+// one: if `<p>.corrupt` already exists, try `.corrupt.2`, `.corrupt.3`, … so earlier
+// corrupt backups are preserved. Best-effort — returns the path it moved the file to,
+// or null if even the rename failed (the throw still fires; the data may be lost only
+// if the rename itself could not happen).
+function quarantineCorrupt(p) {
+  let target = p + '.corrupt';
+  for (let n = 2; existsSync(target); n++) target = `${p}.corrupt.${n}`;
+  try { renameSync(p, target); return target; } catch { return null; }
 }
 
 // --- global project registry ------------------------------------------------

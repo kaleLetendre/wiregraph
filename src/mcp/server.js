@@ -22,6 +22,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { existsSync, realpathSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { connect, schemaVersion, SCHEMA_VERSION } from '../store/sqlite.js';
 import * as Q from '../store/sqlite-query.js';
 import { runBuild, reindexFiles } from '../build.js';
@@ -90,6 +91,7 @@ function withDb(fn, { requireIndexed = true } = {}) {
 // burst of queries pays the git+stat probe at most once per window.
 const FRESH_TTL_MS = 1500;
 let lastFreshAt = 0;
+let freshInFlight = null;      // single-flight: the in-progress ensureFresh reindex, if any
 let schemaConfirmed = false;   // set once the on-disk db is known to be on the current schema (per process)
 let schemaHealPromise = null;  // dedups a concurrent schema-migration rebuild
 
@@ -140,18 +142,49 @@ function staleNow() {
   } finally { db.close(); }
 }
 
+// Injectable deps so a test can drive ensureFresh without a real db/git; default
+// to the real implementations (see __setTestHooks / __resetFresh below).
+let _reindexFiles = reindexFiles;
+let _staleNow = staleNow;
+
+// Single-flight + advance-on-success. Concurrent reads must never stampede the
+// reindex NOR be served the old db while a rebuild is mid-flight, so callers that
+// arrive during a refresh coalesce onto the SAME in-flight promise and resolve
+// only AFTER it completes (reading fresh, not stale). lastFreshAt advances only
+// after a SUCCESSFUL reindex (or a genuine no-stale case): a failed, best-effort
+// reindex leaves the window unclaimed so the very next read retries instead of
+// suppressing re-indexing for a full TTL.
 async function ensureFresh() {
   const now = Date.now();
-  if (now - lastFreshAt < FRESH_TTL_MS) return;
-  lastFreshAt = now; // claim the window up front so concurrent reads don't stampede
-  const stale = staleNow();
-  if (!stale.length) return;
-  // A stale file may live under a linked member — reindexFiles attributes each to
-  // its owning member and fans the update into every graph that includes it, so a
-  // read stays self-healing across the whole union, not just this project's tree.
-  try { await reindexFiles(stale, PROJECT, { fanOut: true }); }
-  catch { /* best-effort: serve what we have rather than fail the read */ }
+  if (now - lastFreshAt < FRESH_TTL_MS) return;   // fast path: recently fresh
+  if (freshInFlight) return freshInFlight;         // a refresh is running → await it (no stampede, no stale serve)
+  freshInFlight = (async () => {
+    const stale = _staleNow();
+    if (!stale.length) { lastFreshAt = Date.now(); return; }
+    // A stale file may live under a linked member — reindexFiles attributes each to
+    // its owning member and fans the update into every graph that includes it, so a
+    // read stays self-healing across the whole union, not just this project's tree.
+    try { await _reindexFiles(stale, PROJECT, { fanOut: true }); lastFreshAt = Date.now(); } // claim window only on success
+    catch { /* best-effort; leave lastFreshAt so the next read retries */ }
+  })();
+  try { return await freshInFlight; } finally { freshInFlight = null; }
 }
+
+// --- test hooks -------------------------------------------------------------
+// Injection points so test/run.mjs can exercise ensureFresh's concurrency and
+// advance/retry behavior without a live db or git. No effect on the CLI path.
+function __setTestHooks({ reindexFiles: rf, staleNow: sn } = {}) {
+  if (rf) _reindexFiles = rf;
+  if (sn) _staleNow = sn;
+}
+function __resetFresh() {
+  _reindexFiles = reindexFiles;
+  _staleNow = staleNow;
+  lastFreshAt = 0;
+  freshInFlight = null;
+}
+function __getLastFreshAt() { return lastFreshAt; }
+export { ensureFresh, __setTestHooks, __resetFresh, __getLastFreshAt };
 
 // --- upstream-divergence caveat ---------------------------------------------
 // ensureFresh keeps the index matching the WORKING TREE, but "matches my
@@ -432,7 +465,19 @@ server.registerTool('update_graph', {
     let targets = files;
     let newShas = state?.reposLastSha || {};
     if (!targets || !targets.length) {
-      newShas = { ...newShas, ...changedSince(PROJECT, state?.reposLastSha || {}).newShas };
+      const c = changedSince(PROJECT, state?.reposLastSha || {});
+      if (c.fullBuildNeeded) {
+        // A new repo or an invalid stored baseline makes an incremental apply
+        // unreliable — it would index nothing yet advance the sha past unindexed
+        // history. Escalate to a full rebuild exactly like the `full` branch.
+        await runBuild({ target: PROJECT, project: PROJECT, reset: true });
+        const rebuiltShas = {};
+        for (const r of projectRepos(PROJECT)) if (r.head) rebuiltShas[r.root] = r.head;
+        updateState(PROJECT, { lastFullBuild: now, reposLastSha: rebuiltShas }, VERSION);
+        const n = withDbCount();
+        return text(`Full rebuild (auto-escalated: ${c.fullBuildReasons.join('; ')}): ${n} symbols indexed. Graph is fresh.`);
+      }
+      newShas = { ...newShas, ...c.newShas };
       targets = staleNow();
       if (!targets.length) {
         updateState(PROJECT, { reposLastSha: newShas }, VERSION); // advance shas; nothing to re-index
@@ -471,5 +516,11 @@ server.registerTool('query_sql', {
   return text(out);
 }));
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// Start the stdio transport ONLY when run directly as the entry point. Importing
+// this module (e.g. from a test) must not open a real server, which would hang the
+// process. Mirrors the isCli guard in src/build.js.
+const isCli = process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isCli) {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}

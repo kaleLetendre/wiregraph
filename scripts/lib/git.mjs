@@ -71,20 +71,39 @@ export function projectRepos(project) {
 // plus the current HEAD per repo. Combines committed diff (lastSha..HEAD) with
 // uncommitted working-tree changes (git status --porcelain). Returns absolute
 // paths so build.js --files resolves them unambiguously.
-//   { files: [abs...], newShas: { root: head }, repos: [{name,root,head}] }
+//   { files: [abs...], newShas: { root: head }, repos: [{name,root,head}],
+//     fullBuildNeeded: bool, fullBuildReasons: [str...] }
+//
+// fullBuildNeeded signals that an INCREMENTAL apply would silently miss code, so
+// an auto-catch-up caller must escalate to a full rebuild instead of trusting
+// `files`/`newShas`. Two conditions trip it:
+//   - NEW REPO (no reposLastSha entry): its committed history was never diffed, so
+//     an incremental apply indexes nothing yet the sha jumps to HEAD — after which
+//     last === HEAD forever and the code is never picked up.
+//   - INVALID BASELINE: the stored sha is no longer a reachable revision (e.g. gc'd
+//     after an amend/rebase), so `git diff last..HEAD` FAILS (git() returns null,
+//     distinct from "" for a valid-but-empty diff). Advancing past a failed range
+//     would permanently drop the last..HEAD commits.
 export function changedSince(project, reposLastSha = {}) {
   const repos = projectRepos(project);
   const files = new Set();
   const newShas = {};
+  const fullBuildReasons = [];
 
   for (const repo of repos) {
     if (repo.head) newShas[repo.root] = repo.head;
     const last = reposLastSha[repo.root];
     const rels = new Set();
 
-    if (last && repo.head && last !== repo.head) {
+    if (last === undefined && repo.head) {
+      // New repo, never indexed by catch-up — escalate rather than index nothing.
+      fullBuildReasons.push(`new repo: ${repo.name}`);
+    } else if (last && repo.head && last !== repo.head) {
+      // Call git ONCE and test === null: null is a failed revision range (the stored
+      // baseline is gone), "" is a valid range with no changes. Only the former escalates.
       const diff = git(repo.root, ['diff', '--name-only', `${last}..${repo.head}`]);
-      if (diff) diff.split('\n').filter(Boolean).forEach((f) => rels.add(f));
+      if (diff === null) fullBuildReasons.push(`invalid baseline: ${repo.name}`);
+      else diff.split('\n').filter(Boolean).forEach((f) => rels.add(f));
     }
     // Uncommitted changes (porcelain: "XY path" or rename "XY old -> new").
     const porcelain = git(repo.root, ['status', '--porcelain']);
@@ -101,7 +120,7 @@ export function changedSince(project, reposLastSha = {}) {
     }
   }
 
-  return { files: [...files], newShas, repos };
+  return { files: [...files], newShas, repos, fullBuildNeeded: fullBuildReasons.length > 0, fullBuildReasons };
 }
 
 // Per-repo divergence from the configured upstream tracking branch.
