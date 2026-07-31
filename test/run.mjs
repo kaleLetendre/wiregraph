@@ -2095,12 +2095,37 @@ async function nestedWorktreeTests() {
   ok(W.isLinkedWorktree(worktree), 'worktree: isLinkedWorktree is true for a nested `git worktree add` dir');
   ok(!W.isLinkedWorktree(main), 'worktree: isLinkedWorktree is false for a normal repo (.git is a directory)');
 
-  // A SUBMODULE has a `.git` FILE too, but pointing at `.../.git/modules/<name>` — must
-  // read false, else we would wrongly skip legitimately-separate submodule repos.
-  const sub = join(ws, 'submod');
-  mkdirSync(sub, { recursive: true });
-  writeFileSync(join(sub, '.git'), 'gitdir: /somewhere/.git/modules/submod\n');
-  ok(!W.isLinkedWorktree(sub), 'worktree: isLinkedWorktree is false for a submodule (.git file → /modules/, not /worktrees/)');
+  // MED-1 regression: a NORMAL repo whose git dir legitimately lives under a directory
+  // literally named "worktrees" (git init --separate-git-dir). The old path-string regex
+  // saw "/worktrees/" in its gitdir and MISREAD it as a linked-worktree marker, silently
+  // dropping the whole repo from indexing. Authoritative detection (its own git-dir ==
+  // its common git-dir) reads false. ~/worktrees/ is a common projects folder for exactly
+  // the worktree-heavy users this feature serves, so this must hold.
+  const sepParent = join(ws, 'worktrees', 'gitdirs');
+  mkdirSync(sepParent, { recursive: true });
+  const plain = join(ws, 'plain');
+  mkdirSync(plain, { recursive: true });
+  await execFileP('git', ['init', '-q', '--separate-git-dir', join(sepParent, 'plain'), plain]);
+  ok(!W.isLinkedWorktree(plain), 'worktree: isLinkedWorktree is false for a --separate-git-dir repo whose gitdir passes through a "worktrees" dir (MED-1)');
+
+  // A real SUBMODULE (its `.git` file points at <super>/.git/modules/<name>) must read
+  // false — its git-dir == its common git-dir — else we would wrongly skip a legitimately
+  // separate submodule repo. Built in its OWN super-repo so `main`'s later assertions stay clean.
+  const subUp = join(ws, 'sub-upstream');
+  mkdirSync(subUp, { recursive: true });
+  await execFileP('git', ['-C', subUp, 'init', '-q']);
+  await execFileP('git', ['-C', subUp, 'config', 'user.email', 't@t']);
+  await execFileP('git', ['-C', subUp, 'config', 'user.name', 't']);
+  writeFileSync(join(subUp, 'lib.js'), 'export function libFn(){}\n');
+  await execFileP('git', ['-C', subUp, 'add', '-A']);
+  await execFileP('git', ['-C', subUp, 'commit', '-q', '-m', 'init']);
+  const superR = join(ws, 'super');
+  mkdirSync(superR, { recursive: true });
+  await execFileP('git', ['-C', superR, 'init', '-q']);
+  await execFileP('git', ['-C', superR, 'config', 'user.email', 't@t']);
+  await execFileP('git', ['-C', superR, 'config', 'user.name', 't']);
+  await execFileP('git', ['-C', superR, '-c', 'protocol.file.allow=always', 'submodule', 'add', subUp, 'libs/foo']);
+  ok(!W.isLinkedWorktree(join(superR, 'libs', 'foo')), 'worktree: isLinkedWorktree is false for a real git submodule (git-dir == common-dir)');
 
   // --- findGitRepos skips the nested worktree, keeps the root ---
   const repos = W.findGitRepos(main).map((r) => r.dir);

@@ -3,7 +3,8 @@
 // language.
 
 import { readdirSync, statSync, existsSync, readFileSync, realpathSync } from 'node:fs';
-import { join, relative, basename } from 'node:path';
+import { join, relative, basename, resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { IGNORE_DIRS, langForFile } from './lang.js';
 
 // A COMPARTMENT is the unit code communicates ACROSS without a call edge (over
@@ -15,23 +16,43 @@ import { IGNORE_DIRS, langForFile } from './lang.js';
 const MODULE_MANIFESTS = new Set(['go.mod', 'Cargo.toml', 'pyproject.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts']);
 
 // A LINKED WORKTREE (`git worktree add`) is an alternate checkout of a repo we may
-// ALREADY be indexing. Its `.git` is a regular FILE reading `gitdir: <...>/.git/worktrees/<name>`
-// — the `/worktrees/` segment is the tell. (A SUBMODULE's `.git` file instead reads
-// `.../.git/modules/<name>`; a normal repo / main worktree has a `.git` DIRECTORY.)
-// We skip a linked worktree nested under the scan root for two reasons: (a) it holds a
-// different branch's copy of the same code, so indexing it pollutes the graph with
-// phantom, name-colliding duplicate symbols; (b) each nested worktree has no
+// ALREADY be indexing. We skip one nested under the scan root for two reasons: (a) it
+// holds a different branch's copy of the same code, so indexing it pollutes the graph
+// with phantom, name-colliding duplicate symbols; (b) each nested worktree has no
 // reposLastSha entry, so it's classified "new repo" and forces a spurious full rebuild
 // on every `git worktree add`. Submodules stay (legitimately separate repos); the scan
 // root itself stays (index-a-worktree-as-project must still work).
+//
+// Detection is AUTHORITATIVE, not a path-string heuristic: a linked worktree's OWN git
+// dir (`--git-dir` → .../.git/worktrees/<name>) differs from its COMMON git dir
+// (`--git-common-dir` → the main repo's .git), whereas a normal repo, a main worktree,
+// and a SUBMODULE all have git-dir == common-dir. Asking git itself is immune to the
+// traps a regex on the gitdir path falls into — a normal repo whose git dir legitimately
+// lives under a directory named "worktrees" (e.g. `git init --separate-git-dir
+// ~/worktrees/...`), a `--separate-git-dir` main repo, and Windows backslash paths. We
+// only shell out for a dir whose `.git` is a FILE (a worktree or submodule); a normal
+// repo has a `.git` DIRECTORY and returns false without a subprocess. If git can't
+// classify the dir (not installed, not a repo) we return false — indexing a repo we
+// weren't sure about is strictly safer than silently dropping it.
 function isLinkedWorktree(dir) {
   const dotgit = join(dir, '.git');
   let st;
   try { st = statSync(dotgit); } catch { return false; }
-  if (!st.isFile()) return false; // a directory → normal repo / main worktree
-  let content;
-  try { content = readFileSync(dotgit, 'utf8'); } catch { return false; }
-  return /^gitdir:\s*.*\/worktrees\//m.test(content);
+  if (!st.isFile()) return false; // `.git` is a directory → normal repo / main worktree
+  // --git-dir / --git-common-dir are ancient flags; both may print relative to `dir`
+  // (we pass `-C dir`), so resolve against `dir` and realpath before comparing.
+  const rp = (flag) => {
+    let out;
+    try { out = execFileSync('git', ['-C', dir, 'rev-parse', flag], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+    catch { return null; }
+    const v = out.trim();
+    if (!v) return null;
+    try { return realpathSync(resolve(dir, v)); } catch { return resolve(dir, v); }
+  };
+  const gitDir = rp('--git-dir');
+  const commonDir = rp('--git-common-dir');
+  if (!gitDir || !commonDir) return false; // git couldn't classify it → don't skip
+  return gitDir !== commonDir;
 }
 
 function isCompartmentBoundary(dir, entries) {
