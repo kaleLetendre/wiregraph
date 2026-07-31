@@ -3,6 +3,7 @@
 // (unresolved) calls that resolve.js will turn into CALLS edges.
 
 import { readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { walkSources } from './walk.js';
 import { parseSource } from './parse.js';
 import { symbolId, moduleId } from '../model.js';
@@ -32,9 +33,15 @@ export function extractCode(graph, rootDir, log = () => {}, fileFilter = null) {
     // for an uncommitted edit). Best-effort: a stat failure leaves them null.
     let mtime = null, size = null;
     try { const st = statSync(f.abs); mtime = st.mtimeMs; size = st.size; } catch { /* keep null */ }
+    // Content hash (v5): the authoritative tiebreaker for the invalid-baseline
+    // reconcile when mtime+size still MATCH — it catches a same-size, mtime-preserved
+    // edit (cp -p / rsync -a / coarse-mtime FS) that mtime+size alone would miss.
+    // Reuse `source` we already read (no second read); sha1 is change-detection only,
+    // not security, so its speed is the point.
+    const hash = createHash('sha1').update(source).digest('hex');
 
     graph.addCompartment(f.compartment, f.compartmentRoot);
-    graph.addFile(f.compartment, f.relPath, f.lang, mtime, size);
+    graph.addFile(f.compartment, f.relPath, f.lang, mtime, size, hash);
     graph.addEdge('IN_COMPARTMENT', `file:${f.compartment}:${f.relPath}`, `compartment:${f.compartment}`);
 
     // Synthetic module symbol owns top-level calls.

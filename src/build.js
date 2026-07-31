@@ -21,7 +21,8 @@
 //   --dump <file>       also write the raw graph as JSON (for inspection)
 //   --no-load           skip the SQLite load, just extract (+ optional --dump)
 
-import { writeFileSync, existsSync, realpathSync, readdirSync, statSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, realpathSync, readdirSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { resolve, join, relative, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Graph } from './model.js';
@@ -513,14 +514,21 @@ export async function reindexFiles(files, editingProject, { fanOut = false } = {
 //
 // This computes the MINIMAL reconcile for ONE repo WITHOUT any git diff: the working
 // tree already reflects the new HEAD, and the store recorded each file's on-disk
-// mtime+size at index time (schema v2), so "what changed" is precisely "the working
-// tree differs from what was indexed". We walk the repo's current sources, compare each
-// file's disk mtime+size against the recorded stamp, and return the abs paths that are
-// NEW / DIFFER (reindex) or VANISHED (prune) — a superset-safe comparison: any content
-// change rewrites the file with a fresh mtime, so this never UNDER-reports a real
-// change (correctness), and a message-only amend leaves every mtime untouched → an
-// empty set → a true content no-op. Only THIS repo's files are considered (compartment
-// root under repoRoot), so sibling repos/members stay untouched.
+// mtime+size AND a content hash at index time (schema v2/v5), so "what changed" is
+// precisely "the working tree differs from what was indexed". We walk the repo's current
+// sources and return the abs paths that are NEW / DIFFER (reindex) or VANISHED (prune):
+//   - mtime OR size differs from the recorded stamp → DIFFERS, reindex (no hashing — a
+//     stamp mismatch already proves a change);
+//   - mtime AND size MATCH → the FAST path says "probably unchanged", but that alone
+//     MISSES a same-size, mtime-PRESERVED edit (cp -p / rsync -a / tar / a coarse-mtime
+//     FAT/exFAT/NFS clock — MED-2). So CONFIRM the match by content: hash the on-disk
+//     file and compare to the recorded hash. Differ → reindex; equal → trust (the
+//     message-only-amend no-op stays a no-op). A NULL recorded hash (a pre-v5 / unstamped
+//     row) can't confirm → reindex (superset-safe).
+// This never UNDER-reports a real change (correctness); a message-only amend leaves every
+// file byte-identical → hashes match → an empty set → a true content no-op. Only THIS
+// repo's files are considered (compartment root under repoRoot), so sibling repos/members
+// stay untouched.
 //
 // Returns { ok, files }. ok:false means the store lacks a usable stamp for this repo's
 // files (e.g. a pre-v2 db, or none populated) — the caller MUST fall back to a full
@@ -541,7 +549,7 @@ export function reconcileRepoByContent(repoRoot, project) {
   for (const r of indexed) {
     const abs = join(r.root, r.path);
     if (abs !== root && !abs.startsWith(root + sep)) continue; // sibling repo/member — leave it alone
-    recorded.set(abs, { mtime: r.mtime, size: r.size });
+    recorded.set(abs, { mtime: r.mtime, size: r.size, hash: r.hash });
     if (r.mtime != null && r.size != null) anyStamped = true;
   }
   // No usable stamp on ANY of this repo's indexed files → we cannot compare by content.
@@ -556,9 +564,24 @@ export function reconcileRepoByContent(repoRoot, project) {
     let mtime = null, size = null;
     try { const st = statSync(f.abs); mtime = st.mtimeMs; size = st.size; } catch { /* unreadable → treat as differing, reindex */ }
     const rec = recorded.get(f.abs);
-    // NEW file (never indexed) or any mtime/size divergence → reindex. A null recorded
-    // stamp counts as "differs" so a partially-stamped repo still reconciles correctly.
-    if (!rec || rec.mtime == null || rec.size == null || rec.mtime !== mtime || rec.size !== size) files.add(f.abs);
+    // NEW file (never indexed) or any mtime/size divergence → reindex outright (no hashing;
+    // a stamp mismatch already proves a change). A null recorded stamp counts as "differs"
+    // so a partially-stamped repo still reconciles correctly.
+    if (!rec || rec.mtime == null || rec.size == null || rec.mtime !== mtime || rec.size !== size) {
+      files.add(f.abs);
+      continue;
+    }
+    // mtime+size MATCH — the "probably unchanged" FAST path. Confirm by CONTENT so a
+    // same-size, mtime-preserved edit is still caught (MED-2). Hash the on-disk file and
+    // compare to the recorded hash: a NULL recorded hash (pre-v5 / unstamped) can't confirm
+    // → reindex; a read failure can't confirm → reindex; a mismatch → reindex; equal →
+    // trust (keeps the message-only-amend no-op a no-op). Only matched candidates are
+    // hashed, so the steady-state cost is one hash per still-present file.
+    // Hash the SAME representation the extractor stamped (the utf8 string it parses), so
+    // an unchanged file's on-disk hash matches its recorded hash byte-for-byte.
+    let onDiskHash = null;
+    try { onDiskHash = createHash('sha1').update(readFileSync(f.abs, 'utf8')).digest('hex'); } catch { /* unreadable → reindex */ }
+    if (rec.hash == null || onDiskHash == null || rec.hash !== onDiskHash) files.add(f.abs);
   }
   // VANISHED: recorded under this repo but gone from disk → prune.
   for (const abs of recorded.keys()) if (!onDisk.has(abs)) files.add(abs);

@@ -54,9 +54,9 @@ export class Graph {
     return id;
   }
 
-  addFile(compartment, path, lang, mtime = null, size = null) {
+  addFile(compartment, path, lang, mtime = null, size = null, hash = null) {
     const id = fileId(compartment, path);
-    if (!this.files.has(id)) this.files.set(id, { id, compartment, path, lang, mtime, size, project: this.project });
+    if (!this.files.has(id)) this.files.set(id, { id, compartment, path, lang, mtime, size, hash, project: this.project });
     return id;
   }
 

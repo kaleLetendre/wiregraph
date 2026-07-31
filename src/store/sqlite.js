@@ -47,7 +47,12 @@ const SQL = await initSqlJs({ locateFile: () => require.resolve('sql.js/dist/sql
 // DRIFT (a contract token no code references, or a token only one side touches).
 // Before v4 the token set was computed at build time, used to mint REFERENCES
 // edges, then discarded — so a drifted-away contract left no trace to detect.
-export const SCHEMA_VERSION = 4;
+// v5 adds files.hash: a per-file CONTENT hash stamped at index time, so the
+// invalid-baseline content-reconcile (build.js) can CONFIRM a "probably unchanged"
+// candidate (mtime+size still match the recorded stamp) by content. Without it a
+// same-size, mtime-PRESERVED edit (cp -p / rsync -a / tar / coarse-mtime FS) reads
+// as unchanged and its stale symbols linger — a real correctness miss (MED-2).
+export const SCHEMA_VERSION = 5;
 
 // better-sqlite3 binds a single object arg as NAMED params (SQL `@key` <- obj.key)
 // and any other args as POSITIONAL (`?`). sql.js wants the `@` sigil in the keys
@@ -224,7 +229,7 @@ export function schemaVersion(db) {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta        (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS compartments(id TEXT PRIMARY KEY, project TEXT, name TEXT, root TEXT);
-CREATE TABLE IF NOT EXISTS files       (id TEXT PRIMARY KEY, project TEXT, compartment TEXT, path TEXT, lang TEXT, mtime REAL, size INTEGER);
+CREATE TABLE IF NOT EXISTS files       (id TEXT PRIMARY KEY, project TEXT, compartment TEXT, path TEXT, lang TEXT, mtime REAL, size INTEGER, hash TEXT);
 CREATE TABLE IF NOT EXISTS symbols     (id TEXT PRIMARY KEY, project TEXT, compartment TEXT, file TEXT, name TEXT, kind TEXT, lang TEXT, startLine INTEGER, endLine INTEGER);
 CREATE TABLE IF NOT EXISTS contracts   (id TEXT PRIMARY KEY, project TEXT, name TEXT, file TEXT);
 CREATE TABLE IF NOT EXISTS contract_tokens(project TEXT, contract TEXT, token TEXT, direction TEXT, producers TEXT, consumers TEXT);
@@ -309,7 +314,7 @@ export function loadGraph(db, graph, { reset = false, log = () => {}, allowReduc
   db.exec(SCHEMA);
 
   const insCompartment = db.prepare('INSERT OR REPLACE INTO compartments (id,project,name,root) VALUES (@id,@project,@name,@root)');
-  const insFile = db.prepare('INSERT OR REPLACE INTO files (id,project,compartment,path,lang,mtime,size) VALUES (@id,@project,@compartment,@path,@lang,@mtime,@size)');
+  const insFile = db.prepare('INSERT OR REPLACE INTO files (id,project,compartment,path,lang,mtime,size,hash) VALUES (@id,@project,@compartment,@path,@lang,@mtime,@size,@hash)');
   const insSym = db.prepare('INSERT OR REPLACE INTO symbols (id,project,compartment,file,name,kind,lang,startLine,endLine) VALUES (@id,@project,@compartment,@file,@name,@kind,@lang,@startLine,@endLine)');
   const insCon = db.prepare('INSERT OR REPLACE INTO contracts (id,project,name,file) VALUES (@id,@project,@name,@file)');
   const insTok = db.prepare('INSERT INTO contract_tokens (project,contract,token,direction,producers,consumers) VALUES (@project,@contract,@token,@direction,@producers,@consumers)');
@@ -336,7 +341,7 @@ export function loadGraph(db, graph, { reset = false, log = () => {}, allowReduc
     }
     db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
     for (const r of graph.compartments.values()) insCompartment.run(r);
-    for (const f of graph.files.values()) insFile.run({ mtime: null, size: null, ...f });
+    for (const f of graph.files.values()) insFile.run({ mtime: null, size: null, hash: null, ...f });
     for (const s of graph.symbols.values()) insSym.run({ lang: null, ...s });
     for (const c of graph.contracts.values()) {
       insCon.run({ file: null, ...c });
@@ -390,10 +395,20 @@ export function loadGraph(db, graph, { reset = false, log = () => {}, allowReduc
 // (build.js) to compare disk-vs-graph WITHOUT a git diff — the diff is exactly what's
 // unavailable once the baseline sha was gc'd. mtime/size may be null on a file indexed
 // before v2 populated them; the caller treats a null stamp as "differs" (reindex) and
-// bails to a full rebuild if NO file under the repo carries a usable stamp.
+// bails to a full rebuild if NO file under the repo carries a usable stamp. hash (v5) is
+// the authoritative tiebreaker for a mtime+size MATCH (see reconcileRepoByContent); it is
+// NULL on any row indexed before v5 stamped it → the caller treats a null hash as "cannot
+// confirm" and reindexes that file (superset-safe).
 export function listIndexedFiles(db, project) {
+  // The reconcile connects READONLY, and this SELECT runs with no schema gate ahead of it
+  // — so a pre-v5 db (files table without the hash column) would throw here on the upgrade
+  // before any full rebuild recreates the table. Add the column defensively: on a readonly
+  // connection the mutation lives only in memory (close never persists), and on a v5+ db
+  // the column already exists so the ALTER is a harmless no-op. Old rows then read
+  // hash=NULL, which the caller already treats as "reindex".
+  try { db.exec('ALTER TABLE files ADD COLUMN hash TEXT'); } catch { /* column already present */ }
   return db.prepare(
-    'SELECT f.compartment AS compartment, f.path AS path, f.mtime AS mtime, f.size AS size, c.root AS root ' +
+    'SELECT f.compartment AS compartment, f.path AS path, f.mtime AS mtime, f.size AS size, f.hash AS hash, c.root AS root ' +
     'FROM files f JOIN compartments c ON c.name = f.compartment AND c.project = f.project ' +
     'WHERE f.project = ?',
   ).all(project);

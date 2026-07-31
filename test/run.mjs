@@ -2850,6 +2850,11 @@ async function invalidBaselineReconcileTest() {
   await gitCommit(p1, { 'a.js': 'export function alpha(){ return 1; }\n' });
   await runRefresh(p1, ['--full']);
   const db1 = join(p1, '.wiregraph', 'graph.db');
+  // v5: a normal full build stamps a non-null content hash on every indexed file — the
+  // authoritative tiebreaker the content-reconcile confirms a mtime+size MATCH with.
+  { const db = connect(db1, { readonly: true }); const rows = db.prepare('SELECT path, hash FROM files').all(); db.close();
+    ok(rows.length > 0 && rows.every((r) => typeof r.hash === 'string' && r.hash.length === 40),
+      'inv-base hash: every file row carries a non-null 40-char sha1 content hash after a normal build'); }
   const st1 = S.readState(p1);
   const fullBefore1 = st1.lastFullBuild;
   const symsBefore1 = symCount(db1);
@@ -2948,6 +2953,47 @@ async function invalidBaselineReconcileTest() {
   const log4 = readFileSync(S.refreshLogPath(p4), 'utf8');
   has(log4, 'no content comparison', 'inv-base fallback: refresh logs the full-rebuild fallback reason');
   ok(S.readState(p4).lastFullBuild !== fullBefore4, 'inv-base fallback: a full rebuild actually ran (lastFullBuild advanced)');
+
+  // ---- Case 5: MED-2 — a SAME-SIZE, mtime-PRESERVED content change under an invalid
+  //      baseline MUST still be reindexed. mtime+size alone read "unchanged"; only the
+  //      content hash (v5) catches it. This is the fail-on-revert guard: on the pre-fix
+  //      code the reconcile returns zero changed files and the stale symbol lingers. ----
+  const p5 = realpathSync(mkdtempSync(join(ws, 'samesize-')));
+  // symAAAA and symBBBB are the same 7-char length, so the file's byte size is invariant.
+  await gitCommit(p5, { 'm.js': 'export function symAAAA(){ return 1; }\n' });
+  const m5 = join(p5, 'm.js');
+  // Pin the file to an EXACT integer-second mtime so it round-trips through utimesSync with
+  // no precision loss — the recorded stamp and the restored stamp then match to the ms, so
+  // the FAST path genuinely reads "unchanged" and only the hash can catch the edit.
+  const fixed = new Date('2020-01-01T00:00:00Z');
+  utimesSync(m5, fixed, fixed);
+  await runRefresh(p5, ['--full']); // records mtime=fixed, size, hash(symAAAA) for m.js
+  const db5 = join(p5, '.wiregraph', 'graph.db');
+  { const db = connect(db5, { readonly: true }); has(Q.findSymbol(db, p5, 'symAAAA'), 'm.js', 'inv-base samesize: symAAAA is indexed before the edit'); db.close(); }
+  const st5 = S.readState(p5);
+  const fullBefore5 = st5.lastFullBuild;
+  // Overwrite with the SAME-LENGTH different content (mtime bumps), then RESTORE the exact
+  // recorded mtime — a cp -p / rsync -a / coarse-mtime-FS style change that mtime+size miss.
+  writeFileSync(m5, 'export function symBBBB(){ return 1; }\n');
+  utimesSync(m5, fixed, fixed);
+  // At this point mtime+size match what was indexed, so a mtime/size-only reconcile is
+  // blind — only the content hash can catch the change.
+  // Amend the baseline commit to carry the new content, then orphan it (the bug trigger).
+  await execFileP('git', ['-C', p5, 'commit', '--amend', '--no-edit', '-a', '-q']);
+  utimesSync(m5, fixed, fixed); // git may touch the working file on amend — re-pin to be sure
+  await orphanHead(p5);
+  // Direct reconcile call: with the hash tiebreaker the same-size change IS surfaced.
+  const rec5 = B.reconcileRepoByContent(p5, p5);
+  ok(rec5.ok === true && rec5.files.includes(m5),
+    'inv-base samesize: reconcileRepoByContent flags the same-size, mtime-preserved file by content hash (MED-2)');
+  await runRefresh(p5);
+  const log5 = readFileSync(S.refreshLogPath(p5), 'utf8');
+  has(log5, 'by content (1 file', 'inv-base samesize: exactly the one same-size file was reconciled by content');
+  eq(S.readState(p5).lastFullBuild, fullBefore5, 'inv-base samesize: NO whole-project rebuild ran (reconciled surgically)');
+  const db5after = connect(db5, { readonly: true });
+  has(Q.findSymbol(db5after, p5, 'symBBBB'), 'm.js', 'inv-base samesize: the NEW symbol was reindexed despite matching mtime+size');
+  has(Q.findSymbol(db5after, p5, 'symAAAA'), 'No symbol named "symAAAA"', 'inv-base samesize: the OLD symbol is gone after reconcile');
+  db5after.close();
 
   rmSync(ws, { recursive: true, force: true });
 }
