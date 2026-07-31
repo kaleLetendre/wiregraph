@@ -40,7 +40,7 @@ export function d3ScriptTag(allowCdn, bundlePath = D3_BUNDLE) {
   } catch {
     if (allowCdn) return '<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>';
     throw new Error(
-      `d3 bundle not found at ${D3_BUNDLE}. The offline visualization needs it — run `
+      `d3 bundle not found at ${bundlePath}. The offline visualization needs it — run `
       + `\`npm install\` in the plugin dir, or pass --allow-cdn to load d3 from a CDN `
       + `(requires network; not "100% local").`);
   }
@@ -73,6 +73,12 @@ const PALETTE = ['#E15554', '#4D9DE0', '#3BB273', '#7768AE', '#E67E22', '#1B9AAA
 const CONTRACT_COLOR = '#F2C94C';
 // Contract-edge colors by drift status: a wire you can trust vs one to look at.
 const DRIFT_COLORS = { ok: '#3BB273', 'one-sided': '#E6A23C', drift: '#E15554' };
+
+// Escape a string for safe interpolation into server-side HTML markup (mirrors the
+// xml() helper in export-gexf.js). Used for values that land in the page's <head>/
+// <body> outside the inline <script> — e.g. data.title, which in --contract mode is
+// the raw CLI search string / matched contract name.
+const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 function parseArgs(argv) {
   const o = { out: null, all: false, tests: false, contract: null, up: 3, down: 1, project: null, db: null, open: false, functions: false, allowCdn: false };
@@ -223,7 +229,7 @@ export function renderHtml(data, { allowCdn = false } = {}) {
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>wiregraph — ${data.title}</title>
+<title>wiregraph — ${escHtml(data.title)}</title>
 ${d3ScriptTag(allowCdn)}
 <style>
   html,body { margin:0; height:100%; background:#1b1d23; color:#e6e6e6; font:13px/1.4 system-ui,sans-serif; overflow:hidden; }
@@ -246,7 +252,7 @@ ${d3ScriptTag(allowCdn)}
 <body>
 <svg id="graph"></svg>
 <div id="panel">
-  <h1>${data.title} &middot; ${data.nodes.length} nodes</h1>
+  <h1>${escHtml(data.title)} &middot; ${data.nodes.length} nodes</h1>
   <div class="ctl"><label>same-compartment attraction <span id="vCluster">0.30</span></label>
     <input id="cluster" type="range" min="0" max="1" step="0.02" value="0.30"></div>
   <div class="ctl"><label>repulsion <span id="vCharge">40</span></label>
@@ -259,7 +265,11 @@ ${d3ScriptTag(allowCdn)}
 </div>
 <div id="tip"></div>
 <script>
-const DATA = ${JSON.stringify(data)};
+const DATA = ${JSON.stringify(data).replace(/</g, '\\u003c')};
+// Escape dynamic values before they hit tip.innerHTML (below). Node names, files,
+// contract names and REFERENCES tokens are authored strings from source, so a name
+// carrying an onerror image tag would otherwise execute on hover.
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const DRIFT = DATA.driftColors;
 const contractCol = d => DRIFT[d.status] || ${JSON.stringify(CONTRACT_COLOR)};
 // A contract is drawn as an EDGE now; the only contract NODES are "dangling" ones
@@ -306,10 +316,10 @@ const linkStroke = d => d.type==='CONTRACT' ? contractCol(d) : (d.type==='REFERE
 const linkWidth = d => d.type==='CONTRACT' ? Math.min(6, 1.4 + Math.log2(1+d.tokens.length)*1.4)
   : d.type==='REFERENCES' ? Math.min(7, 1 + d.count*0.6) : Math.min(3.5, 0.8 + d.count*0.3);
 const linkTip = d => d.type==='CONTRACT'
-    ? '<b>'+d.contract+'</b>'+driftFlag(d)+'<br>contract seam &middot; '+d.tokens.length+' field(s)'
-        + (d.drift? '<br>'+d.drift.satisfied+' satisfied &middot; '+d.drift.oneSided+' one-sided &middot; '+d.drift.unreferenced+' unreferenced':'')
-        + '<br>'+d.tokens.slice(0,12).join(', ')+(d.tokens.length>12?' …':'')
-    : d.type==='REFERENCES' ? '<b>REFERENCES</b> &middot; '+d.count+' field(s)<br>'+d.tokens.join(', ')
+    ? '<b>'+esc(d.contract)+'</b>'+driftFlag(d)+'<br>contract seam &middot; '+d.tokens.length+' field(s)'
+        + (d.drift? '<br>'+esc(d.drift.satisfied)+' satisfied &middot; '+esc(d.drift.oneSided)+' one-sided &middot; '+esc(d.drift.unreferenced)+' unreferenced':'')
+        + '<br>'+d.tokens.slice(0,12).map(esc).join(', ')+(d.tokens.length>12?' …':'')
+    : d.type==='REFERENCES' ? '<b>REFERENCES</b> &middot; '+d.count+' field(s)<br>'+d.tokens.map(esc).join(', ')
     : '<b>CALLS</b> &times;'+d.count;
 
 const link = g.append('g').attr('fill','none').attr('stroke-opacity',0.5).selectAll('path')
@@ -323,10 +333,10 @@ const node = g.append('g').selectAll('circle')
   .attr('r', rOf)
   .attr('fill', color).attr('stroke','#1b1d23').attr('stroke-width',d=>d.kind==='compartment'?2:1.2)
   .on('mousemove', (e,d)=> showTip(e, d.kind==='contract'
-      ? '<b>'+d.name+'</b>'+driftFlag(d)+'<br>unwired contract — no code, or only one side, references it'
+      ? '<b>'+esc(d.name)+'</b>'+driftFlag(d)+'<br>unwired contract — no code, or only one side, references it'
       : d.kind==='compartment'
-      ? '<b>'+d.name+'</b><br>compartment'
-      : '<b>'+d.name+'</b><br>'+d.compartment+'<br>'+(d.file||'')+(d.line?(':'+d.line):'')))
+      ? '<b>'+esc(d.name)+'</b><br>compartment'
+      : '<b>'+esc(d.name)+'</b><br>'+esc(d.compartment)+'<br>'+esc(d.file||'')+(d.line?(':'+esc(d.line)):'')))
   .on('mouseout', hideTip)
   .call(d3.drag()
     .on('start',(e,d)=>{ if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })

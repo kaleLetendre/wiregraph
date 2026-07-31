@@ -112,15 +112,16 @@ async function reinferAndRebuild(project, roots = null) {
 // lines, fatal } — fatal marks a stop that isn't a guard rejection (null SELF,
 // missing target). Never mutates anything.
 export function previewLink(self, targetArg) {
-  if (!self) return { ok: false, fatal: true, reason: NOT_INDEXED, lines: [] };
+  if (!self) return { ok: false, fatal: true, reason: NOT_INDEXED, guardOk: false, guardReason: NOT_INDEXED, lines: [] };
   const target = realpathish(targetArg);
   if (!existsSync(target)) {
     // Show the ABSOLUTE resolved path — a bare/relative arg resolves against the cwd,
     // which is exactly the "IM30 → cwd/IM30" footgun; the absolute form makes it obvious.
     const shown = isAbsolute(targetArg) ? target : resolve(process.cwd(), targetArg);
-    return { ok: false, fatal: true, reason: `target directory does not exist: ${shown} (a relative path resolves against the current directory)`, lines: [] };
+    const reason = `target directory does not exist: ${shown} (a relative path resolves against the current directory)`;
+    return { ok: false, fatal: true, reason, guardOk: false, guardReason: reason, lines: [] };
   }
-  if (target === self) return { ok: false, fatal: true, reason: 'cannot link a graph to itself', lines: [] };
+  if (target === self) return { ok: false, fatal: true, reason: 'cannot link a graph to itself', guardOk: false, guardReason: 'cannot link a graph to itself', lines: [] };
 
   const already = findLink(self, target);
   const guard = already ? { ok: true } : canLink(readState(self), target);
@@ -130,7 +131,7 @@ export function previewLink(self, targetArg) {
   const lines = [`Link preview:  ${self}  ⟷  ${target}`, ''];
   if (!guard.ok) {
     lines.push(`REJECTED: ${guard.reason}`);
-    return { ok: false, reason: guard.reason, lines, target, self };
+    return { ok: false, reason: guard.reason, guardOk: false, guardReason: guard.reason, lines, target, self };
   }
   const selfComps = compartmentsOf(self).length;
   lines.push(`${self}  (this graph):`);
@@ -151,7 +152,7 @@ export function previewLink(self, targetArg) {
   lines.push('Then contracts are re-inferred across the union and BOTH graphs rebuilt.');
   if (!writable) lines.push(`\n⚠ ${target} is not writable — the link cannot write the mirror record there.`);
   if (already) lines.push('\nNote: already linked — re-running will reconcile (idempotent), not double-link.');
-  return { ok: writable, reason: writable ? null : `${target} is not writable`, lines, target, self, autoInit: !preexisting, already: !!already };
+  return { ok: writable, reason: writable ? null : `${target} is not writable`, guardOk: true, guardReason: null, writable, lines, target, self, autoInit: !preexisting, already: !!already };
 }
 
 // Perform the link. Ordered so a re-run always reconciles (§link atomicity):
@@ -171,13 +172,17 @@ export async function doLink(self, targetArg, hooks = {}) {
     if (!c.ok) throw new Error(c.reason);
   }
   // preexisting is measured BEFORE any auto-init side effect — the ONLY moment we can
-  // tell whether THIS link pair is about to conjure the peer graph. autoCreated is
-  // stamped IDENTICALLY on both records; the created graph is the non-initiator side
-  // (SELF, the initiator, always pre-exists). Unlink combines it with an initiator
-  // comparison to know which side may be cleaned up. Preserve the prior value on a
-  // reconcile so a crash-then-rerun doesn't lose it.
+  // tell whether THIS link pair is about to conjure the peer graph. autoCreated and
+  // initiator are stamped IDENTICALLY on both records; the created graph is the
+  // non-initiator side (the initiator always pre-exists). Unlink combines them to know
+  // which side may be cleaned up. Both are immutable facts about the ORIGINAL link pair
+  // ("who conjured whom"), so preserve the prior values on a reconcile — a crash-then-
+  // rerun, or a re-link from the OPPOSITE graph, must not lose or flip them. initiator
+  // is read back from whichever record `already` found (SELF's own or, from the far
+  // side, the mirror), so it stays the original initiator regardless of which side reruns.
   const preexisting = existsSync(stateFilePath(target));
   const autoCreated = already ? already.autoCreated : !preexisting;
+  const initiator = already ? already.initiator : self;
   const linkedAt = new Date().toISOString();
 
   // Write SELF's record FIRST — BEFORE auto-init — so the auto-created intent is
@@ -186,7 +191,7 @@ export async function doLink(self, targetArg, hooks = {}) {
   // crash before the mirror write would leave the peer on disk with NO record of who
   // created it; a re-run would see preexisting===true and wrongly compute
   // autoCreated=false, orphaning the conjured graph from a later unlink's cleanup.
-  addLink(self, { root: target, peer: target, initiator: self, autoCreated, linkedAt });
+  addLink(self, { root: target, peer: target, initiator, autoCreated, linkedAt });
 
   let gi = null;
   if (!preexisting) {
@@ -204,9 +209,10 @@ export async function doLink(self, targetArg, hooks = {}) {
   if (hooks.afterAutoInit) await hooks.afterAutoInit();
 
   // Write the mirror record — the reverse index of record. initiator + autoCreated
-  // are IDENTICAL to SELF's. A crash before this re-runs to convergence: SELF's
-  // record is already present (carrying autoCreated), so the re-run reads it back.
-  addLink(target, { root: self, peer: self, initiator: self, autoCreated, linkedAt });
+  // are IDENTICAL to SELF's, both carrying the preserved ORIGINAL values (not this
+  // run's SELF). A crash before this re-runs to convergence: SELF's record is already
+  // present (carrying initiator + autoCreated), so the re-run reads it back.
+  addLink(target, { root: self, peer: self, initiator, autoCreated, linkedAt });
 
   // Re-infer contracts to disk, then full-reset rebuild — for EACH graph.
   await reinferAndRebuild(self);
@@ -374,8 +380,13 @@ async function main(argv) {
     if (!dirArg) { err(`usage: links.mjs ${cmd} <dir>`); process.exit(2); }
     const p = previewLink(self, dirArg);
     if (cmd === 'check-overlap') {
-      log(p.ok ? 'OK: link is allowed.' : `REJECTED: ${p.reason}`);
-      process.exit(p.ok ? 0 : 2);
+      if (p.guardOk) {
+        log('OK: link guard passes (no overlap / nested index / basename collision).');
+        if (p.writable === false) log(`⚠ note: ${p.target} is not writable — the actual link would fail to write the mirror record there.`);
+        process.exit(0);
+      }
+      log(`REJECTED: ${p.guardReason}`);
+      process.exit(2);
     }
     // A "fatal" stop (missing target, self not indexed, self-link) carries its reason
     // in p.reason with EMPTY p.lines — surface it, or the caller gets a silent exit 2.

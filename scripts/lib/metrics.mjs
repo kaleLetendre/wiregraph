@@ -171,7 +171,13 @@ export async function summarize(project, { sessionId = null, migrate = true } = 
   for (const ln of raw.split('\n')) {
     if (!ln.trim()) continue;
     let e; try { e = JSON.parse(ln); } catch { continue; }
-    if (sessionId && e.sessionId !== sessionId) continue;
+    // Only drop an event that carries a NON-NULL session id that mismatches. 'use'
+    // events (get_source/trace) logged by the long-lived MCP server usually carry a
+    // null sessionId (it rarely sees the hook's CLAUDE_SESSION_ID), while turn/boundary
+    // events carry the real hook id. Excluding null-session reads would zero out a
+    // per-session view; instead we keep them and let the residency loop's null-session
+    // GLOBAL-timeline fallback correlate them.
+    if (sessionId && e.sessionId != null && e.sessionId !== sessionId) continue;
     agg.events++;
     if (e.kind === 'use') {
       if (e.tool === 'get_source') {

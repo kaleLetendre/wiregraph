@@ -43,14 +43,19 @@ export function targetPath(project) {
   return join(project, 'CLAUDE.md');
 }
 
-// Remove one sentinel-delimited block, tidying the blank lines it leaves behind.
+// Remove one sentinel-delimited block, tidying only the seam it leaves behind.
+// Collapses the blank run at the removal junction to a single blank line but
+// leaves all other whitespace in the file byte-for-byte, so a user's intentional
+// triple-blank-line elsewhere survives (the "rest of the file untouched" guarantee).
 function stripBlock(content, begin, end) {
   const bi = content.indexOf(begin);
   const ei = content.indexOf(end);
   if (bi === -1 || ei === -1 || ei < bi) return content;
-  const before = content.slice(0, bi).replace(/\n+$/, '\n');
-  const after = content.slice(ei + end.length).replace(/^\n+/, '');
-  return (before + after).replace(/\n{3,}/g, '\n\n');
+  const beforeTrim = content.slice(0, bi).replace(/\n+$/, '');       // strip ONLY the block's leading blank run
+  const afterTrim = content.slice(ei + end.length).replace(/^\n+/, ''); // and its trailing blank run
+  if (!beforeTrim) return afterTrim;                                  // block at file start
+  if (!afterTrim) return beforeTrim + '\n';                           // block at file end → keep a single trailing newline
+  return beforeTrim + '\n\n' + afterTrim;                             // block in the middle → exactly one blank line
 }
 
 // Strip any pre-rename codegraph block (migration cleanup).
@@ -86,6 +91,15 @@ export function present(content) {
   return !!content && content.includes(BEGIN) && content.includes(END);
 }
 
+// Removal-path predicate: true for a current block OR any pre-rename legacy block.
+// The removal gate must fire for a legacy-only project so uninstall/teardown cleans
+// up the old codegraph directive too — `present` (new-sentinel only) misses those.
+export function presentAny(content) {
+  if (!content) return false;
+  if (content.includes(BEGIN) && content.includes(END)) return true;
+  return LEGACY.some(({ begin, end }) => content.includes(begin) && content.includes(end));
+}
+
 // --- CLI --------------------------------------------------------------------
 function readTarget(project) {
   const p = targetPath(project);
@@ -115,7 +129,7 @@ function main(argv) {
     return;
   }
   if (cmd === 'remove') {
-    if (!present(cur)) { process.stdout.write(`No wiregraph block in ${path}.\n`); return; }
+    if (!presentAny(cur)) { process.stdout.write(`No wiregraph block in ${path}.\n`); return; }
     writeFileSync(path, withoutBlock(cur));
     process.stdout.write(`Removed wiregraph block from ${path}.\n`);
     return;

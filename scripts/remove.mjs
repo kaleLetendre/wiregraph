@@ -19,7 +19,7 @@ import { existsSync, readFileSync, writeFileSync, rmSync, lstatSync, realpathSyn
 import { join } from 'node:path';
 import { wiregraphDir, GITIGNORE_LINE, readRegistry, deregisterProject, readState, members } from './lib/state.mjs';
 import { doUnlink } from './lib/links.mjs';
-import { targetPath as claudeMdPath, present as blockPresent, withoutBlock } from './lib/claudemd.mjs';
+import { targetPath as claudeMdPath, presentAny as blockPresent, withoutBlock } from './lib/claudemd.mjs';
 
 function parse(argv) {
   const o = { project: null, dryRun: false };
@@ -34,20 +34,25 @@ const log = (m) => process.stdout.write(m + '\n');
 
 // Strip the wiregraph entry (and the contiguous wiregraph comment lines above it)
 // from .gitignore content, leaving every other line intact.
-function stripGitignore(text) {
+export function stripGitignore(text) {
   const lines = text.split('\n');
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const t = lines[i].trim();
-    if (t === GITIGNORE_LINE || t === '/.wiregraph/') {
-      // drop any contiguous wiregraph comment lines we just emitted
+    // Drop the current .wiregraph/ entry AND any pre-rename .codegraph/ entry (a
+    // project initialized before the rename adopted the .codegraph folder).
+    if (t === GITIGNORE_LINE || t === '/.wiregraph/' || t === '.codegraph/' || t === '/.codegraph/') {
+      // drop any contiguous wiregraph/codegraph comment lines we just emitted
       while (out.length && out[out.length - 1].trim().startsWith('#') &&
-             /wiregraph/i.test(out[out.length - 1])) out.pop();
+             /wiregraph|codegraph/i.test(out[out.length - 1])) out.pop();
       continue; // drop the ignore line itself
     }
     out.push(lines[i]);
   }
-  return out.join('\n').replace(/\n{3,}/g, '\n\n');
+  // Rebuild is line-by-line (dropped lines are skipped, none inserted), so no seam
+  // normalization is needed — a global \n{3,} collapse would rewrite the user's
+  // unrelated whitespace. The caller normalizes only the trailing newline at EOF.
+  return out.join('\n');
 }
 
 async function main() {
@@ -116,4 +121,7 @@ async function main() {
   log(o.dryRun ? 'Dry run complete — nothing was changed.' : 'wiregraph removed. Your source, the rest of CLAUDE.md, and the rest of .gitignore are untouched.');
 }
 
-main().catch((e) => { process.stderr.write('remove failed: ' + (e.stack || e.message) + '\n'); process.exit(1); });
+// Only run as a CLI — importing this module (e.g. to unit-test stripGitignore)
+// must not fire the uninstall or the no-arg usage exit.
+const isCli = process.argv[1] && process.argv[1].endsWith('remove.mjs');
+if (isCli) main().catch((e) => { process.stderr.write('remove failed: ' + (e.stack || e.message) + '\n'); process.exit(1); });

@@ -7,11 +7,15 @@
 //
 // Options:
 //   --project <root>    project tag/root to scope nodes under (default: target, realpath)
-//   --files <a,b,c>     incremental: re-index only these files (project- or abs-relative),
+//   --files <path> [path ...]  incremental: re-index only these files (project- or abs-relative),
 //                       deleting their prior nodes first; skips a full walk + reset
 //   --contracts <dir>   AsyncAPI contracts dir (default: auto-detect a `contracts`,
 //                       `asyncapi`, or `*-contracts` dir under the target)
-//   --reset             project-scoped wipe before loading (full build only)
+//   --reset             project-scoped wipe before loading. Implied for every full
+//                       build (a full build ALWAYS resets — it is a complete
+//                       re-derivation of the union, never additive), so the flag is a
+//                       harmless no-op there; only the `--files` incremental path is
+//                       additive/surgical and left untouched by it.
 //   --db <path>         SQLite file to write (default: <project>/.wiregraph/graph.db,
 //                       or $WIREGRAPH_DB)
 //   --dump <file>       also write the raw graph as JSON (for inspection)
@@ -32,7 +36,7 @@ import { colorEnabled } from '../scripts/lib/color.mjs';
 import { clusterSeams } from './contracts/infer.js';
 import { resolveImports } from './contracts/imports.js';
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const opts = { target: process.cwd(), reset: false, load: true, dump: null, contracts: null, project: null, files: null, db: null, roots: [] };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
@@ -44,7 +48,12 @@ function parseArgs(argv) {
     else if (a === '--contracts') opts.contracts = argv[++i];
     else if (a === '--project') opts.project = argv[++i];
     else if (a === '--root') opts.roots.push(argv[++i]); // repeatable: explicit union override (tests/manual)
-    else if (a === '--files') opts.files = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
+    // --files: each following arg is ONE path (a comma delimiter can't represent a path
+    // that contains a comma). Consume args until the next --flag.
+    else if (a === '--files') {
+      opts.files = [];
+      while (i + 1 < argv.length && !argv[i + 1].startsWith('--')) if (argv[++i] !== '') opts.files.push(argv[i]);
+    }
     else rest.push(a);
   }
   if (rest[0]) opts.target = resolve(rest[0]);
@@ -272,6 +281,14 @@ function incrementalBuild(opts, root, project) {
 
   const dbPath = resolveDbPath(opts, project);
   const db = connect(dbPath);
+  // The in-memory db becomes durable only at close(). pruneFile commits its deletes
+  // in-memory BEFORE the reload; if anything between the prunes and the end of the
+  // body throws (e.g. loadGraph's newer-schema guard), persisting would write the
+  // pruned-but-not-reloaded db over the good file — the edited files' symbols/edges
+  // would be lost until a full rebuild (M6). So persist ONLY on success: this flag
+  // flips true as the last statement of the try, and any earlier throw leaves it
+  // false → close(persist:false) discards the mutations and re-raises.
+  let ok = false;
   try {
     // 1. extract the existing changed files into a fresh graph. Walk each OWNER root
     //    that actually holds a present changed file (with the abs-path filter), so a
@@ -401,8 +418,9 @@ function incrementalBuild(opts, root, project) {
       try { updateState(project, patch); }
       catch { /* metadata only — never fail an update over it */ }
     }
+    ok = true; // whole incremental completed — safe to persist the mutations
   } finally {
-    db.close();
+    db.close({ persist: ok });
   }
 }
 
@@ -428,6 +446,14 @@ export async function runBuild(opts = {}) {
   // is a cheap read. Best-effort — a registry write must never fail a build.
   try { registerProject(project); } catch { /* best-effort */ }
   if (o.files && o.files.length) return incrementalBuild(o, root, project);
+  // A full (non-`files`) build is a COMPLETE re-derivation of the whole union, so it
+  // must always reset: loadGraph upserts nodes idempotently but INSERTs edges (deduped
+  // only within a batch), so accumulating a full build on top of existing rows would
+  // re-insert every edge additively — doubling counts on the 2nd run, tripling on the
+  // 3rd (M7). Force reset here regardless of --reset; the incremental (`--files`) path
+  // above legitimately keeps reset:false + per-file prune. (unlink's reduced-union
+  // rebuild already passes reset:true + allowReducedUnion:true, so it's unaffected.)
+  o.reset = true;
   // Every reset/full build funnels here, so the union walk is the single source of
   // truth: a stray single-root rebuild can't silently drop linked members.
   const roots = memberRoots(project, o);
