@@ -27,14 +27,21 @@ import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, openSyn
 import { dirname, sep } from 'node:path';
 import { readState } from '../../scripts/lib/state.mjs';
 import { walkSources } from '../extract/walk.js';
-import { buildWireEdges, buildResourceEdges } from '../extract/contracts.js';
+import { buildWireEdges, buildResourceEdges, buildInprocEdges } from '../extract/contracts.js';
 
 // Edge types that are DERIVED from contract REFERENCES rather than parsed from
-// source: the wire seam (producer->consumer) and the resource seam (writer->reader).
-// Every place that prunes or re-derives one must handle BOTH — pruneFile and
+// source: the wire seam (producer->consumer), the resource seam (writer->reader) and the
+// in-process seam (provider->consumer).
+// Every place that prunes or re-derives one must handle ALL of them — pruneFile and
 // rederiveWireEdges below — or the type that was forgotten is deleted on every file
 // save and never rebuilt, while every full-build test still passes.
-export const DERIVED_EDGE_TYPES = ['WIRE', 'RESOURCE'];
+//
+// APPEND-ONLY, and the append is the WHOLE registration for a new derived type: this list
+// drives DERIVED_EDGE_SQL_LIST (the prune's DELETE and the re-derive's DELETE), the
+// contract-keyed dedup in loadGraph, and the re-derive's log line. Adding a type here
+// WITHOUT adding its builder to rederiveWireEdges below silently drops that type's seams
+// on the first file save after a full build — see the note there.
+export const DERIVED_EDGE_TYPES = ['WIRE', 'RESOURCE', 'INPROC'];
 const DERIVED_EDGE_SQL_LIST = DERIVED_EDGE_TYPES.map((t) => `'${t}'`).join(',');
 
 const require = createRequire(import.meta.url);
@@ -667,9 +674,11 @@ export function pruneFile(db, project, compartment, relPath, keepIds, log = () =
   const delOutgoing = db.prepare(
     "DELETE FROM edges WHERE project = ? AND src = ? AND type IN ('CALLS','REFERENCES','DEFINED_IN')",
   );
-  // Both DERIVED seam types (WIRE and RESOURCE), not just WIRE: a resource seam
-  // hanging off a symbol whose backing REFERENCES were just re-matched is exactly as
-  // stale as a wire one. rederiveWireEdges below rebuilds both immediately after.
+  // EVERY derived seam type (DERIVED_EDGE_TYPES: WIRE, RESOURCE, INPROC), not just
+  // WIRE: a resource or in-process seam hanging off a symbol whose backing REFERENCES
+  // were just re-matched is exactly as stale as a wire one. The list drives the SQL, so
+  // a fourth type is cleared the day it is registered — and rederiveWireEdges below
+  // rebuilds them all immediately after (it must; see the note on DERIVED_EDGE_TYPES).
   const delWireOf = db.prepare(
     `DELETE FROM edges WHERE project = ? AND type IN (${DERIVED_EDGE_SQL_LIST}) AND (src = ? OR dst = ?)`,
   );
@@ -690,7 +699,8 @@ export function pruneFile(db, project, compartment, relPath, keepIds, log = () =
   else log(`  pruned ${compartment}/${relPath} (kept ${keepIds.length} stable symbols' incoming edges)`);
 }
 
-// Incremental DERIVED-SEAM self-heal (Change 1) — WIRE *and* RESOURCE. The
+// Incremental DERIVED-SEAM self-heal (Change 1) — every DERIVED_EDGE_TYPES member
+// (WIRE, RESOURCE and INPROC). The
 // incremental path re-matches REFERENCES
 // (M1), but pruneFile deletes every derived seam edge touching a changed/surviving symbol —
 // so the derived producer->consumer seam went DARK in export/visualize until a full
@@ -725,6 +735,12 @@ export function rederiveWireEdges(db, project, contracts, log = () => {}) {
   // Omitting this while the DELETE below still clears RESOURCE would silently drop
   // every resource seam on the first file save after a full build.
   buildResourceEdges(g, contracts, log);
+  // In-process seams likewise, and this is the line the DERIVED_EDGE_TYPES note warns
+  // about: INPROC is in the list, so the DELETE below already clears it. Omitting this call
+  // would delete every in-process seam on the first save and never rebuild it, with every
+  // full-build test still green. Same function the full build uses, same merged contract
+  // set, so the incremental result is identical to a full rebuild's.
+  buildInprocEdges(g, contracts, log);
 
   const del = db.prepare(`DELETE FROM edges WHERE project = ? AND type IN (${DERIVED_EDGE_SQL_LIST})`);
   const ins = db.prepare('INSERT INTO edges (type,src,dst,project,token,cnt,resolution,evidence,direction,contract) VALUES (@type,@src,@dst,@project,@token,@cnt,@resolution,@evidence,@direction,@contract)');

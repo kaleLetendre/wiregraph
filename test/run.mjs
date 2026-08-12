@@ -12221,6 +12221,1083 @@ await flagshipInferredCollisionTest();
 await flagshipDeclaredCollisionTest();
 await flagshipEmptyContractsDirTest();
 
+// ============================================================================
+// IN-PROCESS CONTRACTS — the THIRD contract type (phase 1)
+// ============================================================================
+// A WIRE contract joins two compartments over a network; a RESOURCE contract joins them
+// through a shared file/table/pipe. An INPROC contract joins two compartments that live in
+// ONE PROCESS and are coupled across a crate or module boundary by direct use of each
+// other's exported symbols — the case wiregraph could not represent at all, and the reason
+// a four-crate Cargo workspace indexed as four disconnected islands (resolve.js refuses to
+// resolve a call across a compartment boundary by name, on the rationale that genuine
+// cross-compartment links flow through Contract nodes instead — and for this seam there
+// was no Contract node to flow through).
+//
+// fixture-inproc/ is a Cargo WORKSPACE. Each crate's Cargo.toml is a compartment boundary
+// (extract/walk.js MODULE_MANIFESTS), so no .git dirs are needed in the temp copy:
+//   ecs/     the PROVIDER: defines World, Scheduler, ComponentStore, spawn_entity
+//   sim/     the CONSUMER: genuinely uses World, Scheduler and spawn_entity in bodies and
+//            field types (its `use ecs::{...}` line is an import and must mint NOTHING)
+//   render/  a THIRD crate that spells `World` for its own unrelated purpose. It is the
+//            fixture's whole point about short ids: it DOES mint REFERENCES, it must NEVER
+//            mint an INPROC edge, and it must surface as an UNDECLARED PARTICIPANT.
+// The contract also declares ComponentStore (ecs-only -> one-sided) and RetiredQuery
+// (nowhere at all -> unreferenced), so all three drift classes are live in one build.
+const FIXTURE_INPROC = join(HERE, 'fixture-inproc');
+function inprocFixture(prefix) {
+  const work = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  cpSync(FIXTURE_INPROC, work, { recursive: true });
+  return work;
+}
+// Every INPROC edge as a canonical key. The LINE is part of it on purpose: ecs has two
+// symbols named `new` (World::new and Scheduler::new), and a name-only key would let the
+// two collapse and hide a mis-attributed edge.
+function inprocEdgeRows(conn, project) {
+  return conn.prepare(
+    `SELECT sp.compartment sc, sp.name sn, sp.startLine sl, dp.compartment dc, dp.name dn, dp.startLine dl,
+            e.token t, e.direction dir, e.contract ct, e.evidence ev
+       FROM edges e JOIN symbols sp ON sp.id=e.src JOIN symbols dp ON dp.id=e.dst
+      WHERE e.project=? AND e.type='INPROC'`).all(project);
+}
+const inprocKey = (r) => `${r.t}|${r.sc}:${r.sn}@${r.sl}->${r.dc}:${r.dn}@${r.dl}`;
+function inprocEdgeSet(root, project) {
+  const c = connect(join(root, '.wiregraph', 'graph.db'), { readonly: true });
+  try { return new Set(inprocEdgeRows(c, project).map(inprocKey)); } finally { c.close(); }
+}
+
+// --- the parser, on its own -------------------------------------------------
+async function inprocSpecParseTests() {
+  const P = await import('../src/extract/inproc-spec.js');
+  // Every rejection is logged; the log is the user-facing half of the validation, so it is
+  // asserted alongside the return value rather than trusted to exist.
+  const parse = (doc, file = 'x.inproc.yaml') => {
+    const log = [];
+    const desc = P.parseInprocSpec(doc, file, (m) => log.push(m));
+    return { desc, log: log.join('\n') };
+  };
+  const one = (over = {}) => ({ id: 'World', kind: 'type', provider: 'ecs', consumers: ['sim'], ...over });
+
+  // (1) HAPPY PATH — the descriptor shape is the SAME one the other two parsers return,
+  // which is what lets mergeContracts / contractTokenMeta / matchContracts stay
+  // format-blind. Any drift here is a branch somebody has to add downstream.
+  const good = parse({ title: 'ecs-sim', boundary: 'crate', symbols: [one(), one({ id: 'Scheduler' })] });
+  eq(good.desc?.kind, 'inproc', 'inproc-parse(1): the descriptor carries the inproc kind discriminator');
+  eq(good.desc?.name, 'ecs-sim', 'inproc-parse(1): the title becomes the contract name');
+  eq(JSON.stringify(good.desc?.tokens), JSON.stringify(['World', 'Scheduler']),
+    'inproc-parse(1): every declared id becomes a matchable token, in declaration order');
+  eq(JSON.stringify([...(good.desc?.wireRoles.get('World')?.producers || [])]), JSON.stringify(['ecs']),
+    'inproc-parse(1): provider lands in wireRoles.producers (persisted to contract_tokens.producers)');
+  eq(JSON.stringify([...(good.desc?.wireRoles.get('World')?.consumers || [])]), JSON.stringify(['sim']),
+    'inproc-parse(1): consumers land in wireRoles.consumers');
+  eq(good.desc?.inferred, false, 'inproc-parse(1): a hand-written spec is not a draft');
+
+  // (2) THE DIRECTION ENCODING. contract_tokens.direction is free text whose existing
+  // values are c2s / s2c / NULL / the resource `res:` encoding. An inproc token carries its
+  // own metadata behind a prefix that cannot collide with any of them — no schema change,
+  // SCHEMA_VERSION stays 5.
+  const dir = P.decodeInprocDirection(good.desc?.direction.World);
+  eq(dir?.kind, 'type', 'inproc-parse(2): kind round-trips through the direction column');
+  eq(dir?.boundary, 'crate', 'inproc-parse(2): boundary round-trips through the direction column');
+  eq(dir?.errors, null, 'inproc-parse(2): a well-formed value reports no errors');
+  eq(P.decodeInprocDirection('c2s'), null, 'inproc-parse(2): a WIRE direction does not decode as inproc');
+  eq(P.decodeInprocDirection('res:kind=path;semantics=append-log'), null,
+    'inproc-parse(2): a RESOURCE direction does not decode as inproc either — the two prefixes cannot cross-read');
+  eq(P.decodeInprocDirection(null), null, 'inproc-parse(2): a null direction decodes to null');
+  eq(P.decodeInprocDirection('inproc:kind=type;bogus=1')?.errors?.length, 1,
+    'inproc-parse(2): an unknown field is RECORDED as an error, never silently ignored');
+  eq(P.decodeInprocDirection('inproc:kind=%E0')?.errors?.length, 1,
+    'inproc-parse(2): a malformed percent-escape is recorded rather than swallowed');
+  const round = P.decodeInprocDirection(P.encodeInprocDirection({ kind: 'trait', boundary: 'module' }));
+  eq(`${round?.kind}/${round?.boundary}`, 'trait/module', 'inproc-parse(2): encode/decode round-trips every vocabulary value');
+
+  // (3) `/` IN AN ID IS REJECTED — the same rule as a resource id and for the same reason:
+  // matchContracts branches on `/` into the route-shaped pathTokenRegex branch, whose
+  // {param} wildcards and trailing boundary lookahead are built for HTTP routes and are
+  // wrong for a symbol name.
+  const slash = parse({ title: 't', symbols: [one({ id: 'ecs/World' })] });
+  eq(slash.desc, null, 'inproc-parse(3): an id containing "/" is rejected (and with no other id the spec yields nothing)');
+  has(slash.log, 'matched as an HTTP route', 'inproc-parse(3): …and the message says WHY, not just that it is invalid');
+  has(slash.log, 'bare SYMBOL NAME', 'inproc-parse(3): …and says what to write instead');
+  const slashPartial = parse({ title: 't', symbols: [one({ id: 'ecs/World' }), one({ id: 'Scheduler' })] });
+  eq(JSON.stringify(slashPartial.desc?.tokens), JSON.stringify(['Scheduler']),
+    'inproc-parse(3): one bad id does not take the whole spec down — the rest still load');
+
+  // A Rust PATH is the near-miss the `/` rule does not catch, and it fails the same way:
+  // the matcher builds \becs::World\b, which is not what either the definition or the call
+  // sites write.
+  const qualified = parse({ title: 't', symbols: [one({ id: 'ecs::World' })] });
+  eq(qualified.desc, null, 'inproc-parse(3): a QUALIFIED path (ecs::World) is rejected too');
+  has(qualified.log, 'bare identifier', 'inproc-parse(3): …naming the rule it broke');
+  eq(parse({ title: 't', symbols: [one({ id: 'World<T>' })] }).desc, null,
+    'inproc-parse(3): a parameterised spelling (World<T>) is rejected — the matcher would never find it');
+  eq(parse({ title: 't', symbols: [one({ id: 'My World' })] }).desc, null,
+    'inproc-parse(3): an id containing whitespace is rejected');
+
+  // (4) `kind:` VOCABULARY. Descriptive only — it must not change matching — but an
+  // unknown value is refused, or the field would mean nothing.
+  for (const k of P.INPROC_KINDS) {
+    eq(parse({ title: 't', symbols: [one({ kind: k })] }).desc?.tokens.length, 1,
+      `inproc-parse(4): kind "${k}" is accepted`);
+  }
+  const badKind = parse({ title: 't', symbols: [one({ kind: 'struct' })] });
+  eq(badKind.desc, null, 'inproc-parse(4): an unknown kind is rejected');
+  has(badKind.log, 'type | function | method | trait | macro', 'inproc-parse(4): …and the message lists the vocabulary');
+  // The tokens are IDENTICAL whichever kind is declared — proof that kind is descriptive.
+  eq(JSON.stringify(parse({ title: 't', symbols: [one({ kind: 'macro' })] }).desc?.tokens),
+    JSON.stringify(parse({ title: 't', symbols: [one({ kind: 'type' })] }).desc?.tokens),
+    'inproc-parse(4): kind does not change matching — the token set is the same either way');
+
+  // (5) `boundary:` VOCABULARY, and it is spec-level: the boundary describes the SEAM, so
+  // an unknown value takes the whole spec rather than silently defaulting every token's
+  // stored metadata to a false statement.
+  for (const b of P.INPROC_BOUNDARIES) {
+    eq(P.decodeInprocDirection(parse({ title: 't', boundary: b, symbols: [one()] }).desc?.direction.World)?.boundary, b,
+      `inproc-parse(5): boundary "${b}" is accepted and stored`);
+  }
+  const badB = parse({ title: 't', boundary: 'package', symbols: [one()] });
+  eq(badB.desc, null, 'inproc-parse(5): an unknown boundary rejects the WHOLE spec');
+  has(badB.log, 'Skipping the whole spec', 'inproc-parse(5): …and says so, rather than dropping one entry');
+  eq(P.decodeInprocDirection(parse({ title: 't', symbols: [one()] }).desc?.direction.World)?.boundary, 'crate',
+    'inproc-parse(5): boundary defaults to crate when omitted');
+
+  // (6) ONE COMPARTMENT MAY NOT BE BOTH PROVIDER AND CONSUMER OF ONE ID. This is REFUSED,
+  // not warned about — unlike the resource parser's writer/reader overlap, which is a
+  // legitimate shape there. An inproc contract's entire claim is that direction is one-way;
+  // a compartment on both sides of one id is a self-contradiction, and keeping it would
+  // mean this type quietly stops checking the one thing it exists to check.
+  const both = parse({ title: 't', symbols: [one({ provider: 'ecs', consumers: ['sim', 'ecs'] })] });
+  eq(both.desc, null, 'inproc-parse(6): a compartment named as BOTH provider and consumer of one id is refused');
+  has(both.log, 'one-way BY CONSTRUCTION', 'inproc-parse(6): …and the message says why it is an error and not a warning');
+  eq(parse({ title: 't', symbols: [one({ provider: 'ecs', consumers: ['sim'] }), one({ id: 'Scheduler', provider: 'sim', consumers: ['ecs'] })] }).desc?.tokens.length, 2,
+    'inproc-parse(6): …but two compartments may swap roles on DIFFERENT ids (that is two one-way seams, not a cycle in one)');
+
+  // (7) BOTH SIDES ARE REQUIRED. A provider with no consumer derives nothing and drifts as
+  // nothing; a consumer with no provider has no direction at all.
+  const noProv = parse({ title: 't', symbols: [{ id: 'World', consumers: ['sim'] }] });
+  eq(noProv.desc, null, 'inproc-parse(7): an entry with no provider is rejected');
+  has(noProv.log, 'gives the seam its direction', 'inproc-parse(7): …explaining what the provider is for');
+  const noCons = parse({ title: 't', symbols: [{ id: 'World', provider: 'ecs' }] });
+  eq(noCons.desc, null, 'inproc-parse(7): an entry with no consumers is rejected');
+  has(noCons.log, 'derives nothing and drifts as nothing', 'inproc-parse(7): …explaining that a lone provider is unobservable');
+  const twoProv = parse({ title: 't', symbols: [one({ provider: ['ecs', 'sim'] })] });
+  eq(twoProv.desc, null, 'inproc-parse(7): TWO providers are rejected — one provider is what makes the seam one-way');
+  has(twoProv.log, 'exactly ONE provider', 'inproc-parse(7): …and the message says so');
+
+  // (8) IDS THAT CANNOT BE A JOIN KEY UNDER ANY READING. The full distinctiveness gate is
+  // deliberately NOT applied (see (9)), so this is the floor: a stop-word or a 2-character
+  // name would match essentially every file ever written.
+  const stop = parse({ title: 't', symbols: [one({ id: 'state' })] });
+  eq(stop.desc, null, 'inproc-parse(8): a generic stop-word id is refused outright');
+  has(stop.log, 'generic word that names something in almost every file', 'inproc-parse(8): …saying what makes it unusable');
+  eq(parse({ title: 't', symbols: [one({ id: 'Id' })] }).desc, null,
+    'inproc-parse(8): a 2-character id is refused outright');
+  eq(parse({ title: 't', symbols: [one({ id: 'Ecs' })] }).desc?.tokens.length, 1,
+    'inproc-parse(8): …and a 3-character non-stop-word id is accepted (the floor is a floor, not the gate)');
+
+  // (9) SHORT IDS ARE ACCEPTED AND NAMED. This is the design decision the whole type rests
+  // on: `World`, `Entity` and `Scheduler` all FAIL extract/distinctive.js (its camelCase
+  // arm demands 10+ characters), and those are exactly the flagship's frozen ECS
+  // signatures — applying the gate would have made the feature refuse its own reason for
+  // existing. So the ids load and the loader SAYS what that costs.
+  const weak = parse({ title: 't', symbols: [one({ id: 'World' }), one({ id: 'Entity' }), one({ id: 'ComponentStore' })] });
+  eq(weak.desc?.tokens.length, 3, 'inproc-parse(9): short ids LOAD — the distinctiveness gate is not applied to inproc ids');
+  has(weak.log, '[World, Entity]', 'inproc-parse(9): the short ids are named, together, in ONE line per spec');
+  ok(!weak.log.includes('ComponentStore'), 'inproc-parse(9): …and a distinctive id is not named in it');
+  ok(!weak.log.includes('⚠'), 'inproc-parse(9): the note carries NO warning marker — a short id is the EXPECTED shape here, and one ⚠ per build forever is how a marker stops meaning anything');
+  has(weak.log, 'both sides spell this name', 'inproc-parse(9): the note states the false-positive behaviour precisely rather than claiming precision');
+  const strong = parse({ title: 't', symbols: [one({ id: 'ComponentStore' })] });
+  ok(!strong.log.includes('short/common'), 'inproc-parse(9): a spec whose ids are all distinctive gets no note at all');
+
+  // (10) THE REST OF THE VALIDATION SURFACE.
+  eq(parse({ title: 't', resources: [] }).desc, null, 'inproc-parse(10): a doc with no symbols: list is not an inproc spec');
+  has(parse({ title: 't', resources: [] }).log, "expected a top-level 'symbols:' list", 'inproc-parse(10): …and says what it expected');
+  eq(parse({ title: 't', symbols: [] }).desc, null, 'inproc-parse(10): an empty symbols list yields no contract');
+  eq(parse({ title: 't', symbols: ['nope', one()] }).desc?.tokens.length, 1, 'inproc-parse(10): a non-object entry is skipped, the rest load');
+  eq(parse({ title: 't', symbols: [{ provider: 'ecs', consumers: ['sim'] }] }).desc, null, 'inproc-parse(10): an entry with no id is skipped');
+  const dup = parse({ title: 't', symbols: [one(), one({ consumers: ['other'] })] });
+  eq(JSON.stringify([...(dup.desc?.wireRoles.get('World')?.consumers || [])]), JSON.stringify(['sim']),
+    'inproc-parse(10): an id declared twice in ONE spec keeps the FIRST, and the second does not merge into it');
+  has(dup.log, 'declared twice', 'inproc-parse(10): …and says so');
+  const noTitle = parse({ symbols: [one()] }, 'ecs-sim.inproc.yaml');
+  eq(noTitle.desc?.name, 'ecs-sim', 'inproc-parse(10): a spec with no title falls back to the filename');
+  has(noTitle.log, 'Titles must be unique across every spec', 'inproc-parse(10): …and warns, because the title is the contract identity');
+}
+
+// --- title/id collisions, at the loader ---------------------------------------
+// A title must be unique across ALL specs. Same-format specs sharing a title MERGE (that
+// is long-standing and deliberate — an applied spec and the link-inferred copy routinely
+// collide); a title shared ACROSS formats cannot merge, because mergeContracts keeps only
+// the first contributor's file/kind and the node would name one format while carrying
+// both formats' tokens. With three formats the winner is picked by FORMAT PRECEDENCE
+// rather than by directory read order.
+async function inprocCollisionTests() {
+  const C = await import('../src/extract/contracts.js');
+  const ws = realpathSync(mkdtempSync(join(tmpdir(), 'cg-inproccollide-')));
+  mkdirSync(ws, { recursive: true });
+  const inprocYaml = (title, id) => `title: ${title}\nboundary: crate\nsymbols:\n  - id: ${id}\n    kind: type\n    provider: ecs\n    consumers: [sim]\n`;
+
+  // (a) inproc vs ASYNCAPI on one title — AsyncAPI is the incumbent and wins.
+  writeFileSync(join(ws, 'a.asyncapi.yaml'),
+    'asyncapi: 3.0.0\ninfo: { title: collide-title, version: 1.0.0 }\nchannels:\n  c:\n    address: /api/inproc-collide\n');
+  writeFileSync(join(ws, 'b.inproc.yaml'), inprocYaml('collide-title', 'ComponentStore'));
+  const logA = [];
+  const mA = C.loadAllContracts(new Graph(ws), [ws], (m) => logA.push(m));
+  eq(mA.length, 1, `inproc-collide(a): the colliding spec is SKIPPED, not merged (got ${mA.length})`);
+  eq(mA[0]?.kind, 'asyncapi', 'inproc-collide(a): the ASYNCAPI spec wins an inproc/asyncapi title collision');
+  ok(!mA[0]?.tokens.includes('ComponentStore'),
+    `inproc-collide(a): the skipped spec's tokens do not leak into the surviving node (got ${(mA[0]?.tokens || []).join(', ')})`);
+  has(logA.join('\n'), 'title collision', 'inproc-collide(a): the collision is logged');
+  has(logA.join('\n'), 'b.inproc.yaml', 'inproc-collide(a): …naming the skipped file');
+  rmSync(join(ws, 'a.asyncapi.yaml'));
+
+  // (b) inproc vs RESOURCE on one title — resource predates inproc and wins. The point is
+  // that it is the FORMAT that decides, not the read order: `a.inproc.yaml` sorts FIRST.
+  writeFileSync(join(ws, 'a.inproc.yaml'), inprocYaml('collide-title', 'ComponentStore'));
+  rmSync(join(ws, 'b.inproc.yaml'));
+  writeFileSync(join(ws, 'b.resource.yaml'), 'title: collide-title\nresources:\n  - id: COLLIDE_STATE_PATH\n    writers: [ecs]\n    readers: [sim]\n');
+  const logB = [];
+  const mB = C.loadAllContracts(new Graph(ws), [ws], (m) => logB.push(m));
+  eq(mB.length, 1, `inproc-collide(b): still exactly one contract (got ${mB.length})`);
+  eq(mB[0]?.kind, 'resource', 'inproc-collide(b): the RESOURCE spec wins even though the inproc spec is read FIRST');
+  has(logB.join('\n'), 'DIFFERENT formats', 'inproc-collide(b): the generalised message is used for a non-asyncapi/resource pair');
+  has(logB.join('\n'), 'Keeping the resource spec(s)', 'inproc-collide(b): …and says which one it kept');
+  rmSync(join(ws, 'b.resource.yaml'));
+
+  // (c) SAME-format specs sharing a title still MERGE, exactly as the other two formats do.
+  writeFileSync(join(ws, 'b.inproc.yaml'), inprocYaml('collide-title', 'Scheduler'));
+  const mC = C.loadAllContracts(new Graph(ws), [ws], () => {});
+  eq(mC.length, 1, 'inproc-collide(c): two inproc specs sharing a title collapse to one node');
+  eq(JSON.stringify([...mC[0].tokens].sort()), JSON.stringify(['ComponentStore', 'Scheduler']),
+    'inproc-collide(c): …and UNION their ids, rather than one silently dropping the other');
+  rmSync(join(ws, 'b.inproc.yaml'));
+
+  // (d) THE JOIN-KEY NAMESPACE IS SHARED WITH RESOURCE IDS. An inproc id and a resource id
+  // both compile to \bname\b and land in the SAME token index in matchContracts, so two
+  // differently-titled specs claiming one name mint REFERENCES to two contract nodes and
+  // derive the same seam twice — whichever two formats they came from. One namespace.
+  writeFileSync(join(ws, 'c-second.inproc.yaml'), inprocYaml('second-title', 'ComponentStore')
+    + '  - id: KeptSecondSymbol\n    kind: type\n    provider: ecs\n    consumers: [sim]\n');
+  const logD = [];
+  const mD = C.loadAllContracts(new Graph(ws), [ws], (m) => logD.push(m));
+  const byName = new Map(mD.map((c) => [c.name, c]));
+  eq(mD.length, 2, `inproc-dup(d): both contracts still load (got ${mD.length})`);
+  eq(JSON.stringify(byName.get('collide-title')?.tokens), JSON.stringify(['ComponentStore']),
+    'inproc-dup(d): the first declarer keeps the id');
+  eq(JSON.stringify(byName.get('second-title')?.tokens), JSON.stringify(['KeptSecondSymbol']),
+    'inproc-dup(d): the duplicate is dropped from the second spec, and ONLY the duplicate');
+  has(logD.join('\n'), 'symbol id "ComponentStore" is ALREADY declared',
+    'inproc-dup(d): the rejection speaks the inproc vocabulary, not "resource id"');
+  has(logD.join('\n'), 'a symbol name is the join key', 'inproc-dup(d): …and says why uniqueness matters here');
+
+  // …and ACROSS formats: a resource spec claiming the same name loses it too.
+  rmSync(join(ws, 'c-second.inproc.yaml'));
+  writeFileSync(join(ws, 'c-cross.resource.yaml'), 'title: cross-title\nresources:\n  - id: ComponentStore\n    writers: [ecs]\n    readers: [sim]\n  - id: KEPT_CROSS_PATH\n    writers: [ecs]\n    readers: [sim]\n');
+  const logE = [];
+  const mE = C.loadAllContracts(new Graph(ws), [ws], (m) => logE.push(m));
+  const crossByName = new Map(mE.map((c) => [c.name, c]));
+  eq(JSON.stringify(crossByName.get('cross-title')?.tokens), JSON.stringify(['KEPT_CROSS_PATH']),
+    'inproc-dup(d): a RESOURCE spec claiming an id an INPROC spec already declared loses it — one join-key namespace, not one per format');
+  has(logE.join('\n'), 'resource id "ComponentStore" is ALREADY declared',
+    'inproc-dup(d): …and the resource-side message is unchanged, byte for byte');
+
+  // (e) A contract that loses EVERY id mints no node at all, and says so — otherwise
+  // trace_contract answers "No contract matches" for a spec sitting on disk with nothing
+  // connecting the two.
+  rmSync(join(ws, 'c-cross.resource.yaml'));
+  writeFileSync(join(ws, 'd-erased.inproc.yaml'), inprocYaml('erased-title', 'ComponentStore'));
+  const logF = [];
+  const mF = C.loadAllContracts(new Graph(ws), [ws], (m) => logF.push(m));
+  ok(!mF.some((c) => c.name === 'erased-title'), 'inproc-dup(e): a contract that lost every id mints NO node');
+  has(logF.join('\n'), 'has NO surviving symbol ids', 'inproc-dup(e): …and the disappearance is findable, in this type\'s vocabulary');
+  rmSync(ws, { recursive: true, force: true });
+}
+
+// --- the full build, end to end ----------------------------------------------
+async function inprocContractTests() {
+  const P = await import('../src/extract/inproc-spec.js');
+  const project = inprocFixture('cg-inproc-');
+  const db = join(project, '.wiregraph', 'graph.db');
+  await runBuild({ target: project, project, db, reset: true });
+  const conn = connect(db, { readonly: true });
+
+  // (1) THE CONTRACT NODE. One node carrying the spec's project-relative path (which is
+  // what makes a nested contract's scope root recoverable at query time). `kind` is NOT a
+  // column — it is DERIVED from the tokens' stored direction encoding, which is precisely
+  // what keeps SCHEMA_VERSION at 5 — so it is asserted at (2) and (9) instead.
+  const contracts = conn.prepare('SELECT id,name,file FROM contracts WHERE project=?').all(project);
+  eq(contracts.length, 1, `inproc(1): exactly ONE contract node for the spec (got ${contracts.map((c) => c.name).join(', ') || 'none'})`);
+  eq(contracts[0]?.name, 'ecs-sim', 'inproc(1): the node is named by the spec title');
+  eq(contracts[0]?.file, 'contracts/ecs-sim.inproc.yaml', 'inproc(1): …and carries the .inproc.yaml spec PATH');
+
+  // (2) TOKENS + ROLES persisted, so trace_contract can diff defined-vs-referenced.
+  const toks = new Map(conn.prepare('SELECT token,direction,producers,consumers FROM contract_tokens WHERE project=? AND contract=?')
+    .all(project, contracts[0]?.id ?? '').map((r) => [r.token, r]));
+  eq(toks.size, 5, `inproc(2): all five declared symbols became tokens (got ${[...toks.keys()].join(', ') || 'none'})`);
+  eq(toks.get('World')?.producers, 'ecs', 'inproc(2): provider lands in producers');
+  eq(toks.get('World')?.consumers, 'sim', 'inproc(2): consumers land in consumers');
+  eq(P.decodeInprocDirection(toks.get('spawn_entity')?.direction)?.kind, 'function',
+    'inproc(2): the declared kind survives the round trip through the db');
+  eq(P.decodeInprocDirection(toks.get('World')?.direction)?.boundary, 'crate',
+    'inproc(2): …and so does the spec-level boundary');
+  // SCHEMA_VERSION MUST NOT MOVE for any of this. edges.type has no CHECK constraint and
+  // contract_tokens.direction is free text, so a third contract type needs no schema
+  // change — and moving the version would invalidate every existing user graph.
+  eq(schemaVersion(conn), 5, 'inproc(2): SCHEMA_VERSION is still 5 — a third contract type needs no schema change');
+
+  // (3) THE SEAM. Asserted as an EXACT set, not by membership: a membership check is
+  // satisfied by any SUPERSET, and phantom edges are the entire risk of a token-matching
+  // join — doubly so for a type whose ids are short symbol names. The two `ecs:new`
+  // symbols (World::new at 28, Scheduler::new at 38) are why the key carries the line.
+  const edges = inprocEdgeRows(conn, project);
+  const expected = [
+    // World: ecs {<module> (the `impl World {` line, outside any symbol), the struct
+    // itself, World::new, spawn_entity} x sim {Simulation, new, build_world}.
+    'World|ecs:<module>@0->sim:Simulation@11', 'World|ecs:<module>@0->sim:new@17', 'World|ecs:<module>@0->sim:build_world@27',
+    'World|ecs:World@13->sim:Simulation@11', 'World|ecs:World@13->sim:new@17', 'World|ecs:World@13->sim:build_world@27',
+    'World|ecs:new@28->sim:Simulation@11', 'World|ecs:new@28->sim:new@17', 'World|ecs:new@28->sim:build_world@27',
+    'World|ecs:spawn_entity@48->sim:Simulation@11', 'World|ecs:spawn_entity@48->sim:new@17', 'World|ecs:spawn_entity@48->sim:build_world@27',
+    // Scheduler: ecs {<module>, the struct, Scheduler::new} x sim {Simulation, new}.
+    'Scheduler|ecs:<module>@0->sim:Simulation@11', 'Scheduler|ecs:<module>@0->sim:new@17',
+    'Scheduler|ecs:Scheduler@17->sim:Simulation@11', 'Scheduler|ecs:Scheduler@17->sim:new@17',
+    'Scheduler|ecs:new@38->sim:Simulation@11', 'Scheduler|ecs:new@38->sim:new@17',
+    // spawn_entity: the function itself -> the two sim bodies that call it.
+    'spawn_entity|ecs:spawn_entity@48->sim:build_world@27', 'spawn_entity|ecs:spawn_entity@48->sim:step@21',
+  ].sort();
+  eq(JSON.stringify([...new Set(edges.map(inprocKey))].sort()), JSON.stringify(expected),
+    'inproc(3): EXACTLY these provider->consumer seams — no missing half, and no phantom extras');
+  eq(edges.length, expected.length,
+    `inproc(3): and exactly ${expected.length} rows, so a duplicated seam cannot hide inside the set (got ${edges.length})`);
+  ok(edges.every((r) => r.dir === 'p2c'),
+    `inproc(3): every INPROC edge is labelled p2c — never c2s (there is no round trip) and never w2r (nothing is written); got ${[...new Set(edges.map((r) => r.dir))].join(', ')}`);
+  ok(edges.every((r) => r.ev === 'inproc-derived'), 'inproc(3): …and carries its own evidence tag');
+  ok(edges.every((r) => r.ct === 'ecs-sim'), 'inproc(3): …and names the contract that is the reason for it');
+  ok(edges.every((r) => r.sc === 'ecs' && r.dc === 'sim'),
+    'inproc(3): direction is ONE-WAY — every edge runs provider -> consumer and none runs back');
+  ok(edges.every((r) => r.sc !== r.dc), 'inproc(3): inproc seams are cross-compartment only');
+
+  // (4) AN INPROC TOKEN MUST NOT ALSO MINT A WIRE EDGE. An inproc contract ALWAYS carries
+  // roles, so without the explicit exclusion in buildWireEdges it would satisfy `anyRoles`,
+  // take the producers->consumers branch and silently double every seam into a second,
+  // WRONG edge type that every export and visualization reads as a network call.
+  const counts = edgeCounts(conn, project);
+  eq(counts.WIRE, undefined, `inproc(4): an inproc contract derives NO WIRE edges (got ${counts.WIRE || 0})`);
+  eq(counts.RESOURCE, undefined, `inproc(4): …and no RESOURCE edges either (got ${counts.RESOURCE || 0})`);
+  eq(counts.INPROC, expected.length, 'inproc(4): the seam lives entirely in its own edge type');
+
+  // (5) THE POINT OF THE WHOLE TYPE: there is NO resolved call between the two crates —
+  // resolve.js refuses to resolve a call across a compartment boundary by name — and
+  // path_between nevertheless routes from a sim symbol to an ecs symbol THROUGH the
+  // contract node. Before this type, that answer was "No path found" for two crates that
+  // call each other directly.
+  const crossCalls = conn.prepare(
+    `SELECT count(*) n FROM edges e JOIN symbols sp ON sp.id=e.src JOIN symbols dp ON dp.id=e.dst
+      WHERE e.project=? AND e.type='CALLS' AND sp.compartment<>dp.compartment`).get(project).n;
+  eq(crossCalls, 0, 'inproc(5): there is NO cross-crate CALLS edge — the islands are real, which is why the contract is needed');
+  const p = Q.pathBetween(conn, project, 'spawn_entity', 'build_world', 'ecs', 'sim');
+  has(p, 'ecs-sim', 'inproc(5): path_between routes provider -> consumer THROUGH the inproc contract node');
+  has(p, 'build_world', 'inproc(5): …and reaches the consumer symbol');
+  ok(!p.includes('CALLS'), `inproc(5): the path uses no CALLS edge — got:\n${p}`);
+
+  // (6) THE THREE DRIFT CLASSES, all live in this one build.
+  const trace = Q.traceContract(conn, project, 'ecs-sim');
+  // (6a) an id NOTHING references.
+  has(trace, '🔴 DRIFT', 'inproc(6a): an id no code references anywhere flags DRIFT');
+  has(trace, '1 unreferenced', 'inproc(6a): …and is counted');
+  has(trace, 'RetiredQuery', 'inproc(6a): …and named');
+  // (6b) an id only the PROVIDER references — the consumer half is missing.
+  eq(Q.classifyContractToken(new Set(['ecs']), toks.get('ComponentStore')), 'one-sided',
+    'inproc(6b): an id only the provider references classifies one-sided');
+  has(trace, 'ComponentStore — only provider side [ecs] — consumer half missing',
+    'inproc(6b): …and the detail says PROVIDER, not "writer" and not "producer" — the wording follows the contract type');
+  ok(!trace.includes('writer half missing') && !trace.includes('producer half missing'),
+    'inproc(6b): resource/wire vocabulary never leaks into an inproc report');
+  // (6c) an UNDECLARED PARTICIPANT: render references World while the spec names it as
+  // neither provider nor consumer. undeclaredParticipants GENERALISED — only its gate had
+  // to move (it excluded everything but resource tokens); the body is type-agnostic.
+  eq(JSON.stringify(Q.undeclaredParticipants(new Set(['ecs', 'sim', 'render']), toks.get('World'))), JSON.stringify(['render']),
+    'inproc(6c): a compartment referencing the id while the spec names it as neither provider nor consumer is surfaced');
+  eq(JSON.stringify(Q.undeclaredParticipants(new Set(['ecs', 'sim']), toks.get('World'))), JSON.stringify([]),
+    'inproc(6c): …and a fully declared reference set surfaces nothing');
+  eq(JSON.stringify(Q.undeclaredParticipants(new Set(['x']), { producers: 'ecs', consumers: 'sim', direction: 'c2s' })), JSON.stringify([]),
+    'inproc(6c): a WIRE token is still exempt — the gate moved, it did not disappear');
+  has(trace, '⚠️ UNDECLARED', 'inproc(6c): trace_contract flags it');
+  has(trace, '1 with undeclared participant', 'inproc(6c): …and counts it in the headline');
+  has(trace, 'neither provider nor consumer', 'inproc(6c): …in this type\'s vocabulary');
+  ok(!trace.includes('neither writer nor reader'), 'inproc(6c): …and NOT in the resource\'s');
+  has(trace, 'as likely to be a FALSE POSITIVE as an incomplete spec',
+    'inproc(6c): the report says plainly that a short id makes this ambiguous, rather than advising the user to widen the spec');
+  eq(Q.contractDriftByName(conn, project, false).get('ecs-sim')?.undeclared, 1,
+    'inproc(6c): contractDriftByName counts it on its own key');
+  // The headline arithmetic, which is what a reader actually scans.
+  has(trace, '3/5 tokens satisfied · 1 one-sided · 1 unreferenced',
+    'inproc(6): the headline adds up — three satisfied, one one-sided, one unreferenced');
+
+  // (7) THE FALSE-POSITIVE BOUND, pinned. render's `World` is a different type entirely and
+  // DOES mint REFERENCES (the join key is the bare name; nothing in the graph can tell them
+  // apart). What stops it becoming a seam is the declared roles, and that is the whole
+  // mitigation — so it is asserted in both directions rather than described in a comment.
+  const renderRefs = conn.prepare(
+    `SELECT s.name n FROM edges e JOIN symbols s ON s.id=e.src
+      WHERE e.project=? AND e.type='REFERENCES' AND s.compartment='render' ORDER BY s.name`).all(project).map((r) => r.n);
+  eq(JSON.stringify(renderRefs), JSON.stringify(['World', 'draw']),
+    'inproc(7): an unrelated same-named symbol in a third crate DOES mint REFERENCES — wiregraph matches the identifier, not the definition');
+  ok(!edges.some((r) => r.sc === 'render' || r.dc === 'render'),
+    'inproc(7): …and NEVER an INPROC edge, because the declared provider/consumer roles are the bound on a short id\'s blast radius');
+
+  // (8) A `use` LINE IS NOT A USE. The consumer's only mention of `Scheduler` outside a
+  // body would be its import; without the Rust arm of importLineFlags the seam would key
+  // on module wiring rather than on code that touches the symbol.
+  const simRefLines = conn.prepare(
+    `SELECT DISTINCT s.name n FROM edges e JOIN symbols s ON s.id=e.src
+      WHERE e.project=? AND e.type='REFERENCES' AND s.compartment='sim' ORDER BY s.name`).all(project).map((r) => r.n);
+  ok(!simRefLines.includes('<module>'),
+    `inproc(8): the consumer's \`use ecs::{...}\` line mints NOTHING — no module-scope reference (got ${simRefLines.join(', ')})`);
+
+  // (9) THE CONTRACT DIRECTORY names the third kind. Listing a wire contract as "wire" and
+  // an inproc one as "wire" too would make the directory lie.
+  has(Q.traceContract(conn, project, ''), 'ecs-sim — inproc · 5 token(s)',
+    'inproc(9): the trace_contract listing reports the third kind by name');
+
+  // (10) THE EXPORT SURFACE. store/sqlite-export.js used to spell `type IN ('WIRE',
+  // 'RESOURCE')` as a literal in four SQL strings — the same trap as the prune/re-derive
+  // pair, one layer up and quieter: a newly registered seam type is built, stored, pruned
+  // and re-derived correctly and is then simply INVISIBLE in every export and in the
+  // visualizer, with nothing anywhere saying so. Those queries are now driven by
+  // DERIVED_EDGE_TYPES, and this is what would notice if a fourth type forgot.
+  const X = await import('../src/store/sqlite-export.js');
+  const seam = X.gatherGexf(conn, project, { up: 0, down: 0 });
+  eq(seam.links.filter((l) => l.type === 'INPROC').length, expected.length,
+    'inproc(10): the default GEXF seam surface carries every INPROC edge');
+  const scoped = X.gatherGexf(conn, project, { contract: 'ecs-sim', up: 0, down: 0 });
+  eq(scoped?.links.length, expected.length,
+    'inproc(10): …and `--contract ecs-sim` finds them rather than reporting no derived seam edges');
+  eq(X.gatherGexf(conn, project, { all: true, up: 0, down: 0 }).links.filter((l) => l.type === 'INPROC').length, expected.length,
+    'inproc(10): …and so does the --all view');
+
+  conn.close();
+  rmSync(project, { recursive: true, force: true });
+}
+
+// --- the INCREMENTAL path -----------------------------------------------------
+// `INPROC` is in DERIVED_EDGE_TYPES, which drives the per-file prune's DELETE and the
+// project-wide re-derive's DELETE. Registering it there WITHOUT adding buildInprocEdges to
+// rederiveWireEdges deletes every in-process seam on the first file save after a full build
+// and never rebuilds it — while every full-build test above still passes. So this test is
+// not optional coverage: it is the only thing that catches that failure.
+async function inprocIncrementalSeamTest() {
+  const project = inprocFixture('cg-inprocinc-');
+  await runBuild({ target: project, project, reset: true });
+  const full = inprocEdgeSet(project, project);
+  ok(full.size === 20, `inproc-inc: the full build's seam set is the baseline for parity (got ${full.size})`);
+
+  // (a) a BODY-ONLY edit to the consumer, routed through the incremental path.
+  const simFile = join(project, 'sim', 'src', 'lib.rs');
+  writeFileSync(simFile, readFileSync(simFile, 'utf8').replace('spawn_entity(&mut w);', 'spawn_entity(&mut w);\n    let _ = w;'));
+  await runBuild({ target: project, project, files: [simFile] });
+  const afterEdit = inprocEdgeSet(project, project);
+  ok(setEq(afterEdit, full),
+    `inproc-inc(a): the incremental seam set EQUALS the full build's (inc ${afterEdit.size} | full ${full.size})`);
+  eq(edgeCount(project, project, 'INPROC'), afterEdit.size,
+    'inproc-inc(a): the re-derive REPLACES the seams rather than duplicating them (a delete-all that missed INPROC would leave doubles)');
+
+  // (b) EDIT-THEN-REBUILD PARITY. The incremental result must equal what a from-scratch
+  // full build of the SAME tree produces — not merely equal what was there before the edit.
+  const parityProject = inprocFixture('cg-inprocpar-');
+  writeFileSync(join(parityProject, 'sim', 'src', 'lib.rs'), readFileSync(simFile, 'utf8'));
+  await runBuild({ target: parityProject, project: parityProject, reset: true });
+  const fromScratch = new Set([...inprocEdgeSet(parityProject, parityProject)]);
+  eq(afterEdit.size, fromScratch.size, `inproc-inc(b): incremental and from-scratch agree on seam COUNT (inc ${afterEdit.size} | full ${fromScratch.size})`);
+  ok(setEq(afterEdit, fromScratch),
+    'inproc-inc(b): …and on the seam SET — an edited tree rebuilt incrementally is identical to the same tree built from scratch');
+  rmSync(parityProject, { recursive: true, force: true });
+
+  // (c) an edit to the PROVIDER, which is where the seam originates.
+  const ecsFile = join(project, 'ecs', 'src', 'lib.rs');
+  writeFileSync(ecsFile, readFileSync(ecsFile, 'utf8').replace('self.tick += 1;', 'self.tick += 1; // bumped'));
+  await runBuild({ target: project, project, files: [ecsFile] });
+  ok(setEq(inprocEdgeSet(project, project), full), 'inproc-inc(c): an edit to the provider leaves the seam set intact');
+
+  // (d) an UNRELATED file, in a compartment the contract does not name.
+  const renderFile = join(project, 'render', 'src', 'lib.rs');
+  writeFileSync(renderFile, readFileSync(renderFile, 'utf8') + '\npub fn noop() -> u8 { 0 }\n');
+  await runBuild({ target: project, project, files: [renderFile] });
+  ok(setEq(inprocEdgeSet(project, project), full), 'inproc-inc(d): an unrelated incremental edit leaves the seam set intact');
+
+  // (e) DELETE the consumer: the seam is one-sided now and must leave NO dangling edge.
+  rmSync(simFile, { force: true });
+  await runBuild({ target: project, project, files: [simFile] });
+  eq(edgeCount(project, project, 'INPROC'), 0, 'inproc-inc(e): deleting the consumer drops every seam');
+  const c = connect(join(project, '.wiregraph', 'graph.db'), { readonly: true });
+  const symIds = new Set(c.prepare('SELECT id FROM symbols WHERE project=?').all(project).map((r) => r.id));
+  const dangling = c.prepare("SELECT src,dst FROM edges WHERE project=? AND type='INPROC'").all(project)
+    .filter((r) => !symIds.has(r.src) || !symIds.has(r.dst));
+  c.close();
+  eq(dangling.length, 0, 'inproc-inc(e): …and no INPROC edge references a vanished symbol');
+  rmSync(project, { recursive: true, force: true });
+}
+
+// --- LEGACY SAFETY ------------------------------------------------------------
+// A project with no *.inproc.yaml must produce the graph it produced before this type
+// existed. The BYTE-IDENTITY half of that claim is verified out of band by diffing full
+// graph dumps and the .db files themselves against a pristine checkout of the previous
+// commit (five fixtures, all identical). What lives here is the part a future edit can
+// break: registering INPROC in DERIVED_EDGE_TYPES widened the prune's DELETE and the
+// re-derive's DELETE for EVERY project, so a wire+resource project must still come out
+// with exactly its old edge types and survive the incremental path unchanged.
+async function inprocLegacySafetyTest() {
+  const project = resourceFixture('cg-inproclegacy-');
+  await runBuild({ target: project, project, reset: true });
+  const conn = connect(join(project, '.wiregraph', 'graph.db'), { readonly: true });
+  const before = edgeCounts(conn, project);
+  conn.close();
+  eq(before.INPROC, undefined, 'inproc-legacy: a project with no inproc spec derives ZERO INPROC edges (the type is absent, not empty)');
+  eq(before.WIRE, 1, 'inproc-legacy: …and its WIRE seam is exactly what it was');
+  eq(before.RESOURCE, 8, 'inproc-legacy: …and its RESOURCE seams are exactly what they were');
+
+  // The widened DELETE is the live risk: it runs on every save in every project.
+  writeFileSync(join(project, 'epsilon', 'legacy-probe.js'), 'export function probe() { return 1; }\n');
+  await runBuild({ target: project, project, files: [join(project, 'epsilon', 'legacy-probe.js')] });
+  const conn2 = connect(join(project, '.wiregraph', 'graph.db'), { readonly: true });
+  const after = edgeCounts(conn2, project);
+  conn2.close();
+  eq(after.WIRE, before.WIRE, 'inproc-legacy: the WIRE seam survives an incremental save with INPROC registered alongside it');
+  eq(after.RESOURCE, before.RESOURCE, 'inproc-legacy: …and so does every RESOURCE seam');
+  eq(after.INPROC, undefined, 'inproc-legacy: …and no INPROC row appears from nowhere');
+  rmSync(project, { recursive: true, force: true });
+}
+
+// --- IN-PROCESS CONTRACTS (the third contract type) ---
+await inprocSpecParseTests();
+await inprocCollisionTests();
+await inprocContractTests();
+await inprocIncrementalSeamTest();
+await inprocLegacySafetyTest();
+
+
+// ============================================================================
+// IN-PROCESS CONTRACTS — ADVERSARIAL REVIEW
+// ============================================================================
+// Everything below was written by a second agent trying to BREAK the feature above,
+// deliberately aimed at the places the implementing agent's own tests could not reach:
+// a wrong assumption shared between a test and the code it guards is invisible to both.
+
+// --- A. A NEW SPEC FORMAT HAS THREE REGISTRATION POINTS, NOT TWO ---------------
+// The two obvious ones are src/extract/contracts.js#SPEC_PARSERS (what gets parsed) and
+// src/store/sqlite.js#DERIVED_EDGE_TYPES (what gets pruned and re-derived). The third is
+// src/contracts-dirs.js#SPEC_FORMATS, which is the filename test the contracts FINGERPRINT
+// hashes — and it is the quiet one. `*.inproc.yaml` shipped parsed, matched, derived,
+// pruned and re-derived correctly while that regex still read /\.(asyncapi|resource)\./,
+// so an inproc spec could be added, edited, retitled, MOVED between two contracts dirs or
+// deleted without moving the fingerprint one bit. incrementalBuild's contractsDrift refusal
+// therefore never fired for it, and the save loop re-derived its seams over REFERENCES rows
+// minted under a scope that no longer existed. The identical move of a *.resource.yaml was
+// refused, correctly, the whole time.
+async function inprocSpecFormatRegistrationTest() {
+  const { SPEC_FORMATS, contractsDirSpecs } = await import('../src/contracts-dirs.js');
+  const { SPEC_PARSER_PATTERNS } = await import('../src/extract/contracts.js');
+
+  // (1) THE STRUCTURAL PIN. Not "inproc is in the list" — that only catches this one
+  // omission. A fourth format that adds a parser and forgets the fingerprint fails HERE.
+  eq(SPEC_PARSER_PATTERNS.length, SPEC_FORMATS.length,
+    `inproc-fmt(1): the parser table and the fingerprint's format list are the same length — a format that has a parser but no fingerprint entry is added/edited/moved/deleted invisibly, and the incremental then re-derives its seams over rows minted under a scope that no longer exists (parsers ${SPEC_PARSER_PATTERNS.length}, fingerprint formats ${SPEC_FORMATS.length})`);
+  for (const fmt of SPEC_FORMATS) {
+    const f = `x.${fmt}.yaml`;
+    eq(SPEC_PARSER_PATTERNS.filter((re) => re.test(f)).length, 1,
+      `inproc-fmt(1): "${f}" is claimed by EXACTLY one parser — the fingerprint list and the parser table name the same formats`);
+  }
+
+  // (2) THE BEHAVIOUR, on disk. contractsDirSpecs is what rootContractsSpecs (and therefore
+  // contractsFingerprint) actually reads.
+  const S = await import('../scripts/lib/state.mjs');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cg-inprocfp-')));
+  mkdirSync(join(root, 'contracts'), { recursive: true });
+  mkdirSync(join(root, '.wiregraph'), { recursive: true });
+  writeFileSync(join(root, '.wiregraph', 'state.json'), JSON.stringify({ project: root, links: [] }));
+  writeFileSync(join(root, 'contracts', 'a.resource.yaml'),
+    'title: fp-res\nresources:\n  - id: FP_STATE_PATH\n    writers: [a]\n    readers: [b]\n');
+  const base = S.contractsFingerprint([root])['.'];
+  const names = () => contractsDirSpecs(join(root, 'contracts')).map((s) => basename(s.spec)).sort();
+
+  const specPath = join(root, 'contracts', 'b.inproc.yaml');
+  writeFileSync(specPath, 'title: fp-inproc\nboundary: crate\nsymbols:\n  - id: ComponentStore\n    provider: a\n    consumers: [b]\n');
+  eq(JSON.stringify(names()), JSON.stringify(['a.resource.yaml', 'b.inproc.yaml']),
+    'inproc-fmt(2): contractsDirSpecs SEES an *.inproc.yaml — it is a spec the loader parses, so it must be a spec the fingerprint hashes');
+  const added = S.contractsFingerprint([root])['.'];
+  ok(added !== base, 'inproc-fmt(2): ADDING an *.inproc.yaml moves the contracts fingerprint');
+
+  // Content, not mtime: an EDIT that changes which ids are declared changes the seam the
+  // stored REFERENCES rows were minted for, so it has to move the value.
+  writeFileSync(specPath, 'title: fp-inproc\nboundary: module\nsymbols:\n  - id: SchedulerHandle\n    provider: a\n    consumers: [b]\n');
+  const edited = S.contractsFingerprint([root])['.'];
+  ok(edited !== added, 'inproc-fmt(2): EDITING it (a different declared id) moves it again');
+
+  rmSync(specPath);
+  eq(S.contractsFingerprint([root])['.'], base,
+    'inproc-fmt(2): DELETING it returns the fingerprint to its pre-inproc value — a deleted spec whose ghost contract and REFERENCES rows survive is exactly what the drift refusal exists to catch');
+  rmSync(root, { recursive: true, force: true });
+}
+
+// --- B. RECURSIVE MODE: THE FABRICATED CROSS-SCOPE SEAM ------------------------
+// Recursive mode is the feature in-process contracts exist for, and scope is the half a
+// "do the right edges exist?" test cannot check: a contract with NO scope at all produces
+// every right edge too. So the tree is built so a WRONG scope FABRICATES an edge, and the
+// assertion is that the edge is ABSENT — while the token it would key on really is written
+// in the out-of-scope file, so the absence is a fact about scope and not about a quiet
+// fixture.
+//
+//   server/ecs   provides GameWorld            } governed by server/contracts/
+//   server/sim   consumes it                   }
+//   client/ui    ALSO spells GameWorld, and is DECLARED a consumer — but lives outside
+//                server/, so no reference of its may be minted and no seam may reach it.
+function inprocScopeProject(prefix, { specDir = 'server/contracts' } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  const crate = (rel, name, body) => {
+    mkdirSync(join(root, rel, 'src'), { recursive: true });
+    writeFileSync(join(root, rel, 'Cargo.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\n`);
+    writeFileSync(join(root, rel, 'src', 'lib.rs'), body);
+  };
+  crate('server/ecs', 'ecs', 'pub struct GameWorld { pub tick: u64 }\npub fn make() -> GameWorld { GameWorld { tick: 0 } }\n');
+  crate('server/sim', 'sim', 'use ecs::GameWorld;\npub fn step() { let w = GameWorld { tick: 1 }; let _ = w.tick; }\n');
+  crate('client/ui', 'ui', 'pub struct GameWorld { pub frame: u64 }\npub fn draw() { let w = GameWorld { frame: 0 }; let _ = w.frame; }\n');
+  mkdirSync(join(root, specDir), { recursive: true });
+  mkdirSync(join(root, '.wiregraph'), { recursive: true });
+  writeFileSync(join(root, '.wiregraph', 'state.json'),
+    JSON.stringify({ project: root, indexedRoots: [root], links: [], mode: 'recursive' }, null, 2));
+  writeFileSync(join(root, specDir, 'ecs-seam.inproc.yaml'),
+    'title: ecs-seam\nboundary: crate\nsymbols:\n  - id: GameWorld\n    kind: type\n    provider: ecs\n    consumers: [sim, ui]\n');
+  return root;
+}
+// Every INPROC edge as `src->dst` COMPARTMENTS — the shape a fabricated cross-scope edge
+// is visible in. Symbol-level keys hide it behind noise.
+function inprocCompartmentSeams(root) {
+  const c = connect(join(root, '.wiregraph', 'graph.db'), { readonly: true });
+  try {
+    return c.prepare(`SELECT DISTINCT ss.compartment sc, ds.compartment dc FROM edges e
+        JOIN symbols ss ON ss.id=e.src JOIN symbols ds ON ds.id=e.dst
+        WHERE e.project=? AND e.type='INPROC' ORDER BY sc, dc`).all(root).map((r) => `${r.sc}->${r.dc}`);
+  } finally { c.close(); }
+}
+
+async function inprocRecursiveScopeTest() {
+  const root = inprocScopeProject('cg-inprocscope-');
+  await runBuild({ target: root, project: root, reset: true });
+
+  // (1) THE NEGATIVE, which is the whole point. `ui` is a DECLARED consumer and its source
+  //     really does write `GameWorld`, so the only reason no seam reaches it is that
+  //     server/contracts/ governs server/ and ui is not under it.
+  ok(readFileSync(join(root, 'client', 'ui', 'src', 'lib.rs'), 'utf8').includes('GameWorld'),
+    'inproc-scope(1): the out-of-scope crate really does spell the declared id — the absence below is about SCOPE, not about a quiet fixture');
+  eq(JSON.stringify(inprocCompartmentSeams(root)), JSON.stringify(['ecs->sim']),
+    'inproc-scope(1): EXACTLY the in-scope seam — an inproc spec in server/contracts/ derives NO edge to a declared consumer outside server/, even though that crate writes the id');
+
+  // (2) …and the same is true one layer down, at the REFERENCES the seam is derived from.
+  //     Asserting only the edge would let a fabricated reference sit in the db waiting for
+  //     the next re-derive.
+  const c = connect(join(root, '.wiregraph', 'graph.db'), { readonly: true });
+  const refComps = c.prepare(`SELECT DISTINCT s.compartment ct FROM edges e JOIN symbols s ON s.id=e.src
+      WHERE e.project=? AND e.type='REFERENCES' ORDER BY ct`).all(root).map((r) => r.ct);
+  c.close();
+  eq(JSON.stringify(refComps), JSON.stringify(['ecs', 'sim']),
+    'inproc-scope(2): the out-of-scope crate mints no REFERENCES either — scope is applied when references are MINTED, so a stale row here is what a later re-derive turns into a fabricated seam');
+
+  // (3) THE INCREMENTAL DRIFT REFUSAL, end to end. Move the spec INWARD is the narrowing
+  //     that two already-existing contracts dirs hide completely; here the equivalent is
+  //     moving it OUTWARD, which WIDENS scope and makes ui reachable. Either way the set of
+  //     specs in force changed since the last full build, every stored REFERENCES row was
+  //     minted under the old scope, and an incremental must REFUSE rather than re-derive
+  //     over them. Before src/contracts-dirs.js#SPEC_FORMATS learned about inproc this
+  //     proceeded silently and left a graph a full rebuild does not produce.
+  mkdirSync(join(root, 'contracts'), { recursive: true });
+  renameSync(join(root, 'server', 'contracts', 'ecs-seam.inproc.yaml'), join(root, 'contracts', 'ecs-seam.inproc.yaml'));
+  const edited = join(root, 'server', 'sim', 'src', 'lib.rs');
+  writeFileSync(edited, readFileSync(edited, 'utf8') + '\npub fn extra() {}\n');
+  let refusal = null;
+  try { await runBuild({ target: root, project: root, files: [edited] }); }
+  catch (e) { refusal = e.message; }
+  ok(refusal, 'inproc-scope(3): an incremental after an *.inproc.yaml MOVED between contracts dirs is REFUSED — the scope every stored REFERENCES row was minted under no longer exists');
+  has(refusal || '', 'the contract specs in force changed since the last full build',
+    'inproc-scope(3): …with the contracts-drift message, not some unrelated failure');
+
+  // (4) …and the full rebuild the refusal demands produces the WIDER graph, which is what
+  //     makes the refusal a correctness guard rather than a nuisance: the two answers
+  //     really do differ.
+  await runBuild({ target: root, project: root, reset: true });
+  eq(JSON.stringify(inprocCompartmentSeams(root)), JSON.stringify(['ecs->sim', 'ecs->ui']),
+    'inproc-scope(4): rebuilt with the spec at the root, the contract governs the whole tree and the ui seam appears — so the incremental it refused really would have produced a different graph');
+  rmSync(root, { recursive: true, force: true });
+}
+
+// --- C. ALL THREE FORMATS IN ONE CONTRACTS DIR --------------------------------
+// Three parsers, three token namespaces, three derived edge types and a cross-format title
+// precedence order, all exercised together in ONE build. Each format alone is well covered
+// above; what is not is that they coexist without contaminating each other's edge type,
+// token set or drift report.
+async function inprocThreeFormatBuildTest() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cg-inproc3fmt-')));
+  const crate = (rel, name, body) => {
+    mkdirSync(join(root, rel, 'src'), { recursive: true });
+    writeFileSync(join(root, rel, 'Cargo.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\n`);
+    writeFileSync(join(root, rel, 'src', 'lib.rs'), body);
+  };
+  // One crate provides all three seams' tokens, the other consumes all three. Each token is
+  // written in a BODY (a `use` line mints nothing, and a comment is excluded outright).
+  crate('ecs', 'ecs', [
+    'pub const SNAPSHOT_CACHE_PATH: &str = "/var/run/snap";',
+    'pub struct ComponentStore { pub n: u64 }',
+    'pub fn serve() { let p = SNAPSHOT_CACHE_PATH; let s = ComponentStore { n: 0 };',
+    '  let route = "/ecs/tick"; let _ = (p, s.n, route); }',
+  ].join('\n') + '\n');
+  crate('sim', 'sim', [
+    'use ecs::{SNAPSHOT_CACHE_PATH, ComponentStore};',
+    'pub fn step() { let p = SNAPSHOT_CACHE_PATH; let s = ComponentStore { n: 1 };',
+    '  let route = "/ecs/tick"; let _ = (p, s.n, route); }',
+  ].join('\n') + '\n');
+  mkdirSync(join(root, 'contracts'), { recursive: true });
+  writeFileSync(join(root, 'contracts', 'w.asyncapi.yaml'),
+    'asyncapi: 3.0.0\ninfo: { title: three-wire, version: 1.0.0 }\nchannels:\n  tick:\n'
+    + '    address: /ecs/tick\n    x-wiregraph-producers: [ecs]\n    x-wiregraph-consumers: [sim]\n');
+  writeFileSync(join(root, 'contracts', 'r.resource.yaml'),
+    'title: three-resource\nresources:\n  - id: SNAPSHOT_CACHE_PATH\n    kind: path\n    writers: [ecs]\n    readers: [sim]\n');
+  writeFileSync(join(root, 'contracts', 'i.inproc.yaml'),
+    'title: three-inproc\nboundary: crate\nsymbols:\n  - id: ComponentStore\n    kind: type\n    provider: ecs\n    consumers: [sim]\n');
+  await runBuild({ target: root, project: root, reset: true });
+  const conn = connect(join(root, '.wiregraph', 'graph.db'), { readonly: true });
+
+  // (1) THREE CONTRACT NODES, each reporting its OWN kind. The listing derives kind from the
+  //     tokens' direction encoding, so a prefix that cross-read would show up right here.
+  const listing = Q.traceContract(conn, root, '');
+  has(listing, 'three-wire — wire ·', 'inproc-3fmt(1): the asyncapi contract lists as wire');
+  has(listing, 'three-resource — resource ·', 'inproc-3fmt(1): the resource contract lists as resource');
+  has(listing, 'three-inproc — inproc ·', 'inproc-3fmt(1): the inproc contract lists as inproc — three formats side by side, and none is read as another');
+
+  // (2) EACH SEAM IN ITS OWN EDGE TYPE, all three live at once. The failure this catches is
+  //     an inproc contract slipping past buildWireEdges' exclusion and DOUBLING its seam
+  //     into a WIRE edge, which every export and visualization reads as a network call.
+  const counts = edgeCounts(conn, root);
+  ok(counts.WIRE > 0, `inproc-3fmt(2): the wire seam derives WIRE edges (got ${counts.WIRE || 0})`);
+  ok(counts.RESOURCE > 0, `inproc-3fmt(2): the resource seam derives RESOURCE edges (got ${counts.RESOURCE || 0})`);
+  ok(counts.INPROC > 0, `inproc-3fmt(2): the inproc seam derives INPROC edges (got ${counts.INPROC || 0})`);
+  const byContract = conn.prepare(
+    `SELECT DISTINCT e.type t, e.contract c FROM edges e WHERE e.project=? AND e.type IN ('WIRE','RESOURCE','INPROC') ORDER BY c, t`)
+    .all(root).map((r) => `${r.c}=${r.t}`);
+  eq(JSON.stringify(byContract), JSON.stringify(['three-inproc=INPROC', 'three-resource=RESOURCE', 'three-wire=WIRE']),
+    'inproc-3fmt(2): each contract derives EXACTLY ONE edge type, and its own — no contract appears under two types');
+
+  // (3) TOKENS DO NOT LEAK ACROSS FORMATS. One shared token index backs all three, so a
+  //     contract picking up another format's token is a live possibility, not a hypothetical.
+  const toksOf = (name) => conn.prepare(
+    `SELECT ct.token t FROM contract_tokens ct JOIN contracts c ON c.id=ct.contract
+      WHERE ct.project=? AND c.name=? ORDER BY t`).all(root, name).map((r) => r.t);
+  eq(JSON.stringify(toksOf('three-inproc')), JSON.stringify(['ComponentStore']),
+    'inproc-3fmt(3): the inproc contract holds only its own id');
+  eq(JSON.stringify(toksOf('three-resource')), JSON.stringify(['SNAPSHOT_CACHE_PATH']),
+    'inproc-3fmt(3): …and the resource contract only its own');
+
+  // (4) THE INCREMENTAL RE-DERIVE HANDLES ALL THREE AT ONCE. DERIVED_EDGE_TYPES widened the
+  //     DELETE for every project; the re-derive must put all three back, not two.
+  const before = JSON.stringify(edgeCounts(conn, root));
+  conn.close();
+  const f = join(root, 'sim', 'src', 'lib.rs');
+  writeFileSync(f, readFileSync(f, 'utf8') + '\npub fn extra() {}\n');
+  await runBuild({ target: root, project: root, files: [f] });
+  const conn2 = connect(join(root, '.wiregraph', 'graph.db'), { readonly: true });
+  const after = edgeCounts(conn2, root);
+  conn2.close();
+  eq(after.WIRE, JSON.parse(before).WIRE, 'inproc-3fmt(4): the WIRE seam survives a save with all three types registered');
+  eq(after.RESOURCE, JSON.parse(before).RESOURCE, 'inproc-3fmt(4): …and the RESOURCE seam');
+  eq(after.INPROC, JSON.parse(before).INPROC, 'inproc-3fmt(4): …and the INPROC seam — the re-derive rebuilds every type the DELETE cleared');
+  rmSync(root, { recursive: true, force: true });
+}
+
+// --- D. CROSS-FORMAT TITLE PRECEDENCE, WITH ALL THREE COLLIDING ---------------
+// KIND_PRECEDENCE (asyncapi > resource > inproc) replaced "keep whichever was read first".
+// The two-way pairs are unit-tested above; the THREE-way case is the one that proves it is
+// a precedence ORDER and not a pair of special cases, and the alphabetical filenames are
+// chosen so read order disagrees with precedence at every step.
+async function inprocThreeWayCollisionTest() {
+  const C = await import('../src/extract/contracts.js');
+  const ws = realpathSync(mkdtempSync(join(tmpdir(), 'cg-inproc3way-')));
+  // Read order is a.inproc, b.resource, c.asyncapi — the exact REVERSE of precedence.
+  writeFileSync(join(ws, 'a.inproc.yaml'),
+    'title: shared-title\nboundary: crate\nsymbols:\n  - id: InprocOnlyToken\n    provider: ecs\n    consumers: [sim]\n');
+  writeFileSync(join(ws, 'b.resource.yaml'),
+    'title: shared-title\nresources:\n  - id: RESOURCE_ONLY_TOKEN\n    writers: [ecs]\n    readers: [sim]\n');
+  writeFileSync(join(ws, 'c.asyncapi.yaml'),
+    'asyncapi: 3.0.0\ninfo: { title: shared-title, version: 1.0.0 }\nchannels:\n  c:\n    address: /wire/only/token\n');
+  const log = [];
+  const merged = C.loadAllContracts(new Graph(ws), [ws], (m) => log.push(m));
+  eq(merged.length, 1, `inproc-3way: three specs on one title collapse to ONE contract (got ${merged.length})`);
+  eq(merged[0]?.kind, 'asyncapi',
+    'inproc-3way: AsyncAPI wins outright, though it is read LAST — the winner is the FORMAT, not the read order');
+  eq(JSON.stringify([...merged[0].tokens].filter((t) => t === 'InprocOnlyToken' || t === 'RESOURCE_ONLY_TOKEN')), JSON.stringify([]),
+    'inproc-3way: neither loser\'s tokens leak into the surviving node — a merged node would name one format while carrying three formats\' tokens');
+  const all = log.join('\n');
+  has(all, 'DIFFERENT formats', 'inproc-3way: the generalised collision message is used');
+  has(all, 'Keeping the asyncapi spec(s)', 'inproc-3way: …naming the winner');
+  has(all, 'a.inproc.yaml', 'inproc-3way: …and both losers');
+  has(all, 'b.resource.yaml', 'inproc-3way: …by path, so a user can find them');
+  rmSync(ws, { recursive: true, force: true });
+}
+
+// --- E. THE `direction` ENCODING, ATTACKED -------------------------------------
+// Contract KIND has no column: it is recovered at query time from an `inproc:kind=…;
+// boundary=…` prefix on the free-text contract_tokens.direction. That is what keeps
+// SCHEMA_VERSION at 5, and it is also a hand-rolled serializer sitting on a column that
+// already holds three other vocabularies ('c2s', 's2c', NULL and the `res:` encoding). The
+// suite above round-trips the legal vocabulary; this attacks the encoding itself.
+async function inprocDirectionEncodingAttackTest() {
+  const P = await import('../src/extract/inproc-spec.js');
+  const R = await import('../src/extract/resource-spec.js');
+
+  // (1) THE SEPARATORS ARE IN THE VALUE. `;` and `=` are the encoding's own delimiters, so
+  //     a value containing them is the first thing that breaks a naive `split(';')`
+  //     serializer. encodeURIComponent escapes both, and the decode must give them back
+  //     BYTE FOR BYTE — not merely "not crash".
+  const hostile = [
+    'a;b', 'a=b', ';;;', '===', 'kind=x;boundary=y',        // the delimiters themselves
+    '', ' ', '  ',                                          // empty and whitespace
+    'res:kind=path', 'inproc:kind=type', 'c2s', 's2c',      // values shaped like the OTHER vocabularies
+    '%', '%E0', '%zz', 'a%3Bb',                             // values shaped like percent-escapes
+    'sim/ecs', 'World<T>', 'ecs::World',                    // values shaped like a rejected id
+    'x'.repeat(4096),                                       // very long
+  ];
+  for (const v of hostile) {
+    const d = P.decodeInprocDirection(P.encodeInprocDirection({ kind: v, boundary: v }));
+    const label = JSON.stringify(v.length > 24 ? `${v.slice(0, 12)}…(${v.length} chars)` : v);
+    eq(d?.kind, v, `inproc-enc(1): kind ${label} round-trips through the direction column byte for byte`);
+    eq(d?.boundary, v, `inproc-enc(1): …and so does boundary ${label}`);
+    eq(d?.errors, null, `inproc-enc(1): …with no decode error for ${label}`);
+  }
+
+  // (2) THE PREFIX TEST IS ANCHORED. An unanchored match would let any value CONTAINING
+  //     `inproc:` — including a resource value carrying it inside a percent-encoded field —
+  //     be read as an inproc token, which silently flips the vocabulary of a whole report.
+  eq(P.decodeInprocDirection(' inproc:kind=type'), null,
+    'inproc-enc(2): a LEADING SPACE defeats the prefix — the test is anchored at position 0, not a substring search');
+  eq(P.decodeInprocDirection('res:kind=path;semantics=inproc:kind=type'), null,
+    'inproc-enc(2): …and a resource value that CONTAINS the inproc prefix is still a resource value');
+  eq(P.decodeInprocDirection('INPROC:kind=type'), null,
+    'inproc-enc(2): the prefix is case-SENSITIVE, so an upper-cased spelling is not silently accepted');
+  eq(P.decodeInprocDirection('inprocX:kind=type'), null,
+    'inproc-enc(2): …and a longer prefix that merely starts with it is not accepted either');
+  eq(P.decodeInprocDirection('inproc'), null, 'inproc-enc(2): the bare word without the colon is not an inproc direction');
+
+  // (3) NEITHER DECODER READS THE OTHER'S VALUES. tokenKind tries resource first and inproc
+  //     second, so a cross-read in EITHER direction mislabels the token — and with it the
+  //     writer/provider vocabulary, the undeclared-participant gate and the listing.
+  eq(R.decodeResourceDirection(P.encodeInprocDirection({ kind: 'type', boundary: 'crate' })), null,
+    'inproc-enc(3): the resource decoder refuses a well-formed inproc value');
+  eq(P.decodeInprocDirection(R.encodeResourceDirection
+    ? R.encodeResourceDirection({ kind: 'path' }) : 'res:kind=path'), null,
+    'inproc-enc(3): …and the inproc decoder refuses a well-formed resource value');
+  for (const wire of ['c2s', 's2c', null, undefined, '', 0, 1, true, {}, []]) {
+    eq(P.decodeInprocDirection(wire), null,
+      `inproc-enc(3): ${JSON.stringify(wire)} is not an inproc direction — every existing caller keeps its behaviour unchanged`);
+  }
+
+  // (4) A MALFORMED VALUE IS RECORDED, NEVER GUESSED AT. The rule the header states: only
+  //     wiregraph writes this column, so a value that does not decode means the row is
+  //     corrupt, and substituting a default would turn a corrupt row into a confident wrong
+  //     answer with nothing anywhere to say why.
+  eq(P.decodeInprocDirection('inproc:kind')?.errors?.length, 1,
+    'inproc-enc(4): a field with no "=" separator is recorded');
+  eq(P.decodeInprocDirection('inproc:=v')?.errors?.length, 1,
+    'inproc-enc(4): an EMPTY key is recorded as an unknown field rather than assigned to something');
+  eq(P.decodeInprocDirection('inproc:kind=;boundary=')?.kind, '',
+    'inproc-enc(4): an EMPTY VALUE decodes to the empty string — distinguishable from the null of "absent"');
+  eq(P.decodeInprocDirection('inproc:')?.kind, null,
+    'inproc-enc(4): …while a value with no fields at all leaves both null, with no invented default');
+  eq(P.decodeInprocDirection('inproc:kind=a%3Db')?.kind, 'a=b',
+    'inproc-enc(4): an escaped "=" inside a value survives the first-separator split');
+}
+
+// --- F. A CORRUPT INPROC DIRECTION MUST BE REPORTED, NOT SWALLOWED -------------
+// decodeInprocDirection goes to the trouble of RECORDING every unknown field and malformed
+// escape it meets — and until this test nothing read them. trace_contract's 🛑 UNREADABLE
+// path consulted the `res:` decoder only, so a corrupt inproc row produced precisely the
+// "confident wrong answer with nothing anywhere to say why" that the decoder's own header
+// comment refuses: kind and boundary silently null, no flag, no line. The decoder's unit
+// test asserted the decoder returns the errors, and passed, because the decoder does — the
+// test and the code agreed with each other while the user-visible behaviour was broken.
+async function inprocUnreadableMetaTest() {
+  // (1) THE UNIT. Both prefixes, so the fix cannot be "inproc only" either.
+  eq(Q.contractMetaErrors({ direction: 'res:bogus=1' }).length, 1,
+    'inproc-unreadable(1): a corrupt RESOURCE direction still reports — the resource path is unchanged');
+  eq(Q.contractMetaErrors({ direction: 'inproc:bogus=1' }).length, 1,
+    'inproc-unreadable(1): a corrupt INPROC direction reports too');
+  eq(Q.contractMetaErrors({ direction: 'inproc:kind=%E0' }).length, 1,
+    'inproc-unreadable(1): …including a malformed percent-escape');
+  eq(Q.contractMetaErrors({ direction: 'c2s' }).length, 0,
+    'inproc-unreadable(1): a WIRE direction has no encoding to be corrupt and reports nothing');
+  eq(Q.contractMetaErrors({ direction: null }).length, 0, 'inproc-unreadable(1): …and neither does a null one');
+
+  // (2) END TO END, which is where it was invisible. Corrupt the stored direction the way a
+  //     version skew or a truncated write would, and read the report a user reads.
+  const project = inprocFixture('cg-inprocunread-');
+  await runBuild({ target: project, project, reset: true });
+  const w = connect(join(project, '.wiregraph', 'graph.db'));
+  w.prepare("UPDATE contract_tokens SET direction='inproc:kind=type;boundary=crate;bogus=1' WHERE project=? AND token='World'")
+    .run(project);
+  w.close();
+  const conn = connect(join(project, '.wiregraph', 'graph.db'), { readonly: true });
+  const trace = Q.traceContract(conn, project, 'ecs-sim');
+  conn.close();
+  has(trace, '🛑 UNREADABLE', 'inproc-unreadable(2): a corrupt inproc direction raises the UNREADABLE flag in trace_contract');
+  has(trace, 'unreadable symbol metadata', 'inproc-unreadable(2): …in this type\'s vocabulary — an inproc token has kind/boundary and no semantics or single_writer to be unreadable');
+  ok(!trace.includes('unreadable resource metadata'),
+    'inproc-unreadable(2): …and NOT in the resource\'s, which would name two columns that are not there');
+  has(trace, 'unknown field "bogus"', 'inproc-unreadable(2): the reason is named, so it is actionable rather than just alarming');
+  rmSync(project, { recursive: true, force: true });
+}
+
+// --- G. THE LIST KEY IS `symbols:`, AND `interfaces:` IS A CLEAN BREAK ---------
+// The key was `interfaces:` while this was built. "Interface" is exactly the word
+// `*.inproc.yaml` was chosen to avoid: this repo's architecture warns that contracts/ must
+// never accumulate shared types, and "the interface contract" invites that reading — a
+// place to put the types rather than a description of which already-defined symbols cross a
+// boundary. There is deliberately NO ALIAS (nothing has shipped, and an alias would keep
+// the wrong word alive in users' files forever), but the refusal is NAMED rather than
+// generic, because the design doc this was built from spells the old key.
+async function inprocSymbolsKeyTest() {
+  const P = await import('../src/extract/inproc-spec.js');
+  const parse = (doc) => { const log = []; return { desc: P.parseInprocSpec(doc, 'x.inproc.yaml', (m) => log.push(m)), log: log.join('\n') }; };
+  const one = { id: 'ComponentStore', kind: 'type', provider: 'ecs', consumers: ['sim'] };
+
+  const good = parse({ title: 't', symbols: [one] });
+  eq(JSON.stringify(good.desc?.tokens), JSON.stringify(['ComponentStore']),
+    'inproc-key: `symbols:` is the list key');
+  const old = parse({ title: 't', interfaces: [one] });
+  eq(old.desc, null, 'inproc-key: `interfaces:` is REFUSED — a clean break, not a silent alias');
+  has(old.log, "the list key is 'symbols:', not 'interfaces:'",
+    'inproc-key: …and the refusal NAMES the old key, so a spec written from the design doc is a one-line fix rather than a stare');
+  has(old.log, 'never defines an interface',
+    'inproc-key: …and says why the word was dropped, so the rename does not read as churn');
+  // Both keys present: `symbols:` wins outright and no old-key message fires — the alias
+  // branch must be reachable ONLY when there is nothing else to parse.
+  const both = parse({ title: 't', symbols: [one], interfaces: [{ ...one, id: 'ShouldNotLoad' }] });
+  eq(JSON.stringify(both.desc?.tokens), JSON.stringify(['ComponentStore']),
+    'inproc-key: with both keys present the `symbols:` list is the only one read — `interfaces:` is not a fallback');
+  // And the generic message is still there for a doc that is simply not an inproc spec.
+  has(parse({ title: 't', resources: [] }).log, "expected a top-level 'symbols:' list",
+    'inproc-key: a doc that is not an inproc spec at all still gets the generic message, not the rename one');
+}
+
+// --- H. LIFECYCLE: AN ID REMOVED, AND A SPEC DELETED ---------------------------
+// "Does a stale INPROC edge ever survive?" A derived edge is rebuilt from scratch on every
+// full build, so the interesting residue is the REFERENCES rows and the contract node the
+// seam is derived FROM — those are what a stale seam would come back out of.
+async function inprocSpecLifecycleTest() {
+  const project = inprocFixture('cg-inproclife-');
+  const spec = join(project, 'contracts', 'ecs-sim.inproc.yaml');
+  await runBuild({ target: project, project, reset: true });
+  const state = () => {
+    const c = connect(join(project, '.wiregraph', 'graph.db'), { readonly: true });
+    try {
+      return {
+        inproc: c.prepare("SELECT count(*) n FROM edges WHERE project=? AND type='INPROC'").get(project).n,
+        refs: c.prepare("SELECT count(*) n FROM edges WHERE project=? AND type='REFERENCES'").get(project).n,
+        contracts: c.prepare('SELECT count(*) n FROM contracts WHERE project=?').get(project).n,
+        toks: c.prepare('SELECT token t FROM contract_tokens WHERE project=? ORDER BY t').all(project).map((r) => r.t),
+      };
+    } finally { c.close(); }
+  };
+  const full = state();
+  ok(full.inproc > 0 && full.refs > 0, `inproc-life: the baseline build has a live seam (${full.inproc} INPROC, ${full.refs} REFERENCES)`);
+  ok(full.toks.includes('Scheduler'), 'inproc-life: …including the id about to be removed');
+
+  // (1) AN ID REMOVED FROM THE SPEC. Its token, its REFERENCES and its seam must all go —
+  //     a surviving token would report as 🔴 unreferenced drift against a spec that no
+  //     longer declares it.
+  writeFileSync(spec, readFileSync(spec, 'utf8').replace(/  - id: Scheduler\n    kind: type\n    provider: ecs\n    consumers: \[sim\]\n/, ''));
+  await runBuild({ target: project, project, reset: true });
+  const dropped = state();
+  ok(!dropped.toks.includes('Scheduler'), 'inproc-life(1): removing an id from the spec removes its token');
+  const c1 = connect(join(project, '.wiregraph', 'graph.db'), { readonly: true });
+  eq(c1.prepare("SELECT count(*) n FROM edges WHERE project=? AND type='INPROC' AND token='Scheduler'").get(project).n, 0,
+    'inproc-life(1): …and every INPROC edge it derived');
+  eq(c1.prepare("SELECT count(*) n FROM edges WHERE project=? AND type='REFERENCES' AND token='Scheduler'").get(project).n, 0,
+    'inproc-life(1): …and every REFERENCES row it minted — nothing is left for a later re-derive to resurrect');
+  c1.close();
+  ok(dropped.inproc > 0, 'inproc-life(1): …while the seams of the ids that remain are untouched');
+
+  // (2) THE SPEC DELETED ENTIRELY.
+  rmSync(spec);
+  await runBuild({ target: project, project, reset: true });
+  const gone = state();
+  eq(gone.inproc, 0, 'inproc-life(2): deleting the spec leaves NO INPROC edge');
+  eq(gone.refs, 0, 'inproc-life(2): …no REFERENCES row');
+  eq(gone.contracts, 0, 'inproc-life(2): …and no contract node — the seam is gone, not merely dark');
+  eq(JSON.stringify(gone.toks), JSON.stringify([]), 'inproc-life(2): …and no contract_tokens row');
+  rmSync(project, { recursive: true, force: true });
+}
+
+// --- I. A COMPARTMENT RENAME TAKES THE SEAM DARK, AND IS SAID OUT LOUD ---------
+// An inproc contract's roles are the ONLY thing bounding a short symbol name's blast
+// radius, so a role naming no compartment does not merely lose a seam: it removes the
+// bound, and the real compartment's references reappear as UNDECLARED PARTICIPANTS. Going
+// dark silently is the failure mode; the warning is the feature.
+async function inprocCompartmentRenameTest() {
+  const C = await import('../src/extract/contracts.js');
+  const project = inprocFixture('cg-inprocrename-');
+  const spec = join(project, 'contracts', 'ecs-sim.inproc.yaml');
+  writeFileSync(spec, readFileSync(spec, 'utf8').replace(/provider: ecs/g, 'provider: engine'));
+
+  // The WARNING, read off the loader with the graph's real compartments in hand — the same
+  // shape the wire and resource role checks are covered in (see the D2 block above).
+  const g = new Graph(project);
+  for (const n of ['ecs', 'sim', 'render']) g.addCompartment(n, join(project, n));
+  const logs = [];
+  C.loadAllContracts(g, [join(project, 'contracts')], (m) => logs.push(String(m)));
+  const warn = logs.find((m) => m.includes('⚠') && m.includes('engine'));
+  ok(warn, `inproc-rename: a provider naming no compartment is REPORTED — going dark silently is the whole failure mode (got: ${logs.join(' | ') || 'nothing'})`);
+  has(String(warn), 'names provider/consumer compartment(s) [engine] that do not exist in this graph',
+    'inproc-rename: …naming the offending role value, in provider/consumer vocabulary rather than writer/reader');
+  has(String(warn), 'Known compartments: [ecs, render, sim]',
+    'inproc-rename: …and listing every legal spelling, so the remedy is copyable rather than guessable');
+  has(String(warn), 'UNDECLARED PARTICIPANTS',
+    'inproc-rename: …and saying the roles are ALSO the false-positive bound, so losing them costs more than a seam');
+
+  // …and the consequence, end to end.
+  await runBuild({ target: project, project, reset: true });
+  eq(edgeCount(project, project, 'INPROC'), 0,
+    'inproc-rename: no INPROC edge is derived, rather than one being invented against the old name');
+  const conn = connect(join(project, '.wiregraph', 'graph.db'), { readonly: true });
+  const trace = Q.traceContract(conn, project, 'ecs-sim');
+  conn.close();
+  has(trace, '⚠️ UNDECLARED',
+    'inproc-rename: the real compartment\'s references now report as undeclared participants — the honest consequence of an unbounded id, not silence');
+  rmSync(project, { recursive: true, force: true });
+}
+
+// --- J. query_sql's SCHEMA DESCRIPTION IS THE ONLY MAP AN AGENT HAS ------------
+// It is prose, not a branch, which is exactly why it was missed: everything else about
+// INPROC worked while the one document an agent reads before writing SQL against the graph
+// listed six edge types and not this one. A seam absent from that list is a seam no
+// query_sql call will ever ask for.
+async function inprocQuerySqlSchemaTest() {
+  const { DERIVED_EDGE_TYPES } = await import('../src/store/sqlite.js');
+  const src = readFileSync(join(HERE, '..', 'src', 'mcp', 'server.js'), 'utf8');
+  const i = src.indexOf("registerTool('query_sql'");
+  ok(i > 0, 'inproc-sql: the query_sql registration is findable');
+  const desc = src.slice(i, src.indexOf('inputSchema', i));
+  for (const t of DERIVED_EDGE_TYPES) {
+    has(desc, t, `inproc-sql: query_sql's schema description names the ${t} edge type — every DERIVED_EDGE_TYPES member must appear, or an agent writing SQL against the graph cannot know the seam exists`);
+  }
+  has(desc, 'CALLS/WIRE/RESOURCE/INPROC join symbols.id',
+    'inproc-sql: …and says INPROC joins symbol to symbol, so a query can actually be written against it');
+}
+
+await inprocSpecFormatRegistrationTest();
+await inprocRecursiveScopeTest();
+await inprocThreeFormatBuildTest();
+await inprocThreeWayCollisionTest();
+await inprocDirectionEncodingAttackTest();
+await inprocUnreadableMetaTest();
+await inprocSymbolsKeyTest();
+await inprocSpecLifecycleTest();
+await inprocCompartmentRenameTest();
+await inprocQuerySqlSchemaTest();
+
 // --- REVIEW (test/review.mjs, run as a child) ---
 // review.mjs is standalone: it owns its own counters and exits on its own. We fold its
 // totals into ours rather than just checking its exit code, so the number this file prints

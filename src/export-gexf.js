@@ -17,7 +17,7 @@
 import { writeFileSync, existsSync, realpathSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { connect } from './store/sqlite.js';
+import { connect, DERIVED_EDGE_TYPES } from './store/sqlite.js';
 import { gatherGexf } from './store/sqlite-export.js';
 
 const PLUGIN_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -98,7 +98,7 @@ async function main() {
   let built;
   try {
     built = gatherGexf(db, project, opts);
-    if (!built) { process.stderr.write(`No derived seam edges (WIRE/RESOURCE) for contract "${opts.contract}".\n`); process.exit(1); }
+    if (!built) { process.stderr.write(`No derived seam edges (${DERIVED_EDGE_TYPES.join('/')}) for contract "${opts.contract}".\n`); process.exit(1); }
   } finally { db.close(); }
 
   const links = collapse(built.links);

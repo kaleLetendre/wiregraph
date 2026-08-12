@@ -42,6 +42,22 @@ export function isContractsDirName(name) {
 // `*-contracts` all match isContractsDirName, which needs no file test at all. What is
 // gone is exactly the case with no corroborating signal — an arbitrarily named directory
 // holding a file that merely ends in `.resource.yaml`.
+//
+// IT STAYS ASYNCAPI-ONLY NOW THAT `*.inproc.yaml` EXISTS TOO, and that is a decision, not
+// an omission. The rationale above is about what a filename PROVES, and it splits the three
+// formats differently from every other list in this file: `.asyncapi.yaml` is a public
+// standard nobody else writes into an arbitrary directory, while `.resource.yaml` collides
+// with k8s tooling. `.inproc.yaml` is wiregraph-exclusive and so does not have the resource
+// format's collision problem — but it also has no corroborating signal of its own, and
+// admitting it would re-arm the same failure for a repo that happens to hold one at its
+// root: `state.contractsDir` flips from null to the repo ROOT, permanently silencing the
+// /wiregraph-contracts nudge and making `apply` write the inferred spec to the root. The
+// upside is nil, because an inproc-only contracts home is ALREADY found by NAME like a
+// resource-only one, and inference emits no inproc draft to misplace. So the weaker
+// predicate is kept, and — this is the part that matters — it is deliberately NOT driven by
+// SPEC_FORMATS below: the two lists answer different questions ("may this directory be
+// promoted to a contracts home?" vs "is this a spec the loader parses?") and unifying them
+// would silently re-import the k8s collision the moment someone tidied them together.
 const SPEC_FILE_RE = /\.asyncapi\.ya?ml$/i;
 export function hasTopLevelSpec(dir) {
   try {
@@ -208,9 +224,27 @@ export function rootContractsEntries(root, recursive) {
 // different state from "absent".
 //
 // The filename test must match what readContractsDir actually PARSES (src/extract/contracts.js
-// SPEC_PARSERS): both formats, both YAML extensions, case-insensitive. A file the loader
-// ignores must not move the fingerprint.
-const SPEC_ANY_RE = /\.(asyncapi|resource)\.ya?ml$/i;
+// SPEC_PARSERS): EVERY format, both YAML extensions, case-insensitive. A file the loader
+// ignores must not move the fingerprint — and, the direction that actually bites, a file the
+// loader DOES parse must not be invisible to it.
+//
+// THIS LIST IS A THIRD REGISTRATION POINT FOR A NEW SPEC FORMAT, and the quietest of the
+// three. `*.inproc.yaml` shipped parsed, matched, derived, pruned and re-derived correctly
+// while this regex still named two formats, and the consequence was not a missing feature
+// but a WRONG GRAPH: an inproc spec could be added, edited, retitled, MOVED between two
+// contracts dirs (which narrows its scope in recursive mode) or deleted outright without
+// moving the fingerprint one bit, so incrementalBuild's contractsDrift refusal never fired
+// and the save loop re-derived seams over REFERENCES rows minted under the OLD scope —
+// fabricating a cross-scope INPROC edge that a full rebuild does not produce. The same move
+// of a *.resource.yaml was refused, correctly, the whole time.
+//
+// SPEC_FORMATS is exported so the suite can pin it against src/extract/contracts.js's parser
+// table by COUNT as well as by content: a fourth format that adds a parser and forgets this
+// line fails a test rather than shipping the defect above again. contracts-dirs.js stays
+// dependency-light on purpose (node:fs + node:path + the IGNORE_DIRS leaf), so it declares
+// the list rather than importing it from the extractor.
+export const SPEC_FORMATS = ['asyncapi', 'resource', 'inproc'];
+const SPEC_ANY_RE = new RegExp(`\\.(${SPEC_FORMATS.join('|')})\\.ya?ml$`, 'i');
 
 // The specs ONE `{dir, scopeRoot}` entry contributes, sorted by filename (readdir order is
 // filesystem-dependent; the caller sorts the whole set again, but keeping this stable makes

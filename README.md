@@ -207,6 +207,21 @@ Within one compartment, wiregraph links calls by name. **Across** compartments i
 guess by name (a shared `start` in two compartments would be a false link), so how it
 bridges depends on how your compartments actually connect.
 
+There are **three contract types**, and one idea underneath all of them: each joins the two
+sides on **a shared identifier that appears literally in both compartments' source** — a
+route or topic for a wire, a constant name for a resource, a symbol name for an in-process
+seam. That is why none of them needed a new extractor and why all three work in **every
+language wiregraph indexes**: the matcher looks for a string you already wrote down, and
+mints a `REFERENCES` edge from whichever symbol encloses it. It is also the shared limit —
+a seam whose two sides never spell the same thing is a seam wiregraph cannot see, whatever
+the spec says.
+
+| Type | File | Joins on | Roles | Derived edge |
+|---|---|---|---|---|
+| **wire** | `*.asyncapi.yaml` | a channel address / topic, and payload field names | producer → consumer | `WIRE` |
+| **resource** | `*.resource.yaml` | the shared **constant name** | writer → reader | `RESOURCE` |
+| **in-process** | `*.inproc.yaml` | the exported **symbol name** | provider → consumer | `INPROC` |
+
 ### Services that talk over the wire (HTTP, queues)
 
 A producer sends a message; a consumer in another compartment handles it. There is **no
@@ -220,7 +235,8 @@ can't connect that, so wiregraph bridges them through that shape, described as a
   (e.g. `api-contracts`) — or pass `--contracts <dir>`.
 - Inside it, one or more **AsyncAPI** specs named `*.asyncapi.yaml` / `*.asyncapi.yml`
   (2.x and 3.x are both read), and/or **resource contracts** named `*.resource.yaml`
-  for coupling through a shared file, socket, table or shared-memory region
+  for coupling through a shared file, socket, table or shared-memory region, and/or
+  **in-process contracts** named `*.inproc.yaml` for two compartments in one process
   (other files are ignored).
 - Nothing if you don't have specs — no contracts dir simply means no cross-compartment edges;
   everything else still works.
@@ -260,6 +276,56 @@ communication between two compartments** (services over the wire, a library/SDK'
 surface, or one program reading another's state) — see **[the contract-architecture page](https://kaleletendre.github.io/wiregraph/contracts.html)**
 for the full model, the inference flow, and how to author contracts by hand.
 
+### Crates and modules coupled inside one process
+
+Two compartments in **one binary**, on either side of a crate or module wall, coupled by
+direct use of each other's exported symbols — an `ecs` crate whose `World` and `Scheduler`
+the `sim` crate builds on. There is no wire and no shared file, and — as above — wiregraph
+never resolves a call across a compartment boundary by name, so without a contract a
+four-crate Cargo workspace indexes as four disconnected islands.
+
+The join key is the one thing both sides already spell identically: **the exported symbol
+name**. Describe the seam in a `<name>.inproc.yaml` in the same contracts dir:
+
+```yaml
+title: ecs-sim                 # -> contract name; UNIQUE across every spec, in all formats
+boundary: crate                # crate | module — documentation of what the seam crosses
+symbols:
+  - id: World                  # the exported SYMBOL NAME, bare — not ecs::World, not World<T>
+    kind: type                 # type | function | method | trait | macro — descriptive only
+    provider: ecs              # the ONE compartment that defines it
+    consumers: [sim]           # the compartments that use it
+  - id: Scheduler
+    kind: type
+    provider: ecs
+    consumers: [sim]
+```
+
+That derives directed `INPROC` edges from provider symbols to consumer symbols, and
+`trace_contract` / `path_between` walk them like any other seam. **Direction is one-way by
+construction** — exactly one `provider`, and a spec naming one compartment as both provider
+and consumer of a symbol is refused rather than warned about.
+
+**Read the drift report asymmetrically — this is the part that bites.** An in-process id is
+usually a short name (`World`, `Entity`), matched literally and case-sensitively as
+`\bWorld\b` across both compartments:
+
+- 🔴 **`unreferenced` is strong evidence.** Nothing anywhere in scope spells the name, so
+  either the symbol is gone or the spec is stale. Act on it.
+- ✅ **`satisfied` is weak.** It means *both compartments spell this name*, not *the consumer
+  uses the provider's one*. Comments and `use`/`import` lines are excluded, but an unrelated
+  same-named symbol inside a declared compartment is indistinguishable from the real use, and
+  a re-export under a different local name (`use ecs::World as W`), a type alias or a
+  macro-pasted name is missed entirely.
+- **The blast radius is bounded by the declared roles.** Only symbols in the declared
+  `provider` compartment are paired with symbols in the declared `consumers`, so a stray
+  `World` in a third crate can **never** mint an `INPROC` edge. It surfaces instead as an
+  ⚠️ **undeclared participant** — "something else in this project spells this name, go look."
+
+**These are hand-written only.** `/wiregraph-contracts` infers wire and resource seams; it
+never proposes an `*.inproc.yaml`, so there is no draft to wait for. Write it and run
+`/wiregraph-rebuild`.
+
 ### Packages that import each other in-process
 
 In a monorepo where one package imports another, the link is right there in the code, and
@@ -269,8 +335,8 @@ matching another compartment's `package.json` `name` — and **C**'s quoted `#in
 **Python, Java, Kotlin and Rust emit no import candidates at all**, so nothing is resolved for
 them: a Rust `use` path names a crate-relative *namespace*, not a file, and guessing which file it
 lands on would mint a false edge. For those languages an in-process cross-compartment link is
-either described by a contract or absent from the graph — see
-[Nested compartments](#nested-compartments-recursive-mode) for what that means in practice.
+either described by an [in-process contract](#crates-and-modules-coupled-inside-one-process) or
+absent from the graph.
 
 ## Nested compartments (recursive mode)
 
@@ -310,29 +376,30 @@ nothing at all about the last one. Which is which:
 | **R3** — if two compartments don't communicate, there is no file | `trace_contract` diffs a contract's whole declared token set against the code every call: a token nothing references is 🔴 drift, a token only one side references is ⚠️ one-sided. The converse — communication with *no* contract — is what `/wiregraph-contracts` infers, and a project with seams and no hand-written contracts dir is nudged toward it at session start. | **enforced** |
 | **R4** — a contract lives in the shared parent's `contracts/`, never inside either side | This *is* recursive mode's scope rule: the subtree a contract governs is the parent of the directory holding it (`scopeRoot = dirname(dir)`, `src/contracts-dirs.js`). File a contract inside one of its own sides and it governs only that side; the other side's references fall outside its scope and its tokens report one-sided. Detected — though reported as a missing half, not named as a misfiling. | **enforced** |
 | **R5** — a contract names only siblings | Role names are matched against a **flat** partition: every file belongs to its *nearest* declared compartment, so a parent whose children are compartments in their own right holds only the files that are in none of them. Name `server` as a role when the code lives in `server/ecs`, `server/sim`, … and it matches almost nothing — no `WIRE` edge, a one-sided report, no message saying why. Name the leaf compartments instead. | **assumed** |
-| **R6** — direction is one-way where it can be | Contracts carry message direction (`c2s` / `s2c`) and `WIRE` edges are directed producer → consumer, but that is message flow, not dependency structure. Nothing looks for a cycle — not among contracts, not over `IMPORTS`. | **unaddressed** |
+| **R6** — direction is one-way where it can be | An **in-process contract** is the one place this is checkable, and it is checked: a symbol has exactly one `provider`, and a spec naming a compartment as both provider and consumer of the same symbol is **refused at load**, with the reason. Nothing else is. `WIRE` edges are directed producer → consumer, but that is message flow, not dependency structure, and nothing looks for a *cycle* — not among contracts, not over `IMPORTS`. So the rule is enforced per declaration, never system-wide. | **enforced** (per declaration) |
 
 **enforced** = wiregraph detects a violation and says so. **assumed** = its behaviour depends on the
 rule holding, and goes quiet or wrong if it doesn't. **unaddressed** = nothing in wiregraph relates
-to it. A rule wiregraph doesn't check is not a rule that stopped mattering; four of the six are
-still enforced only by review.
+to it. A rule wiregraph doesn't check is not a rule that stopped mattering; three of the six are
+still enforced only by review, and R6's check covers only what a single spec can contradict —
+never a cycle across several.
 
 ### What it can't express
 
-**An in-process channel across a compartment boundary is not a contract wiregraph models.**
-wiregraph knows two kinds: a **wire** contract (producer → consumer over a network or a queue) and
-a **resource** contract (two compartments coupled through a shared file, table, shared-memory
-region or named pipe). A channel handed between two crates in one process — `sim` sending tick
-output to `network` over an in-memory queue — is neither, and it should **not** be filed as a
-resource contract: a resource's join key is a shared constant naming a *thing outside both
-compartments*, and an in-process channel has no such thing. The mechanism that would fit is
-cross-compartment `IMPORTS`, which does not resolve for Rust, Python, Java or Kotlin (see above).
-So on a Rust workspace, the contracts between in-process crates are documents wiregraph does not
-read: the graph holds each crate's internals and no edge between them. That gap is real, and
-writing a spec that pretends otherwise would put a false edge in the graph instead.
+**A seam whose two sides never name the same thing.** An in-process contract joins on the
+exported symbol name, so it covers the common case — one crate defines `World`, another uses it.
+It does **not** cover two compartments that are wired together by a *third* one and never mention
+each other at all: `sim` handing tick output to `network` over a channel that `host` constructs
+puts no shared identifier in either side's source, so there is nothing to join on and no spec can
+invent one. Nor should that be filed as a resource contract — a resource's join key is a constant
+naming a *thing outside both compartments*, and an in-memory channel has no such thing. The fix is
+the same discipline as for a hand-packed binary protocol (below): give the payload a **named type
+both sides spell**, and declare that name. Until they share a string, the
+graph honestly holds two crates with no edge between them.
 
-**Only two file types in a `contracts/` dir are read** — `*.asyncapi.yaml` (wire) and
-`*.resource.yaml` (resource). Everything else in there is ignored, deliberately and silently. If
+**Only three file types in a `contracts/` dir are read** — `*.asyncapi.yaml` (wire),
+`*.resource.yaml` (resource) and `*.inproc.yaml` (in-process). Everything else in there is
+ignored, deliberately and silently. If
 your contracts are prose documents, they stay prose documents: the YAML spec beside them is a
 machine-readable projection of the part that can be string-matched, not a replacement for the
 document, and the two have to be kept honest by hand.
@@ -355,9 +422,13 @@ side doesn't count — declaration sites are excluded on purpose).
   TS/JS specifiers and C's quoted `#include`; Python, Java, Kotlin and Rust emit no import
   candidates, so their in-process cross-compartment links need a contract or go unlinked. Rust
   needs a `mod`/`Cargo.toml` resolver before a `use` path can name a file.
-- **More contract inference** — contract inference from code shipped for HTTP routes
-  (`/wiregraph-contracts`); next are queues/topics, library/SDK API surfaces, and
-  shared-state schemas as additional sources onto the same contract machinery.
+- **More contract inference** — contract inference from code shipped for HTTP routes and shared
+  constants (`/wiregraph-contracts`); next are queues/topics, library/SDK API surfaces, and
+  **in-process seams**, which are hand-written only today — nothing proposes an `*.inproc.yaml`.
+- **Letting an in-process contract authorize call resolution** — today an `INPROC` edge means
+  "both compartments spell this declared symbol", not "this call resolves to that definition".
+  Teaching `resolve.js` to link calls across a compartment boundary *for the symbols a contract
+  declares* would turn the declared surface into real `CALLS` edges.
 - **Contract maintenance** — flag drift / cross-service breaking changes when a payload
   field or endpoint changes on one side of a contract but not the other.
 

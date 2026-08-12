@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { Graph } from './model.js';
 import { extractCode } from './extract/index.js';
 import { resolveCalls } from './extract/resolve.js';
-import { loadAllContracts, matchContracts, buildWireEdges, buildResourceEdges, constDefIndex, handWrittenTokens } from './extract/contracts.js';
+import { loadAllContracts, matchContracts, buildWireEdges, buildResourceEdges, buildInprocEdges, constDefIndex, handWrittenTokens } from './extract/contracts.js';
 import { compartmentNameFor, walkSources } from './extract/walk.js';
 import { detectContractsDirs, rootContractsEntries, contractsDirSpecs } from './contracts-dirs.js';
 import { connect, loadGraph, loadProjectSymbols, pruneFile, rederiveWireEdges, listIndexedFiles } from './store/sqlite.js';
@@ -371,6 +371,9 @@ function fullBuild(opts, roots, project) {
     // Resource contracts (*.resource.yaml) derive their own writer->reader seam from
     // the SAME REFERENCES. No-op when no resource spec exists.
     buildResourceEdges(graph, contracts, log);
+    // In-process contracts (*.inproc.yaml) derive their provider->consumer seam from the
+    // SAME REFERENCES again. No-op when no inproc spec exists.
+    buildInprocEdges(graph, contracts, log);
   } else {
     log(phaseBar(3, 4, 'no contracts dir found — skipping cross-compartment wire edges'));
   }
@@ -536,9 +539,10 @@ function dbCompartmentNames(db, project) {
 // resolve their OUTGOING calls against the whole project (read from the db), then
 // reload. Incoming name-based CALLS to a renamed symbol may dangle until a full
 // rebuild — THAT is the one documented full-rebuild backstop here. The DERIVED seams
-// (WIRE and RESOURCE) are NOT in that category any more: pruneFile drops the seams
-// touching a re-indexed symbol and rederiveWireEdges rebuilds both from the now-fresh
-// REFERENCES at the end of this function, so a seam survives an ordinary save.
+// (WIRE, RESOURCE and INPROC) are NOT in that category any more: pruneFile drops the
+// seams touching a re-indexed symbol and rederiveWireEdges rebuilds every one of them
+// from the now-fresh REFERENCES at the end of this function, so a seam survives an
+// ordinary save.
 function incrementalBuild(opts, root, project) {
   if (!opts.load) throw new Error('--files (incremental) requires a load; remove --no-load');
 
@@ -724,7 +728,7 @@ function incrementalBuild(opts, root, project) {
       // REFERENCES to the inferred/sibling-member contract, silently dropping the
       // cross-repo seam until a full rebuild (M1). Re-match on each OWNER root that holds
       // a changed file, mirroring fullBuild's per-root matchContracts. (This step restores
-      // REFERENCES only; the derived WIRE/RESOURCE seams are rebuilt from them by
+      // REFERENCES only; the derived WIRE/RESOURCE/INPROC seams are rebuilt from them by
       // rederiveWireEdges at the end of this function — see Change 1 below.)
       if (contractsDirs.length) {
         // The compartment set this graph really has, for validateResourceRoles: THIS

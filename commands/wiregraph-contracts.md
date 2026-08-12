@@ -16,6 +16,16 @@ have to hand-write specs. Two kinds are inferred, and a scan reports both:
   names it → a draft **`*.resource.yaml`** spec, writer→reader. There is no request/reply
   here: a writer creates or updates the resource and readers observe it.
 
+**There is a THIRD contract type and it is NOT inferred — say so before the user waits for
+a draft that never arrives.** An **in-process contract** (`*.inproc.yaml`) joins two
+compartments in ONE process across a crate or module wall, on the **exported symbol names**
+that cross it (`World`, `Scheduler`), with roles **provider → consumer**. `scan` and
+`apply` know nothing about the format: they will never propose one, never mention one, and
+`apply` never writes one. It is **hand-written only** — step 7 has the format. If the user
+came here for an `ecs` ↔ `sim` style seam between two crates in one binary, jump straight to
+step 7; the scan has nothing to say about it and a scan that reports no seams is not
+evidence that there is nothing to write.
+
 A contract is just **the defined communication between two compartments**. (A compartment
 is a package/module or repo; see
 <https://kaleletendre.github.io/wiregraph/contracts.html>.) The inference is a
@@ -132,7 +142,10 @@ Do the steps in order:
      found something. An empty block is ten lines of common reasons, so do not read the
      other block's explainer as the verdict;
    - `No cross-compartment WIRE seams` **and** `No cross-compartment RESOURCE seams` →
-     nothing was found; go to step 4;
+     nothing was found by INFERENCE; go to step 4. It does **not** mean the project has no
+     seams: there are exactly two inferred kinds and no third block, so an in-process seam
+     between two crates in one binary is absent from this output by construction, not by
+     verdict. Never report "no contracts needed" off this line;
    - `Seams considered and NOT proposed` (wire) / `Named constants considered and DECLINED`
      (resource) → the tail of either block: everything the scan deliberately did not
      propose, with the reason for each. Read it back when the user asks why theirs was not
@@ -148,7 +161,11 @@ Do the steps in order:
    or a shared constant if both compartments are in one graph. The scan's own output
    lists the other common reasons (a bare string literal instead of a named constant, a
    function-local constant, the same name with two different values). Stop here — or, if
-   the user wants a seam wiregraph cannot infer, go to step 7 and write it by hand.
+   the user wants a seam wiregraph cannot infer, go to step 7 and write it by hand. **The
+   commonest such seam is an in-process one** — two crates or modules in one binary, coupled
+   by exported symbols. Inference has no detector for it, so it will never appear above
+   however the workspace is laid out; offer step 7's `*.inproc.yaml` rather than letting the
+   user conclude the seam is invisible to wiregraph.
 
 5. **If it found seams**, ask the user with AskUserQuestion whether to write the draft
    contract(s). Make clear it's a starting point they own and should review/commit.
@@ -184,8 +201,10 @@ Do the steps in order:
    does — writing a draft CHANGES THE SET OF SPECS IN FORCE, which is exactly what makes an
    incremental unsafe. Relay it as-is; there is nothing to override.
 
-7. **Write by hand anything inference cannot see, and prune what it wrote.** Both formats
-   live in the same contracts home and are read by the same pipeline.
+7. **Write by hand anything inference cannot see, and prune what it wrote.** All three
+   formats live in the same contracts home and are read by the same pipeline. Two of them
+   (`*.asyncapi.yaml`, `*.resource.yaml`) can arrive as drafts; the third (`*.inproc.yaml`)
+   only ever arrives by hand.
 
    **First, prune the resource roles** (only if a `*.resource.yaml` was written). Open it
    and edit each resource's `writers:` / `readers:` down to the truth. Until then the seam
@@ -362,6 +381,65 @@ Do the steps in order:
      Python, Java and Kotlin emit no import candidates at all, which is why the vendored
      name+value join is mandatory rather than a fallback.)
 
+   **An IN-PROCESS contract** is a wiregraph-native `*.inproc.yaml`, also in the same place.
+   **Nothing infers this format — it exists only if the user writes it.** It is for two
+   compartments in ONE process, on either side of a crate or module wall, coupled by direct
+   use of the other side's exported symbols:
+
+   ```yaml
+   title: ecs-sim                 # -> contract name; must be UNIQUE across all specs
+   boundary: crate                # crate | module — DOCUMENTATION of what the seam crosses
+   symbols:
+     - id: World                  # the exported SYMBOL NAME, bare
+       kind: type                 # type | function | method | trait | macro — descriptive
+       provider: ecs              # the ONE compartment that DEFINES it
+       consumers: [sim]           # the compartments that USE it
+     - id: Scheduler
+       kind: type
+       provider: ecs
+       consumers: [sim]
+   ```
+
+   This derives directed `INPROC` edges from provider symbols to consumer symbols, and
+   `trace_contract` / `path_between` walk them like any other seam. Rules for the format,
+   worth stating to the user:
+
+   - **Direction is one-way BY CONSTRUCTION.** Exactly one `provider:`, and a spec naming a
+     compartment as BOTH provider and consumer of one symbol is **REFUSED** at load — not
+     warned about, the way the resource format's writer/reader overlap is. A compartment
+     using its own exported symbol is the call graph's job, not a seam.
+   - **The id is the BARE symbol name.** `World`, never `ecs::World` and never `World<T>` —
+     the matcher builds `\bWorld\b`, which is what the definition and every call site
+     actually write. An id containing `/` is rejected (a `/`-bearing token is matched as an
+     HTTP route); so is anything under 3 characters, and so is a generic word (`type`,
+     `state`, `name`, `result`, …) that would match essentially every file ever written.
+   - **`kind:` and `boundary:` are DESCRIPTIVE and change no matching** — but an unknown
+     value is refused (`boundary:` for the whole spec, `kind:` for that one symbol), because
+     a typo that loaded silently would make the field mean nothing.
+   - **Short ids are ACCEPTED here, unlike in every other format, and that is deliberate.**
+     A wire or resource token must pass the distinctiveness gate; an in-process id cannot and
+     still be useful, since the exported surface of an ECS crate *is* `World`, `Entity`,
+     `Scheduler`. The gate is not applied. The build instead logs one line per spec naming
+     the short ids — that line is expected on a healthy spec, not a warning to chase.
+   - **Read the drift report ASYMMETRICALLY. This is the thing to tell the user.**
+     🔴 `unreferenced` is STRONG evidence — nothing in scope spells the name at all.
+     `satisfied` is WEAK: it means *both compartments spell this name*, not *the consumer
+     uses the provider's one*. Matching is literal and case-sensitive; comments and
+     `use`/`import` lines are excluded; but an unrelated same-named symbol inside a declared
+     compartment is indistinguishable from the real use, and a re-export under another local
+     name (`use ecs::World as W`), a type alias or a macro-pasted name is missed entirely.
+   - **The blast radius is bounded by the declared roles.** Only symbols in the declared
+     `provider` compartment are paired with symbols in the declared `consumers`, so a stray
+     `World` in a third crate can NEVER mint an `INPROC` edge. It surfaces as an ⚠️
+     **undeclared participant** instead — and for this format that finding is as likely to be
+     a false positive as an incomplete spec. Read it before widening `consumers:`.
+   - **An `INPROC` edge is not a resolved call.** It says a symbol on each side spells the
+     declared name. Calls still do not resolve across a compartment boundary.
+   - **A misspelled compartment name costs more here than elsewhere.** The roles are the only
+     thing bounding a short symbol name, so a name that matches no compartment does not just
+     lose the seam — it removes the bound, and every real reference reports as an undeclared
+     participant. Take role names from `graph_status`, never from the directory layout.
+
 8. **Light up the edges.** Run `/wiregraph-rebuild` — a FULL rebuild, not an incremental.
    Writing or editing a spec CHANGES THE SET OF CONTRACT SPECS IN FORCE — whether it
    creates a contracts home, drops a new file into one that already existed, moves a spec
@@ -383,8 +461,8 @@ Do the steps in order:
    **If you don't already know a contract's name, list them all first.** `trace_contract`'s
    `contract` argument is a case-insensitive SUBSTRING of the contract name, and the EMPTY
    substring matches every one — so calling it with `contract` **omitted, or empty (`""`)**,
-   lists every contract in the graph, each with its kind (wire or resource) and how many
-   tokens it defines. That is the documented way to enumerate coverage on a project with
+   lists every contract in the graph, each with its kind (wire, resource or inproc) and how
+   many tokens it defines. That is the documented way to enumerate coverage on a project with
    several specs across several contracts dirs — don't guess a title, and don't fall back to
    `query_sql` for it. Then call it again with a substring of the one you want for that
    contract's per-token detail.

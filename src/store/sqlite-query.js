@@ -8,6 +8,17 @@ import { readFileSync, statSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { readState, members, memberRoots } from '../../scripts/lib/state.mjs';
 import { decodeResourceDirection } from '../extract/resource-spec.js';
+import { decodeInprocDirection } from '../extract/inproc-spec.js';
+
+// Which CONTRACT TYPE a stored token came from, recovered from the free-text
+// contract_tokens.direction column: `res:` = a *.resource.yaml, `inproc:` = a
+// *.inproc.yaml, anything else ('c2s' / 's2c' / null) = an AsyncAPI wire token. Kind is
+// DERIVED, not stored — there is no column for it and SCHEMA_VERSION stays 5.
+//
+// One reader, so the half-dozen places that need to speak the right vocabulary (writer vs
+// provider, readers vs consumers) cannot drift into disagreeing about what a token is.
+const tokenKind = (meta) => (decodeResourceDirection(meta?.direction) ? 'resource'
+  : decodeInprocDirection(meta?.direction) ? 'inproc' : 'wire');
 
 const isTest = (f) => f.includes('tests/') || f.includes('/test/') || f.includes('.test.') || f.includes('_test.') || f.includes('/test_');
 const loc = (n) => `${n.compartment}:${n.file}:${n.startLine} ${n.name}${n.kind && n.kind !== 'function' ? ` (${n.kind})` : ''}`;
@@ -417,21 +428,48 @@ export function singleWriterViolation(meta) {
 // guessing, is that a compartment touches the resource and the spec does not mention it
 // — the concrete thing to go and look at, and a strict superset of "an undeclared
 // writer".
+// IT GENERALISES TO INPROC UNCHANGED, and the gate is the only thing that had to move.
+// The BODY is type-agnostic — "the spec names these compartments; code in this one touches
+// the token; it is in neither list" — and the reason the gate existed at all was to keep
+// WIRE tokens out, where `x-wiregraph-producers/consumers` are optional and partial by
+// design and a third compartment calling a route is ordinary. An inproc contract is exactly
+// like a resource one in the respect that matters: the roles are a COMPLETE statement of
+// who is allowed to be on the seam. For inproc it is more than a completeness check —
+// buildInprocEdges uses those same role sets as the false-positive bound on a short symbol
+// name, so an undeclared participant is precisely the report that says "something outside
+// the declared seam spells this name; the id may be too common, or the spec too narrow".
 export function undeclaredParticipants(refComps, meta) {
-  if (!decodeResourceDirection(meta?.direction)) return [];   // resource tokens only
+  if (tokenKind(meta) === 'wire') return [];   // resource + inproc tokens only
   const declared = new Set([...roleNames(meta?.producers), ...roleNames(meta?.consumers)]);
   if (!declared.size) return [];
   const refSet = refComps instanceof Set ? refComps : new Set(refComps || []);
   return [...refSet].filter((c) => !declared.has(c)).sort();
 }
 
-// A resource token whose persisted `direction` did not decode cleanly — corrupt db, or a
-// value written by a version that encoded a field this one does not know. Returned as a
-// list of human-readable reasons (empty when fine) so trace_contract can SAY so: a
-// mis-decoded single_writer used to turn a declared TRUE into an effective FALSE and take
-// the violation report down with it, with no signal anywhere.
-export function resourceMetaErrors(meta) {
-  return decodeResourceDirection(meta?.direction)?.errors || [];
+// A token whose persisted `direction` did not decode cleanly — corrupt db, or a value
+// written by a version that encoded a field this one does not know. Returned as a list of
+// human-readable reasons (empty when fine) so trace_contract can SAY so: a mis-decoded
+// single_writer used to turn a declared TRUE into an effective FALSE and take the violation
+// report down with it, with no signal anywhere.
+//
+// IT READS WHICHEVER PREFIX THE VALUE CARRIES. It used to consult only the `res:` decoder,
+// which left `decodeInprocDirection` — which goes to the trouble of RECORDING every unknown
+// field and malformed percent-escape it meets, on the stated rationale that "only wiregraph
+// writes this column, so a value that does not decode means the row is corrupt, and
+// silently substituting a default would turn a corrupt row into a confident wrong answer
+// with nothing anywhere to say why" (extract/inproc-spec.js) — with NO READER AT ALL. The
+// errors were collected and dropped on the floor, so a corrupt inproc row produced exactly
+// the confident wrong answer that comment refuses: kind and boundary silently null, no
+// 🛑 UNREADABLE, nothing anywhere to say why. The decoder's own unit test asserted that the
+// decoder returns the errors, and passed, because the decoder does.
+//
+// `||` and not a kind lookup: the two prefixes cannot both match one value (each decoder is
+// anchored on its own prefix and returns null otherwise), so this is a first-hit dispatch,
+// and a value that is neither yields no errors — which is right, because a WIRE direction
+// ('c2s' / 's2c' / NULL) has no encoding to be corrupt.
+export function contractMetaErrors(meta) {
+  const d = meta?.direction;
+  return (decodeResourceDirection(d) || decodeInprocDirection(d))?.errors || [];
 }
 
 // Human-readable detail for a one-sided token in trace_contract. When role metadata
@@ -445,14 +483,19 @@ function oneSidedDetail(refComps, meta) {
   const comps = [...(refComps instanceof Set ? refComps : new Set(refComps || []))];
   const hasRoles = (roleNames(meta?.producers).length || roleNames(meta?.consumers).length);
   if (!hasRoles) return `only [${comps.join(', ')}]`;
-  const res = decodeResourceDirection(meta?.direction);
-  const P = res ? 'writer' : 'producer';
+  const kind = tokenKind(meta);
+  const res = kind === 'resource';
+  // An inproc token's roles are provider/consumer. It shares the WIRE spelling of the
+  // consumer side and has its own for the producer side, which is why this is a lookup and
+  // not a boolean: telling a user their crate seam has a "writer half missing" would be
+  // exactly as wrong as telling them their shared file has a "consumer half missing".
+  const P = res ? 'writer' : kind === 'inproc' ? 'provider' : 'producer';
   const C = res ? 'reader' : 'consumer';
   const producers = new Set(roleNames(meta.producers));
   const consumers = new Set(roleNames(meta.consumers));
   const refP = comps.filter((c) => producers.has(c));
   const refC = comps.filter((c) => consumers.has(c));
-  if (refP.length && refC.length) return `only [${comps.join(', ')}] (same compartment ${res ? 'writes & reads' : 'produces & consumes'} — no cross-compartment seam)`;
+  if (refP.length && refC.length) return `only [${comps.join(', ')}] (same compartment ${res ? 'writes & reads' : kind === 'inproc' ? 'provides & consumes' : 'produces & consumes'} — no cross-compartment seam)`;
   if (refP.length) return `only ${P} side [${refP.join(', ')}] — ${C} half missing`;
   if (refC.length) return `only ${C} side [${refC.join(', ')}] — ${P} half missing`;
   return `only [${comps.join(', ')}] (no compartment matches the contract's ${P}/${C} roles)`;
@@ -621,7 +664,15 @@ function violationDetail(meta) {
 
 // …and for an UNDECLARED PARTICIPANT: name the compartments whose code touches the
 // resource while the spec does not mention them at all.
-function undeclaredDetail(comps) {
+// The RESOURCE wording is unchanged, byte for byte. The inproc case is a genuinely
+// different finding and gets its own sentence: for a resource the likely cause is an
+// incomplete spec, while for an inproc id — a short symbol name by nature — the likely
+// cause is the id matching an unrelated symbol that merely spells the same word, and
+// telling a user to "add them to consumers:" would be advice to enshrine a false positive.
+function undeclaredDetail(comps, kind = 'resource') {
+  if (kind === 'inproc') {
+    return `referenced by [${comps.join(', ')}], which the spec names as neither provider nor consumer — either the seam is wider than declared (add them to consumers:), or, more likely for a short id, an unrelated symbol in that compartment simply spells the same name. wiregraph matches the identifier, not the definition it resolves to, so check before widening the spec.`;
+  }
   return `referenced by [${comps.join(', ')}], which the spec declares as neither writer nor reader — add them to writers:/readers:, or find out why they touch this resource. (wiregraph cannot tell a write from a read, so it cannot say which list they belong in.)`;
 }
 
@@ -648,15 +699,21 @@ function contractListing(db, project) {
   } catch { return null; } // pre-v4 db (no contract_tokens) — caller falls back
   const byName = new Map();
   for (const r of rows) {
-    if (!byName.has(r.name)) byName.set(r.name, { file: r.file || null, tokens: new Set(), resource: false });
+    if (!byName.has(r.name)) byName.set(r.name, { file: r.file || null, tokens: new Set(), kind: 'wire' });
     const e = byName.get(r.name);
     if (r.token) e.tokens.add(r.token);
-    if (r.direction && decodeResourceDirection(r.direction)) e.resource = true;
+    // A contract whose tokens carry a res:/inproc: direction came from that format's spec.
+    // First non-wire token decides; a contract's tokens all come from one spec, and a
+    // wire contract has no such token at all, so the wire listing is unchanged.
+    if (r.direction && e.kind === 'wire') {
+      const k = tokenKind({ direction: r.direction });
+      if (k !== 'wire') e.kind = k;
+    }
   }
-  if (!byName.size) return `No contracts in this project (${project}). Run /wiregraph-contracts to infer some, or add an AsyncAPI / *.resource.yaml spec under a contracts/ dir.`;
+  if (!byName.size) return `No contracts in this project (${project}). Run /wiregraph-contracts to infer some, or add an AsyncAPI / *.resource.yaml / *.inproc.yaml spec under a contracts/ dir.`;
   const out = [`${byName.size} contract(s) in this project — call trace_contract again with a name substring for the full drift report:`];
   for (const [name, e] of [...byName].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
-    out.push(`  ${name} — ${e.resource ? 'resource' : 'wire'} · ${e.tokens.size} token(s)${e.file ? ` · ${e.file}` : ''}`);
+    out.push(`  ${name} — ${e.kind} · ${e.tokens.size} token(s)${e.file ? ` · ${e.file}` : ''}`);
   }
   return out.join('\n');
 }
@@ -744,8 +801,8 @@ export function traceContract(db, project, contract, token, includeTests) {
         // Orthogonal again: a token can be satisfied by its declared roles AND still be
         // touched by a compartment nobody declared.
         const extra = undeclaredParticipants(comps, meta);
-        if (extra.length) undeclared.push([tok, undeclaredDetail(extra)]);
-        const errs = resourceMetaErrors(meta);
+        if (extra.length) undeclared.push([tok, undeclaredDetail(extra, tokenKind(meta))]);
+        const errs = contractMetaErrors(meta);
         if (errs.length) unreadable.push([tok, errs.join('; ')]);
       }
       const total = definedTokens.size;
@@ -769,12 +826,27 @@ export function traceContract(db, project, contract, token, includeTests) {
         if (violations.length > 40) driftLines.push(`       … +${violations.length - 40} more`);
       }
       if (undeclared.length) {
-        driftLines.push('  ⚠️ undeclared participant — a compartment REFERENCES the resource but the spec names it as neither writer nor reader (wiregraph detects references, NOT writes, so it cannot tell you which side it belongs on — but it can tell you the spec is incomplete):');
+        // The header follows the CONTRACT's kind, not each token's, because a contract's
+        // tokens all come from one spec. `every` (not `some`) keeps the resource header —
+        // and therefore every existing resource report — byte-identical.
+        const allInproc = undeclared.every(([t]) => tokenKind(definedTokens.get(t)) === 'inproc');
+        driftLines.push(allInproc
+          ? '  ⚠️ undeclared participant — a compartment REFERENCES the declared symbol but the spec names it as neither provider nor consumer. For an in-process contract this is as likely to be a FALSE POSITIVE as an incomplete spec: the join key is a bare symbol name matched as \\bname\\b, so an unrelated same-named symbol in a third compartment lands here too. Look before you widen the spec:'
+          : '  ⚠️ undeclared participant — a compartment REFERENCES the resource but the spec names it as neither writer nor reader (wiregraph detects references, NOT writes, so it cannot tell you which side it belongs on — but it can tell you the spec is incomplete):');
         for (const [t, detail] of undeclared.slice(0, 40)) driftLines.push(`       ${t} — ${detail}`);
         if (undeclared.length > 40) driftLines.push(`       … +${undeclared.length - 40} more`);
       }
       if (unreadable.length) {
-        driftLines.push('  🛑 unreadable resource metadata — the stored kind/semantics/single_writer did not decode, so the declared discipline for these tokens is UNKNOWN (rebuild the graph; if it persists the spec or the db is corrupt):');
+        // Same `every`-not-`some` rule as the undeclared header above, and for the same
+        // reason: a contract's tokens all come from ONE spec, so this picks the right
+        // vocabulary while keeping every existing resource report byte-identical. An inproc
+        // token's stored metadata is kind/boundary — it has no semantics and no
+        // single_writer — so naming those fields at it would be a report about a column
+        // that is not there.
+        const allInproc = unreadable.every(([t]) => tokenKind(definedTokens.get(t)) === 'inproc');
+        driftLines.push(allInproc
+          ? '  🛑 unreadable symbol metadata — the stored kind/boundary did not decode, so what these tokens declare about the seam is UNKNOWN (rebuild the graph; if it persists the spec or the db is corrupt):'
+          : '  🛑 unreadable resource metadata — the stored kind/semantics/single_writer did not decode, so the declared discipline for these tokens is UNKNOWN (rebuild the graph; if it persists the spec or the db is corrupt):');
         for (const [t, detail] of unreadable.slice(0, 40)) driftLines.push(`       ${t} — ${detail}`);
         if (unreadable.length > 40) driftLines.push(`       … +${unreadable.length - 40} more`);
       }

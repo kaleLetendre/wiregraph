@@ -100,12 +100,13 @@ function invalidatedSpecs(project) {
 const INVALIDATION_NOTE = [
   'Declaring compartments INVALIDATES contract specs that name a compartment — INFERRED and',
   'HAND-WRITTEN alike.',
-  'Specs record compartment NAMES (x-wiregraph-producers / -consumers, and a',
-  'resource spec\'s writers / readers) and those names are string-matched against each',
+  'Specs record compartment NAMES (x-wiregraph-producers / -consumers, a resource spec\'s',
+  'writers / readers, and an inproc spec\'s provider / consumers) and those names are',
+  'string-matched against each',
   'symbol\'s compartment. Any declared name that differs from the name the walk used',
   'leaves the old spec pointing at a compartment that no longer exists: the seam does',
-  'not error, it goes DARK — satisfied tokens flip to one-sided and the WIRE / RESOURCE',
-  'edges vanish. Re-run /wiregraph-contracts after the rebuild to re-infer them, and',
+  'not error, it goes DARK — satisfied tokens flip to one-sided and the WIRE / RESOURCE /',
+  'INPROC edges vanish. Re-run /wiregraph-contracts after the rebuild to re-infer them, and',
   'review any HAND-WRITTEN spec that names a compartment by hand.',
 ].join('\n');
 

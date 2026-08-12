@@ -6,6 +6,104 @@ the Neo4j-vs-SQLite parity/perf/token experiments — are kept out of this repo.
 
 ---
 
+## D13 — In-process contract ids are NOT put through the distinctiveness gate — 2026-08-12
+
+**Decision.** `*.inproc.yaml` ids skip `isDistinctive` (`src/extract/distinctive.js`), the gate every
+AsyncAPI and resource token must pass. Sub-distinctive ids are **accepted**; the loader names them
+once per spec, deliberately **without** a `⚠` marker. Only ids that cannot be a join key under any
+reading are refused: shorter than 3 characters, or on a small stop list of generic words (`type`,
+`state`, `name`, `result`, …).
+
+**Why.** The gate's camelCase arm is `/^[a-zA-Z][a-zA-Z]{9,}$/` — ten or more letters. The seam this
+contract type exists for is an ECS crate whose exported surface is `World` (5 characters), `Entity`
+(6) and `Scheduler` (9). **Every one of them is rejected by `isDistinctive`.** Applying the gate would
+have made the feature refuse its own reason for existing, and the alternative — a gate with a special
+case for symbol names — is a gate that no longer means anything. So the cost is *documented* rather
+than *gated*, in the parser header, the README and `docs/contracts.html`, in the one form that is
+actionable: `unreferenced` is strong evidence, `satisfied` is weak, and the blast radius of a false
+positive is bounded by the declared provider/consumer roles. The report is not a `⚠` and is not one
+line per id, because a short id is the **expected** shape here (unlike a resource id, where it is a
+mistake); a marker that fires on a healthy spec on every single build teaches the user to ignore the
+marker — the exact failure `resource-spec.js` already documents for its total-overlap warning.
+
+**Cost.** False positives are real, and *within* the declared compartments they are unbounded in
+count: N unrelated `World`-mentioning symbols on one side × M on the other is N×M candidate pairs,
+capped per ordered compartment pair with the truncation logged. So a too-common id inflates a seam
+between two compartments that genuinely share the symbol — it does not manufacture a seam between two
+that do not. The precise fix — intersect the id against the extractor's own symbol table, accepting an
+occurrence only where the file also defines or calls a symbol of that name — is a real cross-check and
+is deliberately **not** built: it needs a definition-site index covering types and traits, and this
+change makes no extractor changes. Recorded so it is a decision rather than an omission.
+
+## D14 — A provider that is also a consumer is REFUSED, where the resource analogue only warns — 2026-08-12
+
+**Decision.** An in-process symbol naming one compartment as both `provider` and a member of
+`consumers` is **skipped with a reason**. The equivalent resource case — a compartment in both
+`writers` and `readers` — is only *warned* about, and still loads.
+
+**Why.** The two look like the same mistake and are not. A resource legitimately has a compartment
+that both writes and reads it; `buildResourceEdges` skips the intra-compartment pairs and the
+cross-compartment ones still derive, so the spec still says something true and checkable. An
+in-process contract's *entire claim* is that direction is one-way — exactly one provider, by
+construction — and a compartment on both sides of one symbol is a self-contradiction with nothing left
+to check. This is the first mechanism in wiregraph that makes the architecture's **R6** ("direction is
+one-way where it can be") checkable at all; accepting the contradiction would mean the type quietly
+stopped checking the one thing it exists to check. A compartment using its own exported symbol is the
+call graph's job, not a seam.
+
+**Cost.** Two formats that otherwise look alike now behave differently on the same-shaped input, and a
+user who learned the resource rule will be surprised — the log line has to carry the whole explanation
+because nothing else will. The whole symbol is dropped rather than partially honored, so a spec with
+one bad entry silently loses that entry from the graph (logged, with the fix). And the check is
+**per declaration only**: nothing looks for a direction cycle across several contracts, so R6 is
+enforced narrowly. The README's R6 row now reads *enforced (per declaration)*, superseding this log's
+own **D12**, which lists R6 as unaddressed.
+
+## D15 — Resource ids and in-process ids share ONE join-key namespace — 2026-08-12
+
+**Decision.** One id-ownership map across both formats, not one per format: a differently-titled spec
+claiming an id another spec already owns has it dropped, whichever two formats they came from, with a
+hand-written spec always beating an inferred draft regardless of read order. A contract that loses
+*every* id this way is dropped rather than left as an empty node, and says so.
+
+**Why.** Both kinds of id are a bare name the user chose, both compile to `\bname\b`, and both land in
+the **same token index** in `matchContracts`. Two contracts claiming one name therefore mint
+`REFERENCES` to two contract nodes and derive the same seam twice — the identical defect whichever
+formats produced them, so it wants the identical rule. Splitting the namespace by format would let a
+`*.resource.yaml` and an `*.inproc.yaml` both claim `SESSION_TOKEN` and reintroduce precisely the
+defect the uniqueness rule exists to refuse.
+
+**Cost.** The two formats are coupled forever on naming: a project must keep constant names and
+exported symbol names globally distinct from each other, even though they describe unrelated things
+and a collision between them is far less likely to be a genuine mistake than a collision within one
+format. The diagnostic has to speak each format's own vocabulary so the message stays honest, which
+means one rule with two spellings and two places to keep in step. And a third join-key format added
+later inherits the namespace whether or not that is right for it — the registration is a single set,
+which is the point, but it is an opt-out nobody gets.
+
+## D16 — Cross-format title collisions resolve by FORMAT PRECEDENCE: asyncapi > resource > inproc — 2026-08-12
+
+**Decision.** When one title is declared by specs of more than one format, the strongest format's
+spec(s) survive and the rest are skipped with a warning naming every file by path. The precedence is
+fixed and explicit: **asyncapi > resource > inproc**. The pre-existing asyncapi-vs-resource message is
+kept byte for byte; any collision involving the new format gets a generalised one.
+
+**Why.** A title shared across formats cannot be merged — `mergeContracts` keeps only the first
+contributor's file and kind, so the resulting node would name one format while carrying the union of
+both formats' tokens, and every report about it would be wrong about what it is. Something has to
+lose. Before this, the loser was whichever spec was **read second**, i.e. a function of directory read
+order — so which contract existed could differ between two machines with identical trees. Fixed
+precedence makes the outcome reproducible and makes the warning actionable: it can name the survivor
+and the file to rename. The ordering is by incumbency — AsyncAPI is the original format and the only
+one with an external standard behind it, and resource predates in-process.
+
+**Cost.** The order is a convention, not a truth: no format is intrinsically more authoritative, so a
+user whose in-process spec is the real one has to rename the *other* file, and the message must say so
+clearly or it reads as wiregraph picking the wrong winner. It is also one more list that a fourth
+format must be appended to — a kind absent from the precedence list falls back into the `asyncapi`
+bucket rather than erroring, which is right for the two legacy values (`asyncapi` and unset) and would
+be silently wrong for a new one.
+
 ## D12 — Recursive mode implements a named architecture, and the docs say which of its rules wiregraph actually checks — 2026-08-12
 
 **Decision.** Treat **Compartments & Contracts** — a language- and tool-independent architecture

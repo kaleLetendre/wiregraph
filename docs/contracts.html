@@ -373,7 +373,7 @@
             <g class="node"><rect class="node-body" x="170" y="34" width="80" height="52" rx="9" stroke="var(--violet)"/><text class="node-label" x="210" y="56" text-anchor="middle" fill="var(--ink)" style="font-size:9.5px">app repo</text><text class="node-label" x="210" y="70" text-anchor="middle" fill="var(--dim)" style="font-size:8px">imports</text></g>
             <path class="edge" d="M170,60 L92,60" stroke-dasharray="5 5" stroke="var(--cyan)" opacity=".7" marker-end=""/>
             <text class="node-label" x="131" y="52" text-anchor="middle" fill="var(--cyan)" style="font-size:8px">createClient</text>
-            <text class="node-label" x="131" y="98" text-anchor="middle" fill="var(--dim)" style="font-size:8px">IMPORTS edge</text>
+            <text class="node-label" x="131" y="98" text-anchor="middle" fill="var(--dim)" style="font-size:8px">IMPORTS edge · or an INPROC contract</text>
           </svg>
         </div>
       </div>
@@ -562,6 +562,32 @@ channels:
 
     <div class="how-note reveal d1">
       <span class="b">⚑</span>
+      <div><b>In-process contracts</b> — the third type, and the one for two compartments in <i>one process</i>: a crate or module wall crossed by direct use of the other side's exported symbols, an <code>ecs</code> crate whose <code>World</code> and <code>Scheduler</code> the <code>sim</code> crate is built on. There is no wire and no shared file here, and wiregraph never resolves a call across a compartment boundary by name — so without a contract a four-crate workspace indexes as four disconnected islands. The join key is the one string both sides already spell identically: <b>the exported symbol name</b>. They live in a <code>&lt;name&gt;.inproc.yaml</code>, the roles are <b>provider</b> and <b>consumer</b>, and <code>trace_contract</code> / <code>path_between</code> walk the derived <code>INPROC</code> edges exactly like a wire.
+      <pre>title: ecs-sim                 <b># -> contract name; UNIQUE across every spec, all formats</b>
+boundary: crate                <b># crate | module — DOCUMENTATION of what the seam crosses</b>
+symbols:
+  - id: World                  <b># the exported SYMBOL NAME, bare</b>
+    kind: type                 <b># type | function | method | trait | macro — descriptive only</b>
+    provider: ecs              <b># the ONE compartment that DEFINES it</b>
+    consumers: [sim]           <b># the compartments that USE it</b>
+  - id: Scheduler
+    kind: type
+    provider: ecs
+    consumers: [sim]</pre>
+      <ul>
+        <li><b>Direction is one-way by construction.</b> There is exactly one <code>provider:</code>, and a spec naming a compartment as <i>both</i> provider and consumer of one symbol is <b>refused</b>, not warned about — a compartment using its own exported symbol is the call graph's job, not a seam. This is the one place wiregraph can check &ldquo;direction is one-way where it can be&rdquo; at all.</li>
+        <li><b>The id is a bare symbol name.</b> <code>World</code>, not <code>ecs::World</code> and not <code>World&lt;T&gt;</code> — the matcher builds <code>\bWorld\b</code>, and a qualified or parameterised spelling is not what the definition or the call sites write. An id containing <code>/</code> is rejected outright (a <code>/</code>-bearing token is matched as an HTTP route, which is wrong for a symbol), as is anything under 3 characters or a generic word (<code>type</code>, <code>state</code>, <code>name</code>…) that would match essentially every file ever written.</li>
+        <li><b>Short ids are ACCEPTED here, unlike everywhere else — deliberately.</b> Every wire and resource token must pass the distinctiveness gate; an in-process id cannot and still be useful, because the exported surface of an ECS crate <i>is</i> <code>World</code>, <code>Entity</code>, <code>Scheduler</code>, <code>Query</code>. Applying the gate would make the feature refuse its own reason for existing, so it is not applied — and the loader names the short ids once per spec instead of pretending they are safe.</li>
+        <li><b><code>unreferenced</code> is strong; <code>satisfied</code> is weak.</b> Read the drift report asymmetrically. 🔴 <b>unreferenced</b> means nothing in scope spells the name at all — act on it. <b>satisfied</b> means only <i>both compartments spell this name</i>, never <i>the consumer uses the provider's one</i>. Matching is literal and <b>case-sensitive</b> (a local <code>world</code> is safe); comments and <code>use</code>/<code>import</code> lines are excluded; but an unrelated same-named symbol <i>inside</i> a declared compartment is indistinguishable from the real use, and a re-export under another local name (<code>use ecs::World as W</code>), a type alias or a macro-pasted name is missed entirely.</li>
+        <li><b>The blast radius is bounded by the declared roles.</b> Only symbols in the declared <code>provider</code> compartment are paired with symbols in the declared <code>consumers</code>, so a stray <code>World</code> in a third crate can <b>never</b> mint an <code>INPROC</code> edge. It surfaces instead as an ⚠️ <b>undeclared participant</b> — the honest report, &ldquo;something else in this project spells this name, go look&rdquo; — and for this contract type that finding is as likely to be a false positive as an incomplete spec. Look before you widen the spec.</li>
+        <li><b>An <code>INPROC</code> edge is not a resolved call.</b> It says a symbol on each side spells the declared name. Calls still do not resolve across a compartment boundary; letting a contract <i>authorize</i> that resolution is a separate, later change.</li>
+        <li><b>There is no inference for this format.</b> <code>/wiregraph-contracts</code> drafts wire and resource specs; it never proposes an <code>*.inproc.yaml</code>. Write it by hand — there is no draft coming.</li>
+      </ul>
+      </div>
+    </div>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
       <div><b>The import detector is language-limited</b>, and it is worth knowing which side of the line you are on. An <code>IMPORTS</code> edge is resolved for <b>TypeScript/JavaScript</b> — a relative specifier, or a bare one matching another compartment's <code>package.json</code> <code>name</code> — and for <b>C</b>'s quoted <code>#include "…"</code>. <b>Python, Java, Kotlin and Rust emit no import candidates at all</b>: a Rust <code>use</code> path names a crate-relative <i>namespace</i> rather than a file, and a guess that lands on the wrong one is a false edge. In those languages an in-process cross-compartment link is described by a contract or it is not in the graph.</div>
     </div>
 
@@ -617,7 +643,7 @@ channels:
         <li><b>Declaring the constant is not using it.</b> The line that declares a named constant is excluded from matching on purpose — a constants module that only <i>defines</i> the name would otherwise become a phantom half of the seam. Each side needs at least one real reference, which the encoder and the switch above are.</li>
         <li><b>The name has to survive the distinctiveness gate.</b> <code>MSG_ENTITY_DELTA</code> passes (an underscore and 6+ characters). <code>Delta</code>, <code>kind</code> and <code>type</code> do not, and would be dropped — deliberately, since a generic token matches every file and manufactures seams.</li>
         <li><b>Both sides must spell it the same.</b> The join is the literal string; <code>MSG_ENTITY_DELTA</code> in Rust and <code>MsgEntityDelta</code> in TypeScript is two tokens, and the seam stays dark. A vendored pair of constants kept in step by hand is the price of a protocol with no strings in it.</li>
-        <li><b>Only YAML specs are read.</b> A <code>contracts/</code> directory holding prose contracts keeps them; wiregraph reads <code>*.asyncapi.yaml</code> and <code>*.resource.yaml</code> and ignores every other file. The spec is a machine-readable projection of the part that can be string-matched, not a replacement for the document.</li>
+        <li><b>Only YAML specs are read.</b> A <code>contracts/</code> directory holding prose contracts keeps them; wiregraph reads <code>*.asyncapi.yaml</code>, <code>*.resource.yaml</code> and <code>*.inproc.yaml</code> and ignores every other file. The spec is a machine-readable projection of the part that can be string-matched, not a replacement for the document.</li>
       </ul>
       </div>
     </div>

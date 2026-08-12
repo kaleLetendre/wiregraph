@@ -1,0 +1,28 @@
+title: ecs-sim
+boundary: crate
+symbols:
+  # Both sides spell it — the happy path. Also the SHORT-id case: `World` fails
+  # extract/distinctive.js outright, and render/ spells it too.
+  - id: World
+    kind: type
+    provider: ecs
+    consumers: [sim]
+  - id: Scheduler
+    kind: type
+    provider: ecs
+    consumers: [sim]
+  # A function rather than a type: `kind:` is descriptive and must not change matching.
+  - id: spawn_entity
+    kind: function
+    provider: ecs
+    consumers: [sim]
+  # Defined and used in ecs, named by nothing in sim -> ONE-SIDED (consumer half missing).
+  - id: ComponentStore
+    kind: type
+    provider: ecs
+    consumers: [sim]
+  # Named by NO code anywhere -> UNREFERENCED (the contract has drifted off the code).
+  - id: RetiredQuery
+    kind: type
+    provider: ecs
+    consumers: [sim]

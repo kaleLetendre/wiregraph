@@ -8,6 +8,16 @@
 // bare "test" substring — else "latest"/"fastest"/"contest" would be misfiltered).
 const isTest = (f) => !!f && (f.includes('tests/') || f.includes('/test/') || f.includes('.test.') || f.includes('_test.') || f.includes('/test_'));
 
+// The derived seam types, from the ONE registration point (store/sqlite.js), rather than
+// the `('WIRE','RESOURCE')` literal that used to be spelled out in four SQL strings here.
+// That literal was the same trap the prune/re-derive pair has, one layer up and quieter:
+// a newly registered seam type is built, stored, pruned and re-derived correctly, and is
+// then simply INVISIBLE in every export and in the visualizer, with nothing anywhere
+// saying so. Driving it from the list means a fourth type is exported the day it exists.
+// sqlite.js does not import this module, so this direction adds no cycle.
+import { DERIVED_EDGE_TYPES } from './sqlite.js';
+const SEAM_SQL = DERIVED_EDGE_TYPES.map((t) => `'${t}'`).join(',');
+
 function symbolNodes(db, project) {
   const m = new Map();
   for (const s of db.prepare('SELECT id,compartment,file,name,kind,startLine FROM symbols WHERE project=?').all(project)) {
@@ -34,7 +44,8 @@ function callsAdj(db, project) {
 }
 
 // gather for GEXF (symbol-centric: the derived cross-compartment seam surface —
-// WIRE (wire contracts) and RESOURCE (shared-resource contracts) — / --all
+// every DERIVED_EDGE_TYPES seam: WIRE (wire contracts), RESOURCE (shared-resource
+// contracts) and INPROC (in-process contracts) — / --all
 // CALLS+seams / --contract).
 export function gatherGexf(db, project, opts) {
   const syms = symbolNodes(db, project);
@@ -44,7 +55,7 @@ export function gatherGexf(db, project, opts) {
   const addSym = (id) => { const n = syms.get(id); if (n && keep(n.file)) { nodes.set(id, n); return true; } return false; };
 
   if (opts.contract) {
-    const wires = db.prepare("SELECT src,dst,token,direction,type FROM edges WHERE project=? AND type IN ('WIRE','RESOURCE') AND contract=?").all(project, opts.contract);
+    const wires = db.prepare(`SELECT src,dst,token,direction,type FROM edges WHERE project=? AND type IN (${SEAM_SQL}) AND contract=?`).all(project, opts.contract);
     if (!wires.length) return null;
     const seeds = new Set();
     for (const w of wires) {
@@ -73,14 +84,14 @@ export function gatherGexf(db, project, opts) {
 
   if (opts.all) {
     for (const [id, n] of syms) if (keep(n.file)) nodes.set(id, n);
-    for (const e of db.prepare("SELECT src,dst,type,token,contract,direction,cnt FROM edges WHERE project=? AND type IN ('CALLS','WIRE','RESOURCE')").all(project)) {
+    for (const e of db.prepare(`SELECT src,dst,type,token,contract,direction,cnt FROM edges WHERE project=? AND type IN ('CALLS',${SEAM_SQL})`).all(project)) {
       if (nodes.has(e.src) && nodes.has(e.dst)) links.push({ source: e.src, target: e.dst, type: e.type, token: e.token, contract: e.contract, direction: e.direction, count: e.cnt != null ? Number(e.cnt) : 1 });
     }
     return { nodes: [...nodes.values()], links };
   }
 
-  // default: the derived seam surface (wire + resource)
-  for (const e of db.prepare("SELECT src,dst,token,contract,direction,type FROM edges WHERE project=? AND type IN ('WIRE','RESOURCE')").all(project)) {
+  // default: the derived seam surface (every registered derived seam type)
+  for (const e of db.prepare(`SELECT src,dst,token,contract,direction,type FROM edges WHERE project=? AND type IN (${SEAM_SQL})`).all(project)) {
     if (addSym(e.src) && addSym(e.dst)) links.push({ source: e.src, target: e.dst, type: e.type, token: e.token, contract: e.contract, direction: e.direction });
   }
   return { nodes: [...nodes.values()], links };

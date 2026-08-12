@@ -1,9 +1,13 @@
 // Graph model: deterministic node/edge identity so re-runs MERGE cleanly.
 //
 // Node kinds : Compartment, File, Symbol, Contract
-// Edge kinds : IN_COMPARTMENT, DEFINED_IN, CALLS, REFERENCES, WIRE, RESOURCE
+// Edge kinds : IN_COMPARTMENT, DEFINED_IN, CALLS, REFERENCES, WIRE, RESOURCE, INPROC
 //              (WIRE = derived producer->consumer seam from a wire contract;
-//               RESOURCE = derived writer->reader seam from a resource contract)
+//               RESOURCE = derived writer->reader seam from a resource contract;
+//               INPROC = derived provider->consumer seam from an in-process contract.
+//               The three derived types are registered in ONE place —
+//               store/sqlite.js#DERIVED_EDGE_TYPES — which is what prunes and
+//               re-derives them; this list is the reader's map, not the registry.)
 //
 // Every id is a stable string derived from content, never a random value, so a
 // second build over unchanged code produces identical ids and the loader's

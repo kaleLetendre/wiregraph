@@ -54,3 +54,14 @@ Steps:
 Note: the page is interactive — drag nodes, scroll to zoom, click a legend swatch to
 hide a repo, hover an edge for the shared tokens/fields. Re-run any time; it
 overwrites the same file.
+
+**All three contract types are drawn, and none of them is labelled by type.** The contract
+views are built from `REFERENCES` edges — symbol (or compartment) → Contract node — so a
+**wire** (`*.asyncapi.yaml`), a **resource** (`*.resource.yaml`) and an **in-process**
+contract (`*.inproc.yaml`) all appear as Contract nodes with their drift color, and nothing
+on the page distinguishes which format a node came from. The page never draws the derived
+seam edges themselves (`WIRE` / `RESOURCE` / `INPROC`) in any mode — `--all` is `CALLS` +
+`REFERENCES` — so don't describe an arrow here as a wire or an in-process seam. Say
+"references the contract", which is what it is. To see the derived seam surface by edge type,
+including `INPROC`, use the Gephi export instead (`npm run export:gexf` in the plugin dir);
+`trace_contract` with no argument names each contract's kind (`wire` / `resource` / `inproc`).

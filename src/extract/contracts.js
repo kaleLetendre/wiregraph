@@ -19,6 +19,7 @@ import YAML from 'yaml';
 import { contractId } from '../model.js';
 import { walkSources } from './walk.js';
 import { parseResourceSpec } from './resource-spec.js';
+import { parseInprocSpec } from './inproc-spec.js';
 import { isDistinctive } from './distinctive.js';
 
 // isDistinctive now lives in its own leaf module (extract/distinctive.js) so BOTH
@@ -93,12 +94,12 @@ export function pathTokenRegex(tok) {
 // ============================================================================
 // THE WIRE CONTRACT FORMAT — the only description of it that exists anywhere.
 // ============================================================================
-// `docs/contracts.html` and `commands/wiregraph-contracts.md` document the RESOURCE
-// format (`*.resource.yaml`, see extract/resource-spec.js) and say nothing about this
-// one, so a user writing a wire spec by hand has had to reverse-engineer it from
-// `synthesizeAsyncApi`'s output. Written here, at the parser, because that is the
-// thing that cannot drift from the truth. A DOC WAVE MUST SURFACE THIS — it belongs in
-// docs/contracts.html and in the command file, neither of which this wave may edit.
+// The prose docs (`docs/contracts.html`, `commands/wiregraph-contracts.md`) now cover
+// all three spec formats, this one included — the doc wave the earlier note here asked
+// for happened. This block stays anyway, and NOT as a duplicate: prose about a format
+// can drift from the parser, and the parser cannot drift from itself. Treat what is
+// written here as the truth and the docs as the introduction; if they disagree, the
+// docs are wrong.
 //
 // FILE: `<anything>.asyncapi.yaml` (or `.yml`, case-insensitive) in a contracts dir.
 //
@@ -354,6 +355,18 @@ function parseContract(doc, f, log = () => {}, isDraft = null) {
 // discovery sensitive) would newly orphan dirs that are found today.
 const ASYNCAPI_SPEC_RE = /\.asyncapi\.ya?ml$/i;
 const RESOURCE_SPEC_NAME_RE = /\.resource\.ya?ml$/i;
+const INPROC_SPEC_NAME_RE = /\.inproc\.ya?ml$/i;
+
+// The kinds whose id is a bare JOIN KEY the user chose, rather than a token harvested out
+// of a schema. Both are subject to the same cross-contract uniqueness rule below, share ONE
+// id namespace (they end up in the SAME token index in matchContracts, so two contracts
+// claiming one name is the same defect whichever formats they came from), and a contract
+// that loses every id to a collision is dropped rather than left as an empty node.
+const JOIN_KEY_KINDS = new Set(['resource', 'inproc']);
+// Cross-format title precedence, strongest first. AsyncAPI is the incumbent and always
+// wins; resource predates inproc. Order-based "keep whichever was read first" is what this
+// replaces — see the collision block in loadAllContracts.
+const KIND_PRECEDENCE = ['asyncapi', 'resource', 'inproc'];
 // The filenames wiregraph itself writes for a generated draft: `wiregraph-inferred
 // .asyncapi.yaml` and `wiregraph-inferred.resource.yaml` (scripts/contracts.mjs) and the
 // same pair under `.wiregraph/inferred/` (scripts/lib/links.mjs).
@@ -368,7 +381,26 @@ const SPEC_PARSERS = [
   // needs NOTHING from resource-spec.js at module-evaluation time — only its hoisted
   // parser function. See extract/distinctive.js for why that matters.
   { match: RESOURCE_SPEC_NAME_RE, parse: (doc, f, log, isDraft) => parseResourceSpec(doc, f, log, isDraft) },
+  { match: INPROC_SPEC_NAME_RE, parse: (doc, f, log, isDraft) => parseInprocSpec(doc, f, log, isDraft) },
 ];
+
+// The filename patterns this module actually PARSES, exported for ONE purpose: the suite
+// pins them against src/contracts-dirs.js#SPEC_FORMATS, which is the list the contracts
+// FINGERPRINT hashes. Those two drifting apart is not a cosmetic mismatch — a format the
+// loader parses but the fingerprint cannot see is added, edited, moved between contracts
+// dirs and deleted without ever tripping incrementalBuild's contractsDrift refusal, so the
+// save loop re-derives its seams over REFERENCES rows minted under a scope that no longer
+// exists. That is exactly what shipped for `*.inproc.yaml`.
+export const SPEC_PARSER_PATTERNS = SPEC_PARSERS.map((p) => p.match);
+
+// filename -> the kind its parser will produce, for the ONE caller that needs the kind
+// BEFORE the parse (readContractsDir, which must hand isGeneratedDraft a kind). Kept
+// beside SPEC_PARSERS so a fourth format cannot add a parser and forget this.
+function specKindFor(f) {
+  if (RESOURCE_SPEC_NAME_RE.test(f)) return 'resource';
+  if (INPROC_SPEC_NAME_RE.test(f)) return 'inproc';
+  return 'asyncapi';
+}
 
 // ============================================================================
 // AUTHORSHIP — is this spec wiregraph's own draft, or a human's declaration?
@@ -516,6 +548,14 @@ export function isGeneratedDraft(doc, file, kind) {
   // BORN a draft, so a hand-written spec cannot claim draft status by pasting a digest in.
   if (stamped) return (marker || named) && stamped === specContentDigest(doc);
   if (marker) return true;
+  // INPROC HAS NO SHAPE TEST BECAUSE IT HAS NO EMITTER. Nothing in wiregraph writes an
+  // *.inproc.yaml — there is no inproc inference in phase 1 — so there is no "exactly what
+  // the generator emits" to compare against, and the filename alone must not be able to
+  // promote a hand-written spec to a draft. That was the precise defect the shape tests
+  // exist to fix (the OR with the filename destroyed user edits); reproducing it for a
+  // format with no drafts at all would be gratuitous. The digest and marker branches above
+  // still work, so an emitter added later needs only its own shape test here.
+  if (kind === 'inproc') return false;
   return named && (kind === 'resource' ? resourceDraftShaped(doc) : asyncApiDraftShaped(doc));
 }
 
@@ -558,7 +598,7 @@ function readContractsDir(entry, log) {
     // ONE authorship verdict per file, computed BEFORE the parse and handed to it, so the
     // parser's total-overlap warning and the loader's precedence rule key on the same
     // answer rather than on two independent readings of the marker.
-    const isDraft = isGeneratedDraft(doc, f, RESOURCE_SPEC_NAME_RE.test(f) ? 'resource' : 'asyncapi');
+    const isDraft = isGeneratedDraft(doc, f, specKindFor(f));
     const desc = parser.parse(doc, f, log, isDraft);
     // `file` stays the BASENAME (it is persisted to contracts.file and read back as a
     // display label). `specPath` is the full path, for DIAGNOSTICS only: a collision
@@ -792,12 +832,34 @@ export function loadAllContracts(graph, dirs, log = () => {}, opts = {}) {
   }
   const raw = [];
   for (const group of byId.values()) {
-    const wire = group.filter((c) => c.kind !== 'resource');
-    const res = group.filter((c) => c.kind === 'resource');
+    // THREE formats now, so "wire vs res" is no longer a partition. The rule is unchanged
+    // in substance — a title shared across FORMATS cannot merge, because mergeContracts
+    // keeps only the first contributor's file/kind and the node would name one format while
+    // carrying the union of both formats' tokens — but the winner is picked by FORMAT
+    // PRECEDENCE (KIND_PRECEDENCE) rather than by arrival order, so which spec survives
+    // does not depend on directory read order.
+    //
+    // The asyncapi-vs-resource message is UNCHANGED, byte for byte: that pair is the one
+    // users have already seen and the one the suite pins. Any collision involving inproc
+    // gets the generalised message.
+    const byKind = new Map();
+    for (const c of group) {
+      const k = KIND_PRECEDENCE.includes(c.kind) ? c.kind : 'asyncapi';
+      if (!byKind.has(k)) byKind.set(k, []);
+      byKind.get(k).push(c);
+    }
     let kept = group;
-    if (wire.length && res.length) {
-      log(`  ⚠ contract title collision: "${group[0].name}" is declared by BOTH ${wire.map(where).join(', ')} (asyncapi) and ${res.map(where).join(', ')} (resource) — a title must be unique ACROSS formats. Keeping the AsyncAPI spec(s), SKIPPING the resource spec(s). Rename the title in ${res.map(where).join(', ')}.`);
-      kept = wire;
+    if (byKind.size > 1) {
+      const winner = KIND_PRECEDENCE.find((k) => byKind.has(k));
+      const losers = [...byKind].filter(([k]) => k !== winner);
+      const lost = losers.flatMap(([, cs]) => cs);
+      if (byKind.size === 2 && winner === 'asyncapi' && byKind.has('resource')) {
+        log(`  ⚠ contract title collision: "${group[0].name}" is declared by BOTH ${byKind.get('asyncapi').map(where).join(', ')} (asyncapi) and ${byKind.get('resource').map(where).join(', ')} (resource) — a title must be unique ACROSS formats. Keeping the AsyncAPI spec(s), SKIPPING the resource spec(s). Rename the title in ${byKind.get('resource').map(where).join(', ')}.`);
+      } else {
+        const named = (k) => `${byKind.get(k).map(where).join(', ')} (${k})`;
+        log(`  ⚠ contract title collision: "${group[0].name}" is declared by specs of ${byKind.size} DIFFERENT formats — ${[...byKind.keys()].map(named).join(' and ')} — and a title must be unique ACROSS formats. Keeping the ${winner} spec(s), SKIPPING ${lost.map(where).join(', ')}. Rename the title in ${lost.map(where).join(', ')}.`);
+      }
+      kept = byKind.get(winner);
     }
     // --- a title shared ACROSS AsyncAPI MAJORS is MERGED, and SAID OUT LOUD -------
     // Considered and deliberately NOT refused. The channel-address rule is per DOC —
@@ -855,21 +917,33 @@ export function loadAllContracts(graph, dirs, log = () => {}, opts = {}) {
   // a statement of intent by the person the tool is for, and no read order should be able
   // to overrule it. Two HAND-WRITTEN specs colliding is still first-come — that is a real
   // ambiguity between two human declarations and the warning tells them to rename one.
-  const idOwner = new Map(); // resource id -> descriptor that owns it
-  const resourceRaw = raw.filter((c) => c.kind === 'resource');
-  const byAuthorship = [...resourceRaw.filter((c) => !c.inferred), ...resourceRaw.filter((c) => c.inferred)];
+  //
+  // INPROC IDS RIDE THE SAME RULE, IN THE SAME NAMESPACE. An inproc id is a join key in
+  // exactly the sense a resource id is — a bare name the user chose, compiled to `\bname\b`
+  // and put into the SAME token index in matchContracts — so two differently-titled specs
+  // claiming one name mint REFERENCES to two contract nodes and derive the same seam twice,
+  // whichever two formats they came from. One namespace, not one per format: splitting them
+  // would let a `*.resource.yaml` and a `*.inproc.yaml` both claim `SESSION_TOKEN` and
+  // reintroduce precisely the defect this block exists to refuse.
+  const idOwner = new Map(); // join-key id -> descriptor that owns it
+  const joinKeyRaw = raw.filter((c) => JOIN_KEY_KINDS.has(c.kind));
+  const byAuthorship = [...joinKeyRaw.filter((c) => !c.inferred), ...joinKeyRaw.filter((c) => c.inferred)];
   for (const c of byAuthorship) {
     const keep = [];
+    // The resource wording is UNCHANGED, byte for byte — it is what users have seen and
+    // what the suite pins. An inproc spec speaks its own vocabulary rather than being told
+    // its symbol name is a "resource id".
+    const noun = c.kind === 'inproc' ? 'symbol id' : 'resource id';
     for (const t of c.tokens) {
       const prior = idOwner.get(t);
       if (prior && prior.id !== c.id) {
         const why = c.inferred && !prior.inferred
           ? ' — a HAND-WRITTEN spec always wins over an inferred draft, whatever order they are read in'
-          : ' — a resource id is the join key and must be unique across every differently-titled spec';
+          : ` — a ${c.kind === 'inproc' ? 'symbol name' : 'resource id'} is the join key and must be unique across every differently-titled spec`;
         const fix = c.inferred && !prior.inferred
           ? ` Delete "${t}" from the draft (or the whole draft) — inference should not have re-proposed a seam you have already declared.`
           : ' Rename one of them.';
-        log(`  ⚠ ${where(c)}: resource id "${t}" is ALREADY declared by ${where(prior)} (contract "${prior.name}")${why}. Dropping it from "${c.name}";${fix}`);
+        log(`  ⚠ ${where(c)}: ${noun} "${t}" is ALREADY declared by ${where(prior)} (contract "${prior.name}")${why}. Dropping it from "${c.name}";${fix}`);
         continue;
       }
       idOwner.set(t, c);
@@ -888,11 +962,11 @@ export function loadAllContracts(graph, dirs, log = () => {}, opts = {}) {
   // derives nothing, and would report as 100% drift on every build — and the precedence
   // rule exists precisely so the SURVIVING owner is the one worth looking at). What was
   // missing was the sentence that makes the disappearance findable.
-  const erased = raw.filter((c) => c.kind === 'resource' && !c.tokens.length);
+  const erased = raw.filter((c) => JOIN_KEY_KINDS.has(c.kind) && !c.tokens.length);
   for (const c of erased) {
-    log(`  ⚠ ${where(c)}: contract "${c.name}" has NO surviving resource ids — every one was dropped above — so NO contract node is created for it at all. trace_contract will answer "No contract matches" for "${c.name}" until the collision is resolved.`);
+    log(`  ⚠ ${where(c)}: contract "${c.name}" has NO surviving ${c.kind === 'inproc' ? 'symbol' : 'resource'} ids — every one was dropped above — so NO contract node is created for it at all. trace_contract will answer "No contract matches" for "${c.name}" until the collision is resolved.`);
   }
-  const usable = raw.filter((c) => c.kind !== 'resource' || c.tokens.length);
+  const usable = raw.filter((c) => !JOIN_KEY_KINDS.has(c.kind) || c.tokens.length);
 
   const merged = mergeContracts(usable);
   validateRoleCompartments(graph, merged, log, opts.knownCompartments);
@@ -900,7 +974,10 @@ export function loadAllContracts(graph, dirs, log = () => {}, opts = {}) {
     graph.addContract({ id: c.id, name: c.name, kind: c.kind || 'asyncapi', file: contractFileLabel(graph.project, c), tokenMeta: contractTokenMeta(c) });
   }
   const nRes = merged.filter((c) => c.kind === 'resource').length;
-  log(`  loaded ${merged.length} contract(s) from ${dirs.length} dir(s)${nRes ? ` (${nRes} resource)` : ''}; ${merged.reduce((n, c) => n + c.tokens.length, 0)} wire tokens`);
+  // A SEPARATE segment, appended only when non-zero, so a project with no inproc spec logs
+  // the byte-identical line it always has.
+  const nInp = merged.filter((c) => c.kind === 'inproc').length;
+  log(`  loaded ${merged.length} contract(s) from ${dirs.length} dir(s)${nRes ? ` (${nRes} resource)` : ''}${nInp ? ` (${nInp} inproc)` : ''}; ${merged.reduce((n, c) => n + c.tokens.length, 0)} wire tokens`);
   return merged;
 }
 
@@ -952,7 +1029,15 @@ function validateRoleCompartments(graph, contracts, log, extraKnown = null) {
       if (!missing.length) continue;
       const names = [...new Set(missing)].join(', ');
       const knownList = [...known].sort().join(', ');
-      if (isResource) {
+      if (c.kind === 'inproc') {
+        // THE SAME CHECK, in this type's vocabulary. It matters more here than anywhere
+        // else: an inproc contract's roles are the ONLY thing bounding a short symbol
+        // name's blast radius (buildInprocEdges pairs declared provider with declared
+        // consumers and nothing else), so a misspelled compartment does not merely lose a
+        // seam — it removes the bound, and every reference to the id in the real
+        // compartment then reports as an UNDECLARED PARTICIPANT instead.
+        log(`  ⚠ ${c.file}: symbol "${tok}" names provider/consumer compartment(s) [${names}] that do not exist in this graph. Known compartments: [${knownList}]. A misspelled name derives NO INPROC edge and reports as a MISSING SEAM HALF (and turns the real compartment's references into UNDECLARED PARTICIPANTS), not as an error — fix the spec or index that compartment.`);
+      } else if (isResource) {
         log(`  ⚠ ${c.file}: resource "${tok}" names compartment(s) [${names}] that do not exist in this graph. Known compartments: [${knownList}]. A misspelled name reports as a MISSING SEAM HALF, not as an error — fix the spec or index that compartment.`);
       } else {
         log(`  ⚠ ${c.file}: channel "${tok}" names producer/consumer compartment(s) [${names}] that do not exist in this graph. Known compartments: [${knownList}]. A role naming no compartment derives NO WIRE edge and reports as a MISSING SEAM HALF, not as an error — a compartment rename takes every bare-basename x-wiregraph-producers/x-wiregraph-consumers name dark at once. Fix the spec or index that compartment.`);
@@ -1503,7 +1588,14 @@ export function buildWireEdges(graph, contracts, log = () => {}) {
   // request/reply orientation and no `c2s` direction), so they are excluded here and
   // derived by buildResourceEdges instead. Dropping them from cById is what keeps a
   // resource token from also minting a WIRE edge below.
-  const merged = mergeContracts(contracts).filter((c) => c.kind !== 'resource');
+  //
+  // INPROC IS EXCLUDED FOR THE SAME REASON, and the exclusion is not optional. An inproc
+  // contract ALWAYS carries roles, so without this line it would satisfy `anyRoles`, take
+  // the producers->consumers branch and mint a WIRE edge labelled `c2s` for every seam —
+  // silently doubling every in-process seam into a second, wrong edge type that every
+  // export and visualization reads as a network call. mergeContracts sets `kind` on every
+  // merged contract, so a kind-less descriptor cannot slip through as inproc.
+  const merged = mergeContracts(contracts).filter((c) => c.kind !== 'resource' && c.kind !== 'inproc');
   const cById = new Map(merged.map((c) => [c.id, c]));
   // Two ways to orient a WIRE edge: the producer/consumer compartments the
   // inference encoded per channel (x-wiregraph-*, read into c.wireRoles), or — for
@@ -1637,4 +1729,85 @@ export function buildResourceEdges(graph, contracts, log = () => {}) {
   }
   log(`  derived ${resource} RESOURCE edges (writer->reader); ${gaps} one-sided resource(s) (no writer or no reader = gap)${truncated ? `; ${truncated} resource/compartment-pair(s) hit the fan-out cap` : ''}`);
   return { resource, gaps, truncated };
+}
+
+// Derive direct symbol -> symbol INPROC edges — the in-process-contract analogue of
+// buildResourceEdges. Same shape (group the REFERENCES already in the graph by
+// contractId|token, then cross the two role sides), different semantics again:
+//
+//   * roles are PROVIDER -> CONSUMERS (wireRoles.producers -> wireRoles.consumers). The
+//     producer side always holds exactly ONE compartment — the parser refuses more — so
+//     unlike a resource seam this one cannot fan out in both directions;
+//   * the direction label is 'p2c' (provider to consumer), never 'c2s'/'s2c' (there is no
+//     client/server and no round trip) and never 'w2r' (nothing is written);
+//   * there is NO env-var fallback, for the same reason buildResourceEdges has none: the
+//     spec always carries its roles, so an inproc-only project derives its seams with no
+//     configuration at all.
+//
+// WHY A DISTINCT EDGE TYPE rather than a flavour of RESOURCE: an in-process call across a
+// crate boundary and a shared file on disk are different couplings with different
+// remedies, and collapsing them would make `path_between` explain a direct type dependency
+// as shared state. Everything that prunes or re-derives WIRE/RESOURCE must handle INPROC
+// too (store/sqlite.js: DERIVED_EDGE_TYPES drives pruneFile + rederiveWireEdges) or the
+// seam is deleted on every file save and never rebuilt.
+//
+// WHAT THIS DOES NOT DO, stated because the edge looks like more than it is: an INPROC edge
+// means "a symbol in the provider compartment and a symbol in the consumer compartment both
+// spell this declared name". It is NOT a resolved call — resolve.js still refuses to link
+// calls across a compartment boundary by name, and letting a contract AUTHORIZE that
+// resolution is deliberately out of scope here.
+export function buildInprocEdges(graph, contracts, log = () => {}) {
+  // Cheap discriminator FIRST — same reason as buildResourceEdges: mergeContracts walks
+  // every contract, token, direction and role set, and this runs on every file save.
+  if (!contracts.some((c) => c.kind === 'inproc')) return { inproc: 0, gaps: 0 };
+  const merged = mergeContracts(contracts).filter((c) => c.kind === 'inproc');
+  if (!merged.length) return { inproc: 0, gaps: 0 };
+  const cById = new Map(merged.map((c) => [c.id, c]));
+  const groups = groupContractReferences(graph);
+
+  let inproc = 0, gaps = 0, truncated = 0;
+  const seen = new Set();
+  for (const [key, syms] of groups) {
+    const [cid, token] = splitGroupKey(key);
+    const c = cById.get(cid);
+    if (!c) continue;
+    const roles = c.wireRoles && c.wireRoles.get(token);
+    if (!roles) continue;
+    // THE ROLE FILTER IS THE FALSE-POSITIVE BOUND, not just an orientation step. An inproc
+    // id is a short symbol name by nature (see extract/inproc-spec.js LIMITATION #2), so a
+    // third compartment that happens to spell the same name WILL mint REFERENCES — and it
+    // is these two filters that stop it from ever becoming a seam. It surfaces instead as
+    // an undeclared participant in trace_contract, which is the honest report.
+    const providers = syms.filter((s) => roles.producers.has(s.compartment));
+    const consumers = syms.filter((s) => roles.consumers.has(s.compartment));
+    // One side missing = the seam's other half is absent (unindexed, renamed, or reached
+    // only through an alias the matcher cannot see). Made visible by absence, exactly as
+    // for a wire and a resource.
+    if (!providers.length || !consumers.length) { gaps++; continue; }
+
+    // Cross-compartment only. The parser already refuses a spec that names one compartment
+    // as both provider and consumer of an id, so unlike the resource case this guard is a
+    // backstop rather than the primary defence — but it must stay, because a compartment
+    // can be the declared provider of one id and a declared consumer of another in the same
+    // contract, and the role sets are read per token from a merged contract.
+    for (const [p, q] of crossCompartmentPairs(providers, consumers, MAX_PAIRS_PER_TOKEN,
+      (fc, tc, dropped, total) => {
+        truncated++;
+        log(`  ⚠ fan-out cap: symbol "${token}" (contract "${c.name}") — ${fc} -> ${tc} has ${total} provider/consumer symbol pairs, capped at ${MAX_PAIRS_PER_TOKEN}; ${dropped} INPROC edge(s) NOT derived. A short, common id is the usual cause — most of those pairs are unrelated symbols that merely spell the same name.`);
+      })) {
+      if (p.id === q.id) continue;
+      // Keyed by CONTRACT too — same reason as buildWireEdges/buildResourceEdges, and the
+      // same key shape the store's dedup uses, so a re-derive can never collapse two
+      // contracts' seams where a full rebuild keeps both.
+      const k = `${c.id}|${p.id}->${q.id}|${token}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      graph.addEdge('INPROC', p.id, q.id, {
+        token, contract: c.name, direction: 'p2c', evidence: 'inproc-derived',
+      });
+      inproc++;
+    }
+  }
+  log(`  derived ${inproc} INPROC edges (provider->consumer); ${gaps} one-sided symbol(s) (no provider or no consumer = gap)${truncated ? `; ${truncated} symbol/compartment-pair(s) hit the fan-out cap` : ''}`);
+  return { inproc, gaps, truncated };
 }
