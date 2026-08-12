@@ -1,0 +1,11 @@
+asyncapi: 3.0.0
+# INNER contract, scope root <root>/client. /ui/frame is mentioned by server/netsrv/net.js
+# too, and MUST NOT match there — that is the whole point of scoping.
+info:
+  title: Client Inner Wire
+  version: 1.0.0
+channels:
+  frame:
+    address: /ui/frame
+    x-wiregraph-producers: [world_state]
+    x-wiregraph-consumers: [netcli]

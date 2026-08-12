@@ -51,7 +51,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  src["📁 your code<br/>C · Python · Java · Kotlin · TS/JS"]:::src --> ts["🌳 tree-sitter<br/>parse"]:::proc --> db[("🗄️ graph.db<br/>symbols + links")]:::store
+  src["📁 your code<br/>C · Python · Java · Kotlin · Rust · TS/JS"]:::src --> ts["🌳 tree-sitter<br/>parse"]:::proc --> db[("🗄️ graph.db<br/>symbols + links")]:::store
   db --> mcp["🔧 wiregraph<br/>tools"]:::proc --> claude(["🤖 Claude reads<br/>only what it needs"]):::ai
   edit["✏️ you edit code"]:::edit -. auto re-index .-> db
   classDef src fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a
@@ -86,8 +86,8 @@ them.
 | Python | ✅ supported |
 | Java | ✅ supported |
 | Kotlin | ✅ supported |
+| Rust | ✅ supported |
 | Go | 🔜 planned |
-| Rust | 🔜 planned |
 | C++ | 🔜 planned |
 
 ## Install
@@ -217,7 +217,9 @@ can't connect that, so wiregraph bridges them through that shape, described as a
 
 - A directory at the workspace root named `contracts`, `asyncapi`, or `*-contracts`
   (e.g. `api-contracts`) — or pass `--contracts <dir>`.
-- Inside it, one or more **AsyncAPI 3.0** specs named `*.asyncapi.yaml` / `*.asyncapi.yml`
+- Inside it, one or more **AsyncAPI** specs named `*.asyncapi.yaml` / `*.asyncapi.yml`
+  (2.x and 3.x are both read), and/or **resource contracts** named `*.resource.yaml`
+  for coupling through a shared file, socket, table or shared-memory region
   (other files are ignored).
 - Nothing if you don't have specs — no contracts dir simply means no cross-compartment edges;
   everything else still works.

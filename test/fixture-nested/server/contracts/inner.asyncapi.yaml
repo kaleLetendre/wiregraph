@@ -1,0 +1,16 @@
+asyncapi: 3.0.0
+# INNER contract, scope root <root>/server. Governs ecs <-> sim <-> netsrv and NOTHING
+# outside server/. Note it re-declares /api/state: for code under server/ this contract
+# wins the longest-prefix contest against the outer one.
+info:
+  title: Server Inner Wire
+  version: 1.0.0
+channels:
+  tick:
+    address: /internal/tick
+    x-wiregraph-producers: [ecs]
+    x-wiregraph-consumers: [sim]
+  state:
+    address: /api/state
+    x-wiregraph-producers: [sim]
+    x-wiregraph-consumers: [netsrv]

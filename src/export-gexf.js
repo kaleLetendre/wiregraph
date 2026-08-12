@@ -98,7 +98,7 @@ async function main() {
   let built;
   try {
     built = gatherGexf(db, project, opts);
-    if (!built) { process.stderr.write(`No WIRE edges for contract "${opts.contract}".\n`); process.exit(1); }
+    if (!built) { process.stderr.write(`No derived seam edges (WIRE/RESOURCE) for contract "${opts.contract}".\n`); process.exit(1); }
   } finally { db.close(); }
 
   const links = collapse(built.links);

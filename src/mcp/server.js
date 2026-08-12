@@ -23,10 +23,10 @@ import { z } from 'zod';
 import { existsSync, realpathSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { connect, schemaVersion, SCHEMA_VERSION } from '../store/sqlite.js';
+import { connect, schemaVersion, schemaStatus, SCHEMA_VERSION } from '../store/sqlite.js';
 import * as Q from '../store/sqlite-query.js';
-import { runBuild, reindexFiles, reconcileRepoByContent } from '../build.js';
-import { readState, updateState, findIndexedRoot, wiregraphDir, owningMember, statusAdvisories } from '../../scripts/lib/state.mjs';
+import { runBuild, reindexFiles, reconcileRepoByContent, resolveDbPath } from '../build.js';
+import { readState, updateState, findIndexedRoot, wiregraphDir, owningMember, fanOutGraphs, statusAdvisories, modeLine, buildWarningLines } from '../../scripts/lib/state.mjs';
 import { changedSince, projectRepos, upstreamDivergence } from '../../scripts/lib/git.mjs';
 import { record, estTokens } from '../../scripts/lib/metrics.mjs';
 
@@ -92,8 +92,24 @@ function withDb(fn, { requireIndexed = true } = {}) {
 const FRESH_TTL_MS = 1500;
 let lastFreshAt = 0;
 let freshInFlight = null;      // single-flight: the in-progress ensureFresh reindex, if any
-let schemaConfirmed = false;   // set once the on-disk db is known to be on the current schema (per process)
-let schemaHealPromise = null;  // dedups a concurrent schema-migration rebuild
+let lastFreshError = null;     // why the last self-heal failed, surfaced on every read until one succeeds
+
+// --- schema gate ------------------------------------------------------------
+// All three of these are keyed BY GRAPH ROOT, not per process. Every incremental this
+// server runs fans out (reindexFiles {fanOut:true}) into the owning member's graph plus
+// every graph linked to it, each against its OWN db — so the gate has to hold per graph.
+// A single boolean/promise pair let one graph's verdict speak for all of them: healing
+// the project marked a stale linked PEER as confirmed, and the very next read ran the
+// exact incremental this gate exists to prevent against the peer's old-schema db.
+const schemaConfirmed = new Set();   // graph roots proven to be on the current schema (per process)
+const schemaHealPromise = new Map(); // graph root -> its in-flight migration rebuild (single-flight, PER graph)
+const schemaBlocked = new Map();     // graph root -> why its migration failed (surfaced, not swallowed)
+
+// Injectable deps so a test can drive the gate's per-graph bookkeeping and its
+// single-flight without real dbs or real rebuilds (see __setTestHooks below).
+let _runBuild = runBuild;
+let _schemaStatus = schemaStatus;
+let _fanOutGraphs = fanOutGraphs;
 
 // A schema bump (e.g. v1 -> v2) leaves an existing graph on the OLD schema. Until
 // now the read tools returned "run /wiregraph-rebuild" and the model fell back to
@@ -102,27 +118,49 @@ let schemaHealPromise = null;  // dedups a concurrent schema-migration rebuild
 // loader's migrate-on-reset path). It's deduped within the process and AWAITED by
 // every caller before serving, so a fan-out of verifier subagents triggers a
 // single rebuild and none of them ever sees the mismatch and bails to grep.
+//
+// Sequential, like the hook worker's healOutdatedSchemas: the per-graph promises already
+// stop two CALLERS from duplicating one graph's rebuild, and rebuilding several graphs at
+// once only multiplies the walk+parse cost. A second caller arriving mid-heal joins each
+// graph's in-flight promise in turn and so still resolves only once every graph is safe.
 async function ensureSchemaCurrent() {
-  if (schemaConfirmed) return;
-  const p = dbPath();
-  if (!existsSync(p)) return; // not built at all → withDb surfaces NOT_BUILT, not a schema issue
-  let v = null, db;
-  try { db = connect(p, { readonly: true }); v = schemaVersion(db); }
-  catch { return; }
-  finally { try { db?.close(); } catch { /* */ } }
-  if (v === SCHEMA_VERSION) { schemaConfirmed = true; return; }
-  // A NEWER db (written by a later wiregraph) must NOT be auto-rebuilt — a reset
-  // rebuild recreates the tables at THIS (older) schema, silently downgrading and
-  // discarding whatever the newer version stored. Leave it; withDb surfaces the
-  // "update wiregraph" message instead of quietly destroying data.
-  if (v > SCHEMA_VERSION) return;
-  if (!schemaHealPromise) {
-    schemaHealPromise = runBuild({ target: PROJECT, project: PROJECT, reset: true })
-      .then(() => { schemaConfirmed = true; lastFreshAt = Date.now(); }) // just rebuilt → also fresh
-      .catch(() => { /* withDb's mismatch message remains the backstop */ })
-      .finally(() => { schemaHealPromise = null; });
-  }
-  await schemaHealPromise;
+  for (const g of _fanOutGraphs(PROJECT)) await healGraphSchema(g);
+}
+
+// One graph. `missing` (nothing built) is left to withDb's NOT_BUILT, and `newer` is left
+// alone deliberately — a reset rebuild recreates the tables at THIS (older) schema,
+// silently downgrading and discarding whatever the newer wiregraph stored, so withDb's
+// "update wiregraph" message is the right answer rather than quietly destroying data.
+// Neither is CONFIRMED, so the (cheap, 64-byte) probe re-runs on the next read and picks
+// up a db that has since been built or downgraded.
+async function healGraphSchema(g) {
+  if (schemaConfirmed.has(g)) return;
+  const running = schemaHealPromise.get(g);
+  if (running) return running;                  // this graph is already being migrated → join it
+  const status = _schemaStatus(resolveDbPath({}, g));
+  if (status === 'current') { schemaConfirmed.add(g); schemaBlocked.delete(g); return; }
+  if (status !== 'older') return;
+  // Registered BEFORE the await so a caller that arrives while this rebuild runs finds it
+  // and joins, rather than starting a second one.
+  const p = _runBuild({ target: g, project: g, reset: true })
+    .then(() => {
+      schemaConfirmed.add(g);
+      schemaBlocked.delete(g);
+      if (g === PROJECT) lastFreshAt = Date.now(); // a reset build is a complete re-derivation → also fresh
+    })
+    .catch((e) => { schemaBlocked.set(g, e?.message?.split('\n')[0] || String(e)); })
+    .finally(() => { schemaHealPromise.delete(g); });
+  schemaHealPromise.set(g, p);
+  await p;
+}
+
+// The graphs whose migration was ATTEMPTED and failed, rendered for a user-facing line —
+// or null when every graph is safe to write. withDb's mismatch message only ever inspects
+// THIS project's db, so a peer stuck on an old schema is invisible to it; without this the
+// server would go on running the very incremental the gate refused to allow.
+function schemaBlockedNote() {
+  if (!schemaBlocked.size) return null;
+  return [...schemaBlocked].map(([g, why]) => `${g === PROJECT ? 'this project' : g}: ${why}`).join('; ');
 }
 
 // Read-only probe: of the files git says changed, which actually differ from what
@@ -159,32 +197,71 @@ async function ensureFresh() {
   if (now - lastFreshAt < FRESH_TTL_MS) return;   // fast path: recently fresh
   if (freshInFlight) return freshInFlight;         // a refresh is running → await it (no stampede, no stale serve)
   freshInFlight = (async () => {
+    // A graph whose migration FAILED is one an incremental must not touch — writing into
+    // an old-schema db is exactly what the gate exists to prevent, and loadGraph would
+    // then stamp it as current and defeat every later check. Refuse, and report it
+    // through the same channel a refused reindex uses (freshRead prepends it to every
+    // answer until a refresh succeeds); lastFreshAt stays unclaimed, so the next read
+    // retries the migration rather than suppressing it for a TTL. The hook worker makes
+    // the same trade — healOutdatedSchemas skips the whole incremental round.
+    const blocked = schemaBlockedNote();
+    if (blocked) { lastFreshError = `db schema is older than this wiregraph and the migrating rebuild failed — ${blocked}`; return; }
     const stale = _staleNow();
-    if (!stale.length) { lastFreshAt = Date.now(); return; }
+    if (!stale.length) { lastFreshAt = Date.now(); lastFreshError = null; return; }
     // A stale file may live under a linked member — reindexFiles attributes each to
     // its owning member and fans the update into every graph that includes it, so a
     // read stays self-healing across the whole union, not just this project's tree.
-    try { await _reindexFiles(stale, PROJECT, { fanOut: true }); lastFreshAt = Date.now(); } // claim window only on success
-    catch { /* best-effort; leave lastFreshAt so the next read retries */ }
+    try { await _reindexFiles(stale, PROJECT, { fanOut: true }); lastFreshAt = Date.now(); lastFreshError = null; } // claim window only on success
+    catch (e) {
+      // RECORD IT. This used to be a bare `catch {}`, which made the read path the most
+      // dangerous of the three incremental entry points: when incrementalBuild REFUSES
+      // (the declared compartments moved since the last full build) every read swallowed
+      // the refusal and quietly served the PRE-EDIT graph, with nothing anywhere saying
+      // so. Recovery normally arrives via the SessionStart catch-up's escalation, but
+      // with posture `off` that hook exits before it runs, so the project stayed wedged
+      // and silently wrong indefinitely. freshRead prepends this to the next answer.
+      // Best-effort is still the right POLICY for a self-heal — it must not fail the
+      // read — but "best-effort" was never supposed to mean "unobservable".
+      lastFreshError = e?.message || String(e);
+    }
   })();
   try { return await freshInFlight; } finally { freshInFlight = null; }
 }
 
 // --- test hooks -------------------------------------------------------------
 // Injection points so test/run.mjs can exercise ensureFresh's concurrency and
-// advance/retry behavior without a live db or git. No effect on the CLI path.
-function __setTestHooks({ reindexFiles: rf, staleNow: sn } = {}) {
+// advance/retry behavior, and the schema gate's per-graph bookkeeping, without a live
+// db or git. No effect on the CLI path. ensureSchemaCurrent is exported too so a test
+// can drive it against REAL dbs (PROJECT is resolved at import, so that half runs in a
+// child process with CLAUDE_PROJECT_DIR pointed at the fixture).
+function __setTestHooks({ reindexFiles: rf, staleNow: sn, runBuild: rb, schemaStatus: ss, fanOutGraphs: fg } = {}) {
   if (rf) _reindexFiles = rf;
   if (sn) _staleNow = sn;
+  if (rb) _runBuild = rb;
+  if (ss) _schemaStatus = ss;
+  if (fg) _fanOutGraphs = fg;
 }
 function __resetFresh() {
   _reindexFiles = reindexFiles;
   _staleNow = staleNow;
+  _runBuild = runBuild;
+  _schemaStatus = schemaStatus;
+  _fanOutGraphs = fanOutGraphs;
   lastFreshAt = 0;
   freshInFlight = null;
+  lastFreshError = null;
+  schemaConfirmed.clear();
+  schemaHealPromise.clear();
+  schemaBlocked.clear();
 }
 function __getLastFreshAt() { return lastFreshAt; }
-export { ensureFresh, __setTestHooks, __resetFresh, __getLastFreshAt };
+function __getLastFreshError() { return lastFreshError; }
+function __getSchemaConfirmed() { return [...schemaConfirmed]; }
+// withDbCount is the number update_graph PUBLISHES ("Full rebuild complete: N symbols
+// indexed"), and /wiregraph-rebuild tells the agent to report it. Exported so a test can
+// compare it against what graph_stats/graph_status report for the same graph, which is the
+// only way to catch the two disagreeing — a source grep cannot.
+export { ensureFresh, ensureSchemaCurrent, __setTestHooks, __resetFresh, __getLastFreshAt, __getLastFreshError, __getSchemaConfirmed, withDbCount as __withDbCount };
 
 // --- upstream-divergence caveat ---------------------------------------------
 // ensureFresh keeps the index matching the WORKING TREE, but "matches my
@@ -214,6 +291,14 @@ async function freshRead(fn, opts) {
   await ensureSchemaCurrent();
   await ensureFresh();
   const res = withDb(fn, opts);
+  // A FAILED self-heal is prepended to EVERY answer until one succeeds — not once per
+  // process like the upstream caveat below. The upstream caveat is a standing property of
+  // the checkout; this one means "the answer you are about to read may predate your own
+  // edits", which is a correctness problem that persists until it is fixed and must not
+  // scroll out of view after the first tool call.
+  if (lastFreshError && res?.content?.[0]?.type === 'text') {
+    res.content[0].text = `⚠ wiregraph could NOT re-index your changed files, so this answer may reflect the code BEFORE your recent edits: ${lastFreshError}\n\n${res.content[0].text}`;
+  }
   // One-time-per-process banner so the FIRST read of a session flags a stale
   // checkout without the agent having to call graph_status (the skipped step in
   // the session this guards against). Mark sent unconditionally — exactly one git
@@ -341,9 +426,9 @@ server.registerTool('trace_callers', {
 
 // --- trace_contract ---------------------------------------------------------
 server.registerTool('trace_contract', {
-  description: 'Cross-compartment wire seam AND code↔contract DRIFT check: which code symbols, in which compartments, reference a given contract (matched on its wire tokens — channel paths and payload fields), PLUS which of the contract\'s tokens are unreferenced or only touched by one side. Every call diffs the contract\'s FULL defined-token set against the code: 🔴 unreferenced = defined in the contract but NO code references it (code drifted off the contract), ⚠️ one-sided = only one compartment references it (a cross-compartment seam missing its other half), satisfied = both sides present. A clean report is EARNED, not assumed — trust the drift lines. Edges are HEURISTIC (evidence: contract-match): "mentions a token this contract defines", not verified to implement it, and a token can be present but with a drifted PAYLOAD SHAPE the string match can\'t see — confirm the exact field/endpoint with a targeted get_source.',
+  description: 'Cross-compartment seam AND code↔contract DRIFT check, over BOTH contract types. CALL IT WITH NO ARGUMENTS to LIST every contract in the project (name, kind wire|resource, defined-token count, spec path) — that is the directory, and the way to discover a name before tracing it. WIRE contracts (AsyncAPI): caller → route/message → handler, request/reply, matched on channel paths and payload fields. RESOURCE contracts (*.resource.yaml): two compartments coupled through a SHARED RESOURCE — a file/sentinel path, a DB table+key, shared memory, a named pipe — where the roles are WRITER/READER and the semantics are presence/state, not request/reply; these are matched on the shared CONSTANT NAME, so a side that only ever writes the bare string literal is invisible BY DESIGN. Reports which code symbols, in which compartments, reference the contract, PLUS which of its tokens are unreferenced or only touched by one side. Every call diffs the contract\'s FULL defined-token set against the code: 🔴 unreferenced = defined in the contract but NO code references it (code drifted off the contract), ⓘ shadowed = defined here but every reference to it is governed by a NARROWER contract inside this contract\'s subtree — NOT drift, nothing to fix, and reported separately from unreferenced precisely so the DRIFT flag stays meaningful on a nested layout, ⚠️ one-sided = only one side references it UNDER THIS CONTRACT (the consumer of a wire, or the reader/writer of a resource) — READ THE DETAIL before concluding a handler is missing: when the same token is also declared by a narrower contract that governs the other half, the line says NOT A MISSING IMPLEMENTATION and names that contract and the compartments holding it, 🛑 single-writer violation = a resource declared single_writer that names two or more writers (a DECLARATION check only — wiregraph detects references, never writes, so an UNDECLARED second writer cannot be identified as a writer at all), ⚠️ undeclared participant = a compartment whose code references the resource while the spec names it as neither writer nor reader, satisfied = both sides present. A clean report is EARNED, not assumed — trust the drift lines. Edges are HEURISTIC (evidence: contract-match): "mentions a token this contract defines", not verified to implement it, and a token can be present but with a drifted PAYLOAD SHAPE the string match can\'t see — confirm the exact field/endpoint with a targeted get_source.',
   inputSchema: {
-    contract: z.string().describe('Substring of the contract name, e.g. "Heartbeat", "Provisioning"'),
+    contract: z.string().optional().describe('Substring of the contract name, e.g. "Heartbeat", "Provisioning". OMIT IT (or pass "") to LIST every contract in the project with its kind (wire|resource) and defined-token count — call that first when you do not already know a contract name.'),
     token: z.string().optional().describe('Restrict to symbols referencing a specific wire token, e.g. "order_id"'),
     includeTests: z.boolean().optional().describe('Include symbols in test files (default false)'),
   },
@@ -362,7 +447,7 @@ server.registerTool('trace_contract', {
 
 // --- path_between -----------------------------------------------------------
 server.registerTool('path_between', {
-  description: 'Shortest path between two symbols across CALLS and contract REFERENCES edges (undirected) within this project. This can cross compartments by routing through a shared Contract node — e.g. an emitter in one compartment to the handler in another. Returns the chain of nodes and edge types.',
+  description: 'Shortest path between two symbols across CALLS and contract REFERENCES edges (undirected) within this project. This can cross compartments by routing through a shared Contract node with NO direct call edge between the two sides — e.g. an emitter in one compartment to the handler in another (wire contract), or a writer of a shared file/table/shm to its reader (resource contract). Pass "<module>" as from/to to name a file\'s TOP-LEVEL scope (top-level route registration and module-scope resource reads/writes are attributed there); narrow it with fromCompartment/toCompartment. Returns the chain of nodes and edge types.',
   inputSchema: {
     from: z.string().describe('Source symbol name'),
     to: z.string().describe('Target symbol name'),
@@ -391,7 +476,25 @@ server.registerTool('graph_status', {
     stats.split('\n').slice(0, 3).join('\n'), // Project / Nodes / Edges lines
     `Last full build: ${state?.lastFullBuild || 'unknown'}`,
     `Auto-update posture: ${state?.autoUpdate || '(not set)'}`,
+    // How this project's compartments are decided. Directly below the posture line
+    // because that pair is what /wiregraph-status step 1 consumes, and what an agent
+    // mid-session needs in order to read a compartment name correctly.
+    `Mode: ${modeLine(state)}`,
   ];
+  // Content-dropping warnings from the last build (state.lastBuildWarnings, persisted by
+  // the refresh worker). Rendered by buildWarningLines in scripts/lib/state.mjs — same
+  // policy as modeLine and statusAdvisories: the wording lives in ONE place the handler
+  // cannot drift from. Directly under Mode:, because a graph that is FRESH and knowingly
+  // INCOMPLETE is exactly the case an agent must see before trusting a trace, and it is
+  // silent when the last build dropped nothing.
+  lines.push(...buildWarningLines(state));
+  // …and the compartment names the walk had to RENAME to keep the partition injective.
+  // Read from the graph itself (a declared name can never contain `/` or `#`), so it cannot
+  // go stale against the db it describes. Silent unless something actually collided. This is
+  // the only place outside build stderr that says `network` became `client/network` +
+  // `server/network` — without it `Mode: global — compartments inferred…` reads as though the
+  // bare name were queryable, and find_symbol on it dead-ends.
+  lines.push(...Q.disambiguatedCompartmentLines(db, PROJECT));
   // Staleness: of the files git says changed (committed diff vs stored per-root
   // sha + uncommitted edits), only those whose on-disk mtime/size differs from
   // what was indexed are actually stale — so a re-indexed-but-uncommitted file is
@@ -415,6 +518,10 @@ server.registerTool('graph_status', {
   // seams until a full rebuild re-infers (seam staleness). statusAdvisories renders the
   // exact lines from state so "fresh" is never read as "everything is guaranteed correct."
   lines.push(...statusAdvisories(state));
+  // A self-heal that keeps failing is the one thing a freshness report must never omit:
+  // the read tools are what an agent trusts INSTEAD of calling this tool, so if their
+  // re-index is refused the graph is serving pre-edit code on every one of them.
+  if (lastFreshError) lines.push(`SELF-HEAL FAILING: the read tools could not re-index your changed files — ${lastFreshError}`);
   // Upstream divergence: the graph mirrors the working tree, so "fresh" can still
   // mean "indexing a branch behind origin". Report ahead/behind vs each repo's
   // @{upstream} — a trust caveat, not a staleness error (no re-index would fix it;
@@ -442,14 +549,26 @@ server.registerTool('update_graph', {
     full: z.boolean().optional().describe('Full project-scoped rebuild instead of incremental (default false).'),
   },
 }, async ({ files, full }) => {
-  // An incremental update against an old-schema db would try to write v2 columns
-  // into v1 tables and fail; migrate first (no-op once on the current schema).
-  if (!full) await ensureSchemaCurrent();
+  // An incremental update against an old-schema db does NOT fail loudly — loadGraph
+  // re-execs its `IF NOT EXISTS` schema over the old tables and then stamps the db as
+  // current — so migrate first, across every graph this update can fan out into (no-op
+  // once each is on the current schema). If a migration failed, say so and stop rather
+  // than running the incremental the gate just refused to allow.
+  if (!full) {
+    await ensureSchemaCurrent();
+    const blocked = schemaBlockedNote();
+    if (blocked) return text(`update_graph refused: a graph is on an older schema and the migrating rebuild failed — ${blocked}. Run /wiregraph-rebuild there.`);
+  }
   const state = readState(PROJECT);
   const now = new Date().toISOString();
   try {
     if (full) {
       await runBuild({ target: PROJECT, project: PROJECT, reset: true });
+      // A reset build recreated THIS project's tables at the current schema — record that
+      // so the next read's gate skips the probe. Peers are untouched by a full build, so
+      // their verdicts (and any block) deliberately stand.
+      schemaConfirmed.add(PROJECT);
+      schemaBlocked.delete(PROJECT);
       const repos = projectRepos(PROJECT);
       const newShas = {};
       for (const r of repos) if (r.head) newShas[r.root] = r.head;
@@ -516,17 +635,24 @@ server.registerTool('update_graph', {
 
 // Count this project's symbols via a fresh read-only connection (used after a
 // build, when withDb's cached-free open reflects the just-written rows).
+//
+// IT MUST COUNT WHAT graph_stats / graph_status COUNT. It used to exclude the synthetic
+// per-file `<module>` symbol while `graphStats`'s `Nodes: Symbol=` includes it, so one run
+// reported `Full rebuild complete: 20 symbols indexed` and `Symbol=28` for the same graph —
+// and /wiregraph-rebuild tells the agent to "report the new stats", i.e. to publish the
+// disagreement. Whichever number is more meaningful, TWO numbers for one quantity is a bug;
+// the one an agent can cross-check is the one graph_status prints, so this matches it.
 function withDbCount() {
   const p = dbPath();
   if (!existsSync(p)) return 0;
   const db = connect(p, { readonly: true });
-  try { return db.prepare("SELECT count(*) AS c FROM symbols WHERE project = ? AND kind <> 'module'").get(PROJECT).c; }
+  try { return db.prepare('SELECT count(*) AS c FROM symbols WHERE project = ?').get(PROJECT).c; }
   finally { db.close(); }
 }
 
 // --- query_sql (read-only escape hatch) -------------------------------------
 server.registerTool('query_sql', {
-  description: 'Run a read-only SQL SELECT against the graph for structural questions the shaped tools do not cover. Rejected if it is not a single read-only SELECT/WITH. The db holds ONLY this project, so no project filter is needed. Schema — tables: symbols(id,project,compartment,file,name,kind,lang,startLine,endLine), files(id,project,compartment,path,lang), compartments(id,project,name,root), contracts(id,project,name,file), edges(type,src,dst,project,token,cnt,resolution,evidence,direction,contract). edges.type is one of CALLS|DEFINED_IN|REFERENCES|WIRE|IN_COMPARTMENT; src/dst are node ids — CALLS/WIRE join symbols.id↔symbols.id, DEFINED_IN symbols.id→files.id, REFERENCES symbols.id→contracts.id, IN_COMPARTMENT files.id→compartments.id. Example: SELECT s.compartment, count(*) n FROM symbols s WHERE s.kind=\'function\' GROUP BY s.compartment.',
+  description: 'Run a read-only SQL SELECT against the graph for structural questions the shaped tools do not cover. Rejected if it is not a single read-only SELECT/WITH. The db holds ONLY this project, so no project filter is needed. Schema — tables: symbols(id,project,compartment,file,name,kind,lang,startLine,endLine), files(id,project,compartment,path,lang), compartments(id,project,name,root), contracts(id,project,name,file), edges(type,src,dst,project,token,cnt,resolution,evidence,direction,contract). edges.type is one of CALLS|DEFINED_IN|REFERENCES|WIRE|RESOURCE|IN_COMPARTMENT (WIRE = derived producer→consumer wire seam; RESOURCE = derived writer→reader shared-resource seam); src/dst are node ids — CALLS/WIRE/RESOURCE join symbols.id↔symbols.id, DEFINED_IN symbols.id→files.id, REFERENCES symbols.id→contracts.id, IN_COMPARTMENT files.id→compartments.id. Example: SELECT s.compartment, count(*) n FROM symbols s WHERE s.kind=\'function\' GROUP BY s.compartment.',
   inputSchema: {
     query: z.string().describe('A single read-only SQL SELECT (or WITH … SELECT)'),
   },

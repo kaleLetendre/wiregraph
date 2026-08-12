@@ -1,0 +1,10 @@
+asyncapi: 3.0.0
+# Same idea as vendor/, for a second IGNORE_DIRS entry (a build output dir).
+info:
+  title: Dist Leak
+  version: 1.0.0
+channels:
+  leak:
+    address: /dist/only
+    x-wiregraph-producers: [harness]
+    x-wiregraph-consumers: [netsrv]

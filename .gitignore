@@ -28,3 +28,15 @@ node_modules/.bin/npm-check-updates
 # Runtime marker Claude Code writes into a plugin's install dir; only lands in the
 # repo when the install is dev-symlinked here. Never part of the plugin.
 .in_use/
+
+# Dogfooding debris — wiregraph run against its OWN repo. Neither of these belongs to
+# the plugin, and both were untracked AND unignored, so a plain `git add -A` would have
+# shipped them to every user.
+#
+# /contracts/ is written by `/wiregraph-contracts apply` when the tool is pointed at
+# this repo. It holds a SELF-INFERRED AsyncAPI spec, which a build of this repo then
+# loads back as though it were hand-authored. Anchored to the repo root so it can never
+# match a `contracts/` fixture under test/.
+/contracts/
+# Per-developer working notes for this repo; not part of the shipped plugin.
+/CLAUDE.md

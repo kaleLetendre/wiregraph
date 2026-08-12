@@ -28,11 +28,19 @@ import {
 } from './state.mjs';
 import { findCompartmentRoots, walkSources } from '../../src/extract/walk.js';
 import { runBuild } from '../../src/build.js';
-import { inferSeamsAcross, synthesizeAsyncApi } from '../../src/contracts/infer.js';
+import {
+  extractSignals, clusterSeams, clusterResourceSeams,
+  synthesizeAsyncApi, synthesizeResourceSpec,
+} from '../../src/contracts/infer.js';
 import { projectRepos } from './git.mjs';
 import { connect } from '../../src/store/sqlite.js';
 
 const INFERRED_SPEC = 'wiregraph-inferred.asyncapi.yaml';
+// The second inferred format, written to the SAME out-of-source inferred/ dir. Its
+// title differs from the AsyncAPI draft's for the reason spelled out in
+// scripts/contracts.mjs: a title shared across formats is refused at load, and the
+// resource side is the one that gets skipped.
+const INFERRED_RESOURCE_SPEC = 'wiregraph-inferred.resource.yaml';
 const NOT_INDEXED = "This directory isn't indexed yet — run /wiregraph-init here first, then /wiregraph-link.";
 const log = (m) => process.stdout.write(m + '\n');
 const err = (m) => process.stderr.write(m + '\n');
@@ -51,6 +59,7 @@ export function resolveSelf(startDir) {
 // tree — the synthesized draft lives beside the db, redundantly under each graph.
 function inferredDir(project) { return join(wiregraphDir(project), 'inferred'); }
 function inferredSpecPath(project) { return join(inferredDir(project), INFERRED_SPEC); }
+function inferredResourceSpecPath(project) { return join(inferredDir(project), INFERRED_RESOURCE_SPEC); }
 
 function isWritable(dir) { try { accessSync(dir, constants.W_OK); return true; } catch { return false; } }
 
@@ -90,13 +99,24 @@ function compartmentNamesOf(root) {
 // makes runBuild honor that exact set instead of re-reading state.
 async function reinferAndRebuild(project, roots = null) {
   const union = roots || memberRoots(project);
-  const seams = inferSeamsAcross(union);
-  const spec = inferredSpecPath(project);
-  if (seams.length) {
-    mkdirSync(inferredDir(project), { recursive: true });
-    writeFileSync(spec, synthesizeAsyncApi(seams));
-  } else if (existsSync(spec)) {
-    rmSync(spec, { force: true });
+  // ONE extraction pass, BOTH clusterers — wire seams from routes/topics, resource
+  // seams from shared named constants.
+  const { candidates, comments } = extractSignals(union);
+  const seams = clusterSeams(candidates);
+  const resourceSeams = clusterResourceSeams(candidates, union, { comments });
+  // Each format is written when its clusterer found something and REMOVED when it did
+  // not. The removal half is what keeps an unlink honest: the reduced union may still
+  // yield wire seams while the only resource seam has just lost its peer, and a stale
+  // *.resource.yaml left in inferred/ would keep deriving a seam across a member that is
+  // no longer part of this graph. Both files, same rule.
+  const specs = [
+    [inferredSpecPath(project), seams.length ? synthesizeAsyncApi(seams) : null],
+    [inferredResourceSpecPath(project), resourceSeams.length ? synthesizeResourceSpec(resourceSeams) : null],
+  ];
+  if (specs.some(([, body]) => body)) mkdirSync(inferredDir(project), { recursive: true });
+  for (const [path, body] of specs) {
+    if (body) writeFileSync(path, body);
+    else if (existsSync(path)) rmSync(path, { force: true });
   }
   // With an explicit reduced union, tell the build this member loss is INTENTIONAL
   // (allowReducedUnion) so the member-losing-reset backstop — which reads state, where
@@ -279,7 +299,7 @@ export async function doUnlink(self, targetArg, hooks = {}) {
   const peerState = readState(target);
 
   // Compute each graph's REDUCED union (the counterpart dropped) BEFORE touching any
-  // record. inferSeamsAcross + the rebuild key off these, so the seam is shed even
+  // record. The re-inference + the rebuild key off these, so the seam is shed even
   // though the still-present records name the peer.
   const selfReduced = memberRoots(self).filter((r) => r !== target);
   const targetReduced = peerState ? memberRoots(target).filter((r) => r !== self) : [];

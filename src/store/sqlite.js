@@ -23,11 +23,19 @@
 
 import initSqlJs from 'sql.js';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, openSync, closeSync, statSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, openSync, readSync, closeSync, statSync, rmSync } from 'node:fs';
 import { dirname, sep } from 'node:path';
 import { readState } from '../../scripts/lib/state.mjs';
 import { walkSources } from '../extract/walk.js';
-import { buildWireEdges } from '../extract/contracts.js';
+import { buildWireEdges, buildResourceEdges } from '../extract/contracts.js';
+
+// Edge types that are DERIVED from contract REFERENCES rather than parsed from
+// source: the wire seam (producer->consumer) and the resource seam (writer->reader).
+// Every place that prunes or re-derives one must handle BOTH — pruneFile and
+// rederiveWireEdges below — or the type that was forgotten is deleted on every file
+// save and never rebuilt, while every full-build test still passes.
+export const DERIVED_EDGE_TYPES = ['WIRE', 'RESOURCE'];
+const DERIVED_EDGE_SQL_LIST = DERIVED_EDGE_TYPES.map((t) => `'${t}'`).join(',');
 
 const require = createRequire(import.meta.url);
 // Resolve the bundled wasm next to the sql.js package (no network, no compile).
@@ -97,6 +105,11 @@ class Stmt {
 //     tiny race where the lockfile exists (openSync 'wx' won) but its PID has not
 //     been written yet. We don't know the holder, so we fall back to the old
 //     staleness check rather than steal a possibly-fresh live lock.
+// A third case sits outside shouldStealLock entirely: a lock path we cannot STAT
+// or READ at all (a DIRECTORY at <db>.lock, a chmod-000 file, another user's
+// file, a dangling symlink, a symlink to a directory). That is debris, not a
+// claim by anyone, and acquireLock steals it immediately — waiting on it could
+// never end because nothing about it will ever change.
 // ms-scale blocking is fine in these one-shot CLI/worker processes.
 //
 // Invariant: the wait deadline (LOCK_TIMEOUT_MS) is > LOCK_HARD_MAX_MS, so a
@@ -106,6 +119,7 @@ class Stmt {
 const LOCK_STALE_MS = 30_000;          // mtime staleness — used only for the unparseable-PID fallback
 const LOCK_HARD_MAX_MS = 5 * 60_000;   // steal even a LIVE holder past this age (PID reuse / wedged holder)
 const LOCK_TIMEOUT_MS = LOCK_HARD_MAX_MS + LOCK_STALE_MS; // absolute wait deadline; > HARD_MAX so a steal can fire first
+const LOCK_MAX_BYTES = 64;             // a lock file holds a decimal PID; anything larger is not one (don't read it)
 
 function sleepSync(ms) {
   // Block the thread without burning CPU (no async context to await in).
@@ -146,17 +160,53 @@ function acquireLock(lockPath) {
       return;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      // Someone holds the lock. Read its PID + age and decide steal-vs-wait.
-      let pid = null, ageMs = 0;
+      // Something occupies the lock path. Inspect it and decide steal-vs-wait.
+      //
+      // A lock we cannot STAT or READ is NOT evidence of a live claim — it is
+      // debris: a DIRECTORY at <db>.lock, a chmod-000 file, a file owned by
+      // another user, a dangling symlink, a symlink to a directory, or a lock
+      // that vanished between the open and the read. Waiting on debris can never
+      // end, because nothing about it will ever change on its own; so anything we
+      // cannot inspect is STEALABLE. (This is the same conclusion the <db>.heal
+      // marker reaches in scripts/hooks/refresh.mjs.) The old code `continue`d on
+      // a read/stat throw, which skipped the deadline check below and turned a
+      // directory at <db>.lock into an unbounded, silent spin.
+      let decision = 'steal';
       try {
-        const raw = readFileSync(lockPath, 'utf8').trim();
-        const n = Number.parseInt(raw, 10);
-        pid = Number.isInteger(n) && String(n) === raw ? n : null; // reject empty/garbage/partial writes
-        ageMs = Date.now() - statSync(lockPath).mtimeMs;
-      } catch { continue; /* lock vanished between open and read — retry immediately */ }
-      if (shouldStealLock({ pid, ageMs }) === 'steal') { rmSync(lockPath, { force: true }); continue; }
+        const st = statSync(lockPath); // follows symlinks: a link to a real lock is a real lock
+        // Only a regular file can be a lock. A directory / symlink-to-directory /
+        // fifo / socket here is debris, and must never be read (reading a fifo
+        // would block forever — a second way to hang).
+        if (st.isFile()) {
+          const ageMs = Date.now() - st.mtimeMs;
+          // A lock holds a decimal PID and nothing else. Anything bigger is not a
+          // PID: treat it as unparseable (the mtime fallback below) WITHOUT
+          // reading it, so a huge file is not slurped once per 50ms poll.
+          let pid = null;
+          if (st.size <= LOCK_MAX_BYTES) {
+            const raw = readFileSync(lockPath, 'utf8').trim();
+            const n = Number.parseInt(raw, 10);
+            pid = Number.isInteger(n) && String(n) === raw ? n : null; // reject empty/garbage/partial writes
+          }
+          decision = shouldStealLock({ pid, ageMs });
+        }
+      } catch { decision = 'steal'; /* unstat-able / unreadable -> debris, not a claim */ }
+
+      let cleared = false;
+      if (decision === 'steal') {
+        // force: tolerate the lock vanishing under us (another contender stole it
+        // first). recursive: a DIRECTORY at the lock path has to go too — plain
+        // rmSync refuses one with ERR_FS_EISDIR, which is how the spin started.
+        // A failed removal (e.g. read-only parent dir) is NOT fatal: we fall
+        // through to the poll + deadline below and eventually time out loudly.
+        try { rmSync(lockPath, { force: true, recursive: true }); cleared = true; }
+        catch { /* could not clear it — wait it out and let the deadline fire */ }
+      }
+      // Reached on EVERY path through the loop, the steal path included: a lock we
+      // can neither read nor remove must still end in a thrown timeout rather than
+      // an unbounded spin. Nothing here may `continue` past this check.
       if (Date.now() > deadline) throw new Error(`wiregraph: timed out waiting for db lock ${lockPath}`);
-      sleepSync(50);
+      if (!cleared) sleepSync(50); // a successful steal retries at once (instant crash recovery)
     }
   }
 }
@@ -226,6 +276,80 @@ export function schemaVersion(db) {
   }
 }
 
+// The file header's `user_version` read from an ALREADY-OPEN db (the cheap 64-byte probe
+// below reads it from the path instead). 0 when absent, matching stampedSchemaVersion's
+// "absent means UNKNOWN, never outdated" rule.
+function userVersion(db) {
+  try { return Number(db.prepare('PRAGMA user_version').get()?.user_version) || 0; }
+  catch { return 0; }
+}
+
+// One `meta` row, or null. Total: the table may not exist on a pre-versioning db.
+function metaValue(db, key) {
+  try { return db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null; }
+  catch { return null; }
+}
+
+// --- cheap schema probe -----------------------------------------------------
+// Both incremental entry points — the hook worker (scripts/hooks/refresh.mjs) and the
+// MCP server (src/mcp/server.js) — must gate on "is this db older than the schema I
+// write?" before every incremental, for EVERY graph they can write into. That is a
+// per-edit, per-graph question about an event that happens once per release, so it
+// lives here (next to the loader that writes both stamps) rather than being duplicated
+// at each caller.
+
+// The schema version stamped in a db WITHOUT opening it: the SQLite file header's
+// user_version field is a fixed 4-byte big-endian slot at byte 60, so this is one
+// 64-byte read no matter how big the graph is. connect() is NOT an acceptable
+// substitute on this path — sql.js has no partial read, so it copies the entire file
+// into the WASM heap (sub-ms on a small graph, ~13ms on a 20MB one). loadGraph writes
+// this slot in the same transaction as meta.schema_version. Returns 0 when the stamp is
+// ABSENT — a db written before that mirror existed, or not a SQLite file at all.
+export function stampedSchemaVersion(dbPath) {
+  let fd;
+  try {
+    fd = openSync(dbPath, 'r');
+    const head = Buffer.alloc(64);
+    if (readSync(fd, head, 0, 64, 0) < 64) return 0;
+    if (head.subarray(0, 15).toString('latin1') !== 'SQLite format 3') return 0;
+    return head.readUInt32BE(60);
+  } catch { return 0; }
+  finally { try { if (fd !== undefined) closeSync(fd); } catch { /* */ } }
+}
+
+// Where `dbPath` sits relative to the schema this wiregraph writes:
+//   'missing'    — nothing built yet (not a schema problem; the caller surfaces NOT_BUILT)
+//   'current'    — safe to write incrementally
+//   'older'      — MIGRATE (a full --reset build) before any incremental touches it
+//   'newer'      — written by a later wiregraph; leave it alone. A reset would recreate
+//                  the tables at THIS (older) schema, silently downgrading, so this is
+//                  deliberately NOT reported as a problem to fix — loadGraph's explicit
+//                  refusal and the server's "update wiregraph" message handle it.
+//   'unreadable' — corrupt / not a db. Not a schema verdict; whatever the caller does
+//                  next hits the same error and reports it through its own path.
+//
+// The ABSENT header stamp is the case that matters. A 0 stamp means "unknown", NEVER
+// "outdated": reading it as outdated would force a full rebuild of every project built
+// before the mirror existed, on its very next edit — a far worse regression than the
+// cost being saved here. So 0 falls back to the authoritative `meta` row, which does
+// need the full open; correctness is unchanged, only the price. Once any build stamps
+// the header, every later probe takes the cheap path.
+export function schemaStatus(dbPath) {
+  if (!existsSync(dbPath)) return 'missing';
+  const rank = (v) => (v === SCHEMA_VERSION ? 'current' : v < SCHEMA_VERSION ? 'older' : 'newer');
+  const stamped = stampedSchemaVersion(dbPath);
+  if (stamped > 0) return rank(stamped);
+  let db;
+  try { db = connect(dbPath, { readonly: true }); return rank(schemaVersion(db)); }
+  catch { return 'unreadable'; }
+  finally { try { db?.close(); } catch { /* */ } }
+}
+
+// Sugar for the callers that only need the one verdict that demands action.
+export function schemaOutdated(dbPath) {
+  return schemaStatus(dbPath) === 'older';
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta        (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS compartments(id TEXT PRIMARY KEY, project TEXT, name TEXT, root TEXT);
@@ -256,6 +380,62 @@ export function loadGraph(db, graph, { reset = false, log = () => {}, allowReduc
   // recreated at this older schema (silent data loss). Refuse loudly instead.
   if (priorVersion > SCHEMA_VERSION) {
     throw new Error(`refusing to write: db schema v${priorVersion} is newer than this wiregraph (v${SCHEMA_VERSION}). Update wiregraph instead of downgrading the graph.`);
+  }
+
+  // --- THE TWO SCHEMA STAMPS MUST AGREE, AND A DISAGREEMENT IS NOT SELF-HEALING ---
+  // `meta.schema_version` is the AUTHORITATIVE stamp and the file header's `user_version`
+  // is its cheap mirror; they are written in one transaction below precisely so they cannot
+  // diverge. When they HAVE diverged — a hand edit, an older tool, a partial write — the
+  // cheap probe is the only gate on the hook path (schemaStatus short-circuits on a non-zero
+  // header), so with meta=3 and header=5 the value the code calls authoritative was never
+  // read, no migration ran, and the incremental below RESTAMPED meta to 5. The db then
+  // CLAIMS to be current while physically on the old shape, permanently defeating every
+  // downstream check including the MCP server's — the silent-restamp trap §1 of the design
+  // describes, which is exactly the failure mode a schema gate exists to prevent.
+  //
+  // So detect it and REFUSE, rather than restamp. Only on the incremental path: a `reset`
+  // build DROPs and recreates every table below when priorVersion !== SCHEMA_VERSION, which
+  // is a real migration and the remedy this error names. A 0 on either side means ABSENT,
+  // never "disagrees" — a pre-mirror db (header 0) and a pre-meta db (meta 0) are both
+  // legitimate and must keep working, the same rule schemaStatus applies to its own probe.
+  const headerVersion = userVersion(db);
+  if (!reset && priorVersion > 0 && headerVersion > 0 && priorVersion !== headerVersion) {
+    throw new Error(
+      `refusing to write: this db's two schema stamps DISAGREE — meta.schema_version=${priorVersion} but the file `
+      + `header's user_version=${headerVersion}. They are written in one transaction, so a mismatch means the file was `
+      + 'edited or written by another tool, and the cheap header probe every incremental gates on is therefore lying. '
+      + 'An incremental would restamp it as current WITHOUT migrating. Run a full rebuild (/wiregraph-rebuild, or '
+      + 'update_graph {full:true}) — it recreates the tables at the current schema and rewrites both stamps together.',
+    );
+  }
+
+  // --- WHOSE GRAPH IS THIS? ------------------------------------------------------
+  // A `graph.db` from ANOTHER project, dropped in place, was never detected. Every id is
+  // project-FREE (src/model.js), so the file looks like a plausible graph; one incremental
+  // then prunes under THIS project's tag, misses every foreign row, and re-inserts — leaving
+  // hundreds of rows carrying the other project's tag, while `INSERT OR REPLACE` on the
+  // compartment id means this project's own compartment row is REPLACED by the foreign one.
+  // No warning, no escalation, and no self-heal short of a full rebuild. A `cp -a` of a whole
+  // PROJECT is caught by the copy sentinel (scripts/lib/state.mjs) because it carries a
+  // state.json to compare; the bare-db case carries nothing, so the db has to say who owns it.
+  //
+  // A MOVE IS NOT A FOREIGN DB, and the test is the same decisive existsSync the copy
+  // sentinel uses: after `mv proj proj2` the recorded owner path no longer holds a wiregraph
+  // project, so this is a move and the incremental proceeds (and restamps the owner). If the
+  // recorded owner is STILL a wiregraph project sitting there, this db belongs to it.
+  const owner = metaValue(db, 'project_root');
+  if (!reset && project && owner && owner !== project) {
+    let ownerLives = false;
+    try { ownerLives = !!readState(owner); } catch { /* unreadable — treat as gone */ }
+    if (ownerLives) {
+      throw new Error(
+        `refusing to write: this graph db was built for a DIFFERENT project (${owner}), which still exists — so this is `
+        + `a foreign db, not a moved one. Incrementally updating it would prune under ${project} while hundreds of rows `
+        + `stay tagged ${owner}, and the compartment rows would silently overwrite each other. Delete `
+        + '.wiregraph/graph.db and run a full rebuild (/wiregraph-rebuild, or update_graph {full:true}).',
+      );
+    }
+    log(`  adopting a graph db previously owned by ${owner} (that path is no longer a wiregraph project — treating it as a move)`);
   }
   if (reset && !project) throw new Error('sqlite loadGraph --reset requires graph.project');
 
@@ -340,6 +520,22 @@ export function loadGraph(db, graph, { reset = false, log = () => {}, allowReduc
       }
     }
     db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
+    // Mirror the same number into the SQLite file header's user_version slot — a fixed
+    // 4-byte big-endian field at byte 60 — written in the SAME transaction as the `meta`
+    // row so the two can never disagree. `meta` stays authoritative; this exists purely
+    // so a reader can learn the version with a 64-byte read instead of a full open.
+    // connect() has no partial-read mode (sql.js slurps the whole file into the WASM
+    // heap), which is fine for anything that then QUERIES the db and far too expensive
+    // for a probe — see stampedSchemaVersion / schemaStatus above, which the hook worker
+    // and the MCP server run on every incremental, once per graph.
+    db.exec(`PRAGMA user_version = ${Number(SCHEMA_VERSION)}`);
+    // WHO OWNS THIS FILE. Read back by the foreign-db refusal above, on the incremental
+    // path only. Written on EVERY load (not just a reset) so a legitimately MOVED project —
+    // which the refusal lets through precisely because its old path is no longer a wiregraph
+    // project — re-stamps itself and is guarded again from its very next save, instead of
+    // carrying a dead owner path forever. `meta` survives the reset wipe above (that loop
+    // deliberately excludes it), so the value is not lost on a rebuild either.
+    if (project) db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('project_root', ?)").run(String(project));
     for (const r of graph.compartments.values()) insCompartment.run(r);
     for (const f of graph.files.values()) insFile.run({ mtime: null, size: null, hash: null, ...f });
     for (const s of graph.symbols.values()) insSym.run({ lang: null, ...s });
@@ -370,9 +566,18 @@ export function loadGraph(db, graph, { reset = false, log = () => {}, allowReduc
     for (const e of graph.edges) {
       if (!nodeIds.has(e.from) || !nodeIds.has(e.to)) continue; // drop dangling
       const tok = e.props?.token ?? null;
-      const key = (e.type === 'REFERENCES' || e.type === 'WIRE')
-        ? `${e.type}\0${e.from}\0${e.to}\0${tok}`
-        : `${e.type}\0${e.from}\0${e.to}`;
+      // A DERIVED seam also keys on its CONTRACT. Two contracts can legitimately name the
+      // same token between the same two symbols (two specs declaring one resource id, or
+      // a hand-written channel duplicated in the inferred spec) — those are two findings
+      // under two contract names, and without the contract in the key the second addEdge
+      // was silently DROPPED. The losing contract then reported status `ok` while
+      // `export-gexf --contract <it>` found no edges at all, and which one lost came down
+      // to directory read order. REFERENCES needs no such term: its `to` IS the contract.
+      const key = DERIVED_EDGE_TYPES.includes(e.type)
+        ? `${e.type}\0${e.from}\0${e.to}\0${tok}\0${e.props?.contract ?? ''}`
+        : (e.type === 'REFERENCES'
+          ? `${e.type}\0${e.from}\0${e.to}\0${tok}`
+          : `${e.type}\0${e.from}\0${e.to}`);
       if (seen.has(key)) continue;
       seen.add(key);
       insEdge.run({
@@ -438,13 +643,16 @@ export function loadProjectSymbols(db, project) {
 //     DEFINED_IN), keeping incoming, so the reload recreates exactly one of each
 //     (Neo4j's MERGE deduped these implicitly; SQLite's INSERT is additive, so we
 //     must clear everything the re-extraction will re-add for this file);
-//   - for surviving symbols, ALSO drop any WIRE edge touching them (either
-//     direction). WIRE is a derived cross-compartment seam that the incremental path
-//     never re-derives (a full rebuild is its backstop). Keeping it would leave a
-//     stale WIRE hanging off a symbol whose backing REFERENCES were just re-matched —
-//     a dangling seam with no live backing. Dropping it is honest: the seam simply
-//     goes dark in export/visualize until the next full rebuild (query tools don't
-//     read WIRE). Deleted symbols' WIRE goes with delEdgesOf already.
+//   - for surviving symbols, ALSO drop any DERIVED seam edge touching them (WIRE and
+//     RESOURCE, either direction). Keeping one would leave a stale seam hanging off a
+//     symbol whose backing REFERENCES were just re-matched — a dangling seam with no
+//     live backing. This is a DELETE-THEN-REBUILD, not a delete: the incremental caller
+//     (src/build.js#incrementalBuild) runs rederiveWireEdges over the refreshed
+//     REFERENCES immediately afterwards, so the seam is back before the update returns.
+//     It goes dark only when that re-derive FAILS — which the caller logs and degrades
+//     to the old behaviour (dark in export/visualize until the next full rebuild; the
+//     query tools don't read the derived edges). Deleted symbols' seam edges go with
+//     delEdgesOf already.
 //   - clear the file's IN_COMPARTMENT edge for the same reason;
 //   - if keepIds is empty (file deleted on disk), also drop the File node.
 export function pruneFile(db, project, compartment, relPath, keepIds, log = () => {}) {
@@ -459,8 +667,11 @@ export function pruneFile(db, project, compartment, relPath, keepIds, log = () =
   const delOutgoing = db.prepare(
     "DELETE FROM edges WHERE project = ? AND src = ? AND type IN ('CALLS','REFERENCES','DEFINED_IN')",
   );
+  // Both DERIVED seam types (WIRE and RESOURCE), not just WIRE: a resource seam
+  // hanging off a symbol whose backing REFERENCES were just re-matched is exactly as
+  // stale as a wire one. rederiveWireEdges below rebuilds both immediately after.
   const delWireOf = db.prepare(
-    "DELETE FROM edges WHERE project = ? AND type = 'WIRE' AND (src = ? OR dst = ?)",
+    `DELETE FROM edges WHERE project = ? AND type IN (${DERIVED_EDGE_SQL_LIST}) AND (src = ? OR dst = ?)`,
   );
 
   const tx = db.transaction(() => {
@@ -479,8 +690,9 @@ export function pruneFile(db, project, compartment, relPath, keepIds, log = () =
   else log(`  pruned ${compartment}/${relPath} (kept ${keepIds.length} stable symbols' incoming edges)`);
 }
 
-// Incremental WIRE self-heal (Change 1). The incremental path re-matches REFERENCES
-// (M1), but pruneFile deletes every WIRE edge touching a changed/surviving symbol —
+// Incremental DERIVED-SEAM self-heal (Change 1) — WIRE *and* RESOURCE. The
+// incremental path re-matches REFERENCES
+// (M1), but pruneFile deletes every derived seam edge touching a changed/surviving symbol —
 // so the derived producer->consumer seam went DARK in export/visualize until a full
 // rebuild. This re-derives the WHOLE project's WIRE set from the db's now-fresh
 // REFERENCES (no source re-parse; cost is O(references)), running the SAME
@@ -508,8 +720,13 @@ export function rederiveWireEdges(db, project, contracts, log = () => {}) {
   const emitted = [];
   const g = { symbols, edges, addEdge: (type, from, to, props) => emitted.push({ type, from, to, props }) };
   buildWireEdges(g, contracts, log);
+  // Resource seams are derived by the SAME function the full build uses, from the same
+  // merged contract set — so the incremental result is identical to a full rebuild's.
+  // Omitting this while the DELETE below still clears RESOURCE would silently drop
+  // every resource seam on the first file save after a full build.
+  buildResourceEdges(g, contracts, log);
 
-  const del = db.prepare("DELETE FROM edges WHERE project = ? AND type = 'WIRE'");
+  const del = db.prepare(`DELETE FROM edges WHERE project = ? AND type IN (${DERIVED_EDGE_SQL_LIST})`);
   const ins = db.prepare('INSERT INTO edges (type,src,dst,project,token,cnt,resolution,evidence,direction,contract) VALUES (@type,@src,@dst,@project,@token,@cnt,@resolution,@evidence,@direction,@contract)');
   const tx = db.transaction(() => {
     del.run(project);
@@ -518,11 +735,14 @@ export function rederiveWireEdges(db, project, contracts, log = () => {}) {
     const seen = new Set();
     for (const e of emitted) {
       const tok = e.props?.token ?? null;
-      const key = `${e.from}\0${e.to}\0${tok}`;
+      // Same key as the full-build loader above, contract term included — the incremental
+      // re-derive must not collapse two contracts' seams where a full rebuild keeps both,
+      // or a file save would silently delete one of them.
+      const key = `${e.type}\0${e.from}\0${e.to}\0${tok}\0${e.props?.contract ?? ''}`;
       if (seen.has(key)) continue;
       seen.add(key);
       ins.run({
-        type: 'WIRE', src: e.from, dst: e.to, project,
+        type: e.type, src: e.from, dst: e.to, project,
         token: tok, cnt: null, resolution: null,
         evidence: e.props?.evidence ?? null, direction: e.props?.direction ?? null,
         contract: e.props?.contract ?? null,
@@ -530,6 +750,6 @@ export function rederiveWireEdges(db, project, contracts, log = () => {}) {
     }
   });
   tx();
-  log(`  re-derived ${emitted.length} WIRE edge(s) from db REFERENCES`);
+  log(`  re-derived ${emitted.length} derived seam edge(s) (${DERIVED_EDGE_TYPES.join('/')}) from db REFERENCES`);
   return emitted.length;
 }

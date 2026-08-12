@@ -21,20 +21,21 @@
 //   --dump <file>       also write the raw graph as JSON (for inspection)
 //   --no-load           skip the SQLite load, just extract (+ optional --dump)
 
-import { writeFileSync, readFileSync, existsSync, realpathSync, readdirSync, statSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, realpathSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { resolve, join, relative, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Graph } from './model.js';
 import { extractCode } from './extract/index.js';
 import { resolveCalls } from './extract/resolve.js';
-import { loadAllContracts, matchContracts, buildWireEdges } from './extract/contracts.js';
-import { findCompartmentRoots, compartmentNameFor, walkSources } from './extract/walk.js';
+import { loadAllContracts, matchContracts, buildWireEdges, buildResourceEdges, constDefIndex, handWrittenTokens } from './extract/contracts.js';
+import { compartmentNameFor, walkSources } from './extract/walk.js';
+import { detectContractsDirs, rootContractsEntries, contractsDirSpecs } from './contracts-dirs.js';
 import { connect, loadGraph, loadProjectSymbols, pruneFile, rederiveWireEdges, listIndexedFiles } from './store/sqlite.js';
-import { wiregraphDir, updateState, readState, owningMember, graphsListing, memberRoots as memberRootsFromState, registerProject } from '../scripts/lib/state.mjs';
+import { wiregraphDir, updateState, readState, owningMember, graphsListing, memberRoots as memberRootsFromState, registerProject, compartmentsFingerprint, compartmentsDrift, stampCompartmentsFingerprint, compartmentPartition, contractsFingerprint, contractsDrift, stampContractsFingerprint, isRecursiveMode, splitWarningBlocks, recordBuildWarnings } from '../scripts/lib/state.mjs';
 import { migrateMetrics } from '../scripts/lib/metrics.mjs';
 import { colorEnabled } from '../scripts/lib/color.mjs';
-import { clusterSeams } from './contracts/infer.js';
+import { clusterSeams, clusterResourceSeams } from './contracts/infer.js';
 import { resolveImports } from './contracts/imports.js';
 
 export function parseArgs(argv) {
@@ -63,6 +64,81 @@ export function parseArgs(argv) {
 
 const log = (m) => process.stderr.write(m + '\n');
 
+// --- CONTENT-DROPPING WARNINGS MUST SURVIVE EVERY BUILD PATH -------------------
+// Every warning the build emits is a bare `process.stderr.write` several call frames down
+// (src/extract/contracts.js, src/extract/walk.js), and on the hook path that stream is a log
+// nobody reads. A tee of THIS PROCESS's stderr catches all of them in-process, wherever they
+// are raised, with no plumbing through five signatures — and it keeps working for warnings
+// added later, because it keys on the markers the build already uses.
+//
+// IT LIVES HERE, NOT IN THE HOOK, AND THAT IS THE FIX. It used to be installed only by
+// scripts/hooks/refresh.mjs, so `update_graph {full:true}` (what /wiregraph-rebuild prefers)
+// and `node src/build.js --reset` (what /wiregraph-init runs) recorded NOTHING: a build that
+// dropped an entire contract left no trace, and graph_status then rendered warnings from a
+// DIFFERENT, OLDER build captioned as the current one. runBuild is the funnel every build
+// path goes through, so installing it here reaches all of them at once.
+//
+// Installation is IDEMPOTENT and the tee always passes the chunk through to the original
+// write, so importing this module never changes what anything prints. refresh.mjs installs
+// it EARLY (before its own discovery walk) because walk.js memoizes its warnings per
+// process: a collision warning raised while comparing fingerprints is not re-emitted inside
+// the build that follows, and a capture that started at the build would miss it.
+//
+// The accumulator is DRAINED per build (not per process): each build records the blocks
+// emitted since the previous one — which correctly includes the discovery walk that preceded
+// it — so nothing accumulates across a long-lived process and one project's warning can
+// never be persisted into another's state.
+let _warnOrig = null;
+let _warnPending = '';
+let _warnBlocks = [];
+const _warnSinks = new Set();
+
+export function installBuildWarningCapture() {
+  if (_warnOrig) return;
+  _warnOrig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, enc, cb) => {
+    try {
+      _warnPending += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+      const lines = _warnPending.split('\n');
+      _warnPending = lines.pop(); // the trailing partial line stays buffered
+      for (const b of splitWarningBlocks(lines)) _warnBlocks.push(b);
+    } catch { /* capture must NEVER break or drop the underlying write */ }
+    return _warnOrig(chunk, enc, cb);
+  };
+}
+
+// Take everything captured since the last drain, flushing any buffered partial line.
+export function drainBuildWarnings() {
+  try {
+    if (_warnPending) { for (const b of splitWarningBlocks([_warnPending])) _warnBlocks.push(b); _warnPending = ''; }
+  } catch { /* best-effort */ }
+  const out = _warnBlocks;
+  _warnBlocks = [];
+  return out;
+}
+
+// Observers of each build's captured blocks — refresh.mjs registers one so refresh.log keeps
+// its per-run, per-warning truth (state holds only a replaceable snapshot).
+export function onBuildWarnings(fn) {
+  _warnSinks.add(fn);
+  return () => _warnSinks.delete(fn);
+}
+
+// Test seam: forget the capture entirely (used by test/run.mjs so one case's warnings cannot
+// leak into the next). Restores the original stderr.write.
+export function __resetBuildWarningCapture() {
+  if (_warnOrig) { process.stderr.write = _warnOrig; _warnOrig = null; }
+  _warnPending = '';
+  _warnBlocks = [];
+  _warnSinks.clear();
+}
+
+function flushBuildWarnings(project, kind, complete) {
+  const blocks = drainBuildWarnings();
+  for (const fn of _warnSinks) { try { fn(blocks, { project, kind, complete }); } catch { /* a sink must not fail a build */ } }
+  try { recordBuildWarnings(project, kind, blocks, { complete }); } catch { /* persistence is best-effort */ }
+}
+
 // Phase progress bars are colored via the shared color policy (color.mjs): color on a
 // real TTY (build logs to stderr), plain in the relay/pipes, FORCE_COLOR to override.
 // The "N/total label" text is preserved verbatim regardless, so log scanners are safe.
@@ -76,69 +152,155 @@ function phaseBar(step, total, label) {
   return `  [${bar}] ${tag} ${label}`;
 }
 
-// A directory name that marks a contracts home: `contracts`/`asyncapi` (any case),
-// or any `*-contracts` dir. Matched case-insensitively.
-const CONTRACTS_DIR_NAME = /^(contracts|asyncapi)$/i;
-function isContractsDirName(name) {
-  return CONTRACTS_DIR_NAME.test(name) || /-contracts$/i.test(name);
-}
+// detectContractsDirs / isContractsDirName / hasTopLevelSpec now live in
+// src/contracts-dirs.js — ONE copy, shared with scripts/contracts.mjs (which used to
+// carry a hand-synced duplicate) and scripts/lib/compartments.mjs. Re-exported here
+// because this module's path is the one every caller already imports it from.
+export { detectContractsDirs };
 
-// Does `dir` DIRECTLY contain at least one AsyncAPI spec file? (Lets a standalone
-// `payments-contracts/` repo whose specs sit at its top level be discovered as its
-// own contracts home, not just via a nested contracts/ child.)
-function hasTopLevelSpec(dir) {
-  try {
-    for (const f of readdirSync(dir)) if (/\.asyncapi\.ya?ml$/i.test(f)) return true;
-  } catch { /* unreadable */ }
-  return false;
-}
-
-// Auto-detect the AsyncAPI contracts dirs for `root`, returning ALL matches deduped
-// (a root with both contracts/ and api-contracts/ loads BOTH, deterministically):
-//   - `root` ITSELF when its basename looks like a contracts dir, or it directly
-//     holds *.asyncapi.y(a)ml files (a standalone *-contracts repo linked in);
-//   - every CHILD dir whose name looks like a contracts dir — matched
-//     case-insensitively and following a symlink-to-dir.
-// The cross-compartment wire feature only activates if at least one exists, so
-// projects without any just skip it.
-export function detectContractsDirs(root) {
-  const dirs = [];
-  const seen = new Set();
-  const add = (p) => { if (!seen.has(p)) { seen.add(p); dirs.push(p); } };
-
-  if (isContractsDirName(basename(root)) || hasTopLevelSpec(root)) add(root);
-
-  try {
-    for (const e of readdirSync(root, { withFileTypes: true })) {
-      if (!isContractsDirName(e.name)) continue;
-      const full = join(root, e.name);
-      // A plain dir counts; so does a symlink that RESOLVES to a dir (isDirectory()
-      // is false for a symlink-to-dir, so stat the target explicitly).
-      let isDir = e.isDirectory();
-      if (!isDir && e.isSymbolicLink()) {
-        try { isDir = statSync(full).isDirectory(); } catch { isDir = false; }
-      }
-      if (isDir) add(full);
+// --- contracts-dir discovery, per walked root --------------------------------
+// Mode is read from the WALKED ROOT's own state.json, never from the editing project —
+// the same rule findCompartmentRoots follows (src/extract/walk.js), and for the same
+// reason: a linked member is indexed with ITS OWN boundaries so an incremental matches
+// that member's full build. A global-mode member linked into a recursive-mode graph
+// therefore keeps depth-1 discovery and unscoped matching.
+//
+// SCOPED TO ONE runBuild CALL, NEVER TO THE PROCESS. This used to be a pair of
+// module-level Maps keyed by root alone, never invalidated, living for the whole process
+// — and the MCP server IS a long-lived process that calls runBuild({reset:true}) over and
+// over (src/mcp/server.js), which is the path /wiregraph-rebuild explicitly prefers. The
+// consequence was that a contracts dir CREATED between two builds in that process was
+// invisible to the second one: `/wiregraph-contracts apply` created `<root>/contracts/`,
+// the follow-up full rebuild still reported zero contracts and zero seams, `contractsDir`
+// stayed null, the SessionStart nudge kept firing, and the stale list was PERSISTED. The
+// comments claiming a full build "always walks live" were false — every path went through
+// the memo; only the (now removed) disk cache was gated. A per-CALL context keeps the
+// reason the memo existed (fullBuild resolves the dirs for loading, for the state stamp
+// and for the fingerprint — one walk, not three) with none of the staleness.
+//
+// SCOPED TO ONE SAVE, NOT ONE runBuild, WHEN THE CALLER PASSES ONE IN. The post-edit hook
+// resolved the set TWICE per save otherwise: healPartitionDrift compares the fingerprint
+// (a live walk), then incrementalBuild — one function call later, in the SAME process —
+// built a fresh context and walked again, neither sharing the other's memo. Measured at
+// ~38ms per walk on a 4,300-directory tree, i.e. ~76ms per save, about 2.6x the per-edit
+// regression Phase 0 rejected as unacceptable. refresh.mjs now creates ONE context and
+// threads it through reindexFiles into the incremental. It stays a CONTEXT, not a cache:
+// it lives for one hook invocation and dies with it. A cross-process cache cannot answer
+// "did this change?" — only the stamp can — which is why the disk cache was correctly
+// deleted rather than repaired.
+//
+// IT CARRIES THE COMPARTMENT PARTITION TOO. Phase 3 built this context for the CONTRACTS
+// partition and left the COMPARTMENTS partition — the older of the two, and the one whose
+// resolution is the more expensive — with no memoization at all. A single save resolved it
+// about five times: healPartitionDrift's comparison, incrementalBuild's refusal check,
+// infoFor's attribution, and both walkSources passes. Resolving a declaration re-validates
+// every declared path against disk (~10.8ms on a large tree), and resolving an INFERRED
+// partition — now that global mode is fingerprinted too, which is the whole point of that
+// fix — is a full boundary walk. One memo per save, exactly like the contracts half.
+export function discoveryContext() {
+  const modes = new Map();
+  const entries = new Map();
+  const specs = new Map();
+  const partitions = new Map();
+  const recursive = (root) => {
+    if (!modes.has(root)) {
+      let v = false;
+      try { v = isRecursiveMode(readState(root)); } catch { v = false; }
+      modes.set(root, v);
     }
-  } catch { /* unreadable root — skip contracts */ }
-
-  return dirs;
+    return modes.get(root);
+  };
+  const key = (root) => `${recursive(root) ? 'R' : 'G'}\0${root}`;
+  const ctx = {
+    recursive,
+    // `{ dir, scopeRoot }[]` for one root — the shared rule in src/contracts-dirs.js, so
+    // the build and the fingerprint can never disagree about what governs what.
+    entries(root) {
+      const k = key(root);
+      if (!entries.has(k)) entries.set(k, rootContractsEntries(root, recursive(root)));
+      return entries.get(k);
+    },
+    // `{ spec, scopeRoot, digest }[]` for one root — what the FINGERPRINT hashes. Built
+    // from the entries above rather than by re-walking, so the walk really is once per
+    // context, and the spec reads (a readdir + a readFile per spec, on a handful of small
+    // files) happen once too.
+    specs(root) {
+      const k = key(root);
+      if (!specs.has(k)) specs.set(k, ctx.entries(root).flatMap(contractsDirSpecs));
+      return specs.get(k);
+    },
+    // `{ declared, value, roots }` for one root — the COMPARTMENT partition in force:
+    // what the fingerprint hashes AND the `[{dir,name}]` list attribution uses, from ONE
+    // resolution, so the guard and the walk can never disagree about what the partition is.
+    compartments(root) {
+      if (!partitions.has(root)) partitions.set(root, compartmentPartition(root));
+      return partitions.get(root);
+    },
+  };
+  return ctx;
 }
 
+// THERE IS NO CROSS-PROCESS DISCOVERY CACHE ANY MORE, deliberately. Phase 3 shipped a
+// `.wiregraph/contracts-dirs.json` written by the full build and reused by the save loop,
+// to spare the incremental path a live recursive walk (measured at ~34ms on a 3,900
+// -directory tree). The contracts-dir FINGERPRINT (scripts/lib/state.mjs) makes it dead
+// weight: the incremental now has to resolve the dir set LIVE anyway, to compare it against
+// what the last full build stamped — a cache read cannot answer "did this change?", it can
+// only answer with the stamp itself. One live walk per save, its result memoized for the
+// rest of that build, is therefore the whole cost, and it replaces a cache whose staleness
+// signal (an existsSync per cached dir) was vacuous on the exact sequence that broke
+// scoping: a delete+add — i.e. a MOVE — passed the guard and fed the save loop the OLD
+// scopes. Removing it also removes a bare writeFileSync into the one directory with a
+// documented torn-write incident, and a `[].every(existsSync)` that cached "no contracts
+// dirs" as authoritative.
+//
 // Ordered LIST of contract dirs for a full build over the union: each member's own
 // hand-written contracts dir(s), then this graph's out-of-source inferred/ dir.
 // Order is own-root-first, then members, then inferred — a hand-written spec always
 // precedes the auto-inferred one. Deduped. The inferred dir is written by
 // link/unlink's infer-to-disk phase (fullBuild only MATCHES on-disk specs).
-function resolveContractsDirs(opts, roots, project) {
-  if (opts.contracts) return [opts.contracts];
-  const dirs = [];
+//
+// Each entry is now `{ dir, scopeRoot }`. `scopeRoot` is the directory a contract
+// GOVERNS: a file matches one of its tokens only when the file sits beneath it
+// (src/extract/contracts.js#matchContracts). null means UNSCOPED — matches every file,
+// which is today's behaviour and therefore what global mode always gets.
+//
+//   - recursive mode  -> scopeRoot = dirname(dir). `server/contracts/` governs the
+//     siblings of its parent, i.e. everything under `server/`, and nothing else.
+//   - global mode     -> scopeRoot = null. UNCHANGED, byte for byte.
+//   - `--contracts <dir>` -> ALWAYS null. It is an explicit CLI/CI override with no
+//     natural scope (it routinely points OUTSIDE the tree), and silently narrowing it
+//     would change what a scripted caller's build means.
+//   - `.wiregraph/inferred/` -> ALWAYS null. It sits outside every source subtree, so
+//     dirname() would scope it to `.wiregraph/` and match nothing; and link-inferred
+//     cross-member seams are union-wide by construction, so scoping them would take
+//     every one of them dark.
+//   - a root that is ITSELF a contracts home -> ALWAYS null (see rootContractsEntries in
+//     src/contracts-dirs.js; dirname() there lands outside the project).
+function resolveContractsDirs(opts, roots, project, ctx) {
+  if (opts.contracts) return [{ dir: opts.contracts, scopeRoot: null }];
+  const out = [];
   const seen = new Set();
-  const add = (d) => { if (!seen.has(d)) { seen.add(d); dirs.push(d); } };
-  for (const root of roots) for (const d of detectContractsDirs(root)) add(d);
+  const add = (d, scopeRoot) => { if (!seen.has(d)) { seen.add(d); out.push({ dir: d, scopeRoot }); } };
+  for (const root of roots) for (const e of ctx.entries(root)) add(e.dir, e.scopeRoot);
   const inferred = join(wiregraphDir(project), 'inferred');
-  if (existsSync(inferred)) add(inferred);
-  return dirs;
+  if (existsSync(inferred)) add(inferred, null);
+  return out;
+}
+
+// The hand-written contracts dirs across the union, mode-aware — what fullBuild records
+// as state.contractsDirs (plural, recursive mode) / state.contractsDir (singular, the
+// pre-existing key). The out-of-source inferred/ dir is deliberately NOT here: it is our
+// own synthesized output, not user-authored coverage, and must not silence the
+// /wiregraph-contracts nudge.
+function handWrittenContractsDirs(opts, roots, ctx) {
+  if (opts.contracts) return [opts.contracts];
+  const out = [];
+  const seen = new Set();
+  for (const root of roots) {
+    for (const e of ctx.entries(root)) if (!seen.has(e.dir)) { seen.add(e.dir); out.push(e.dir); }
+  }
+  return out;
 }
 
 // The union of roots a full build walks for `project`: an explicit --root override
@@ -174,25 +336,41 @@ export function resolveDbPath(opts, project) {
 function fullBuild(opts, roots, project) {
   log(`wiregraph: scanning ${roots.join(', ')} (project ${project})`);
   const graph = new Graph(project);
+  // ONE discovery context for THIS build (see discoveryContext): the dirs are resolved
+  // once and reused by the contract load, the state stamp and the fingerprint.
+  const ctx = discoveryContext();
 
   log(phaseBar(1, 4, 'extracting code symbols + calls...'));
   const calls = [];
   const candidates = [];
+  // Comment ranges from the SAME parse, so matchContracts can tell a token USED in code
+  // from one merely MENTIONED in prose. It scans raw text and has no parse of its own.
+  const comments = new Map();
   for (const r of roots) {
     const res = extractCode(graph, r, log);
     calls.push(...res.calls);
     candidates.push(...res.candidates);
+    for (const [k, v] of res.comments || []) comments.set(k, v);
   }
 
   log(phaseBar(2, 4, 'resolving calls...'));
   resolveCalls(graph, calls, log);
 
-  const contractsDirs = resolveContractsDirs(opts, roots, project);
+  // A full build ALWAYS walks live — and now genuinely does, because the only memo left
+  // is this call's own context (the module-level one made "always walks live" a lie).
+  const contractsDirs = resolveContractsDirs(opts, roots, project, ctx);
   if (contractsDirs.length) {
-    log(phaseBar(3, 4, `loading + matching contracts from ${contractsDirs.join(', ')}...`));
+    log(phaseBar(3, 4, `loading + matching contracts from ${contractsDirs.map((e) => e.dir).join(', ')}...`));
     const contracts = loadAllContracts(graph, contractsDirs, log);
-    for (const r of roots) matchContracts(graph, r, contracts, log);
+    // constDefIndex: where each named constant is DEFINED, so the definition site itself
+    // never mints a REFERENCES edge (a declaration is not a use — see matchContracts).
+    // The candidates are already in hand from phase 1, so this costs no extra parsing.
+    const constDefs = constDefIndex(candidates);
+    for (const r of roots) matchContracts(graph, r, contracts, log, null, constDefs, comments);
     buildWireEdges(graph, contracts, log);
+    // Resource contracts (*.resource.yaml) derive their own writer->reader seam from
+    // the SAME REFERENCES. No-op when no resource spec exists.
+    buildResourceEdges(graph, contracts, log);
   } else {
     log(phaseBar(3, 4, 'no contracts dir found — skipping cross-compartment wire edges'));
   }
@@ -210,9 +388,59 @@ function fullBuild(opts, roots, project) {
   // The out-of-source inferred/ dir is deliberately excluded here: it is our own
   // synthesized output, not user-authored coverage, so its presence must not silence
   // the nudge. candidates already span every member root, so the seam count is union-wide.
-  const handWritten = opts.contracts || roots.flatMap(detectContractsDirs)[0] || null;
-  try { updateState(project, { inferredSeams: clusterSeams(candidates).length, contractsDir: handWritten, structuralDriftSinceFullBuild: false, seamStaleSinceInference: false }); }
-  catch { /* metadata only — never fail a build over it */ }
+  // PLURAL, because recursive mode has genuinely several: one contracts dir per governed
+  // subtree, none of which is "the" one. `contractsDir` (singular) stays the first entry
+  // — it is what /wiregraph-contracts writes into and what every pre-existing consumer
+  // reads — and `contractsDirs` carries the whole list so nothing has to guess. The
+  // SessionStart nudge reads BOTH (scripts/hooks/session-start.mjs), which is harmless but
+  // is NOT load-bearing: `handWritten` below is `handWrittenDirs[0]`, and detectContractsDirs
+  // returns the WHOLE discovered list in recursive mode — nested dirs included, shallowest
+  // first — so the singular is null exactly when the plural is empty. There is no
+  // "recursive project with only nested contracts dirs" that the singular alone would miss.
+  const handWrittenDirs = handWrittenContractsDirs(opts, roots, ctx);
+  const handWritten = handWrittenDirs[0] || null;
+  // Every token those hand-written specs ALREADY declare. inferredSeams is the count of
+  // seams still worth INFERRING, so it must be computed with the same exclusion set
+  // scripts/contracts.mjs uses — otherwise the SessionStart nudge and /wiregraph-status
+  // count seams the user has already written down by hand, and quote a number the CLI
+  // then contradicts (`scan` excludes them, so it reports fewer, or none at all).
+  // Drafts are excluded from the exclusion set by handWrittenTokens itself, so a previous
+  // `apply` cannot make inference forget what it proposed. Parse failures are already
+  // logged by the contract load above, so this pass stays silent.
+  const declaredTokens = handWrittenTokens(
+    opts.contracts ? [{ dir: opts.contracts, scopeRoot: null }] : roots.flatMap((r) => ctx.entries(r)));
+  // inferredSeams counts BOTH inferrable seam kinds — wire (routes/topics) and resource
+  // (shared named constants). It is the nudge gate ("seams found AND no hand-written
+  // contracts dir"), so a project whose only cross-compartment coupling is a shared file
+  // would otherwise never be told that /wiregraph-contracts has something for it. ONE
+  // key, because the existing consumers (SessionStart, /wiregraph-status) read exactly
+  // one; a second key nothing reads is how `wireSeams` became dead weight.
+  // COST — AND IT IS NOT SMALL ON A LARGE TREE. clusterResourceSeams returns immediately
+  // when no module-scope string constant exists at all, and on a ~200-file project it is
+  // the 5-11ms this comment used to quote as though it were the whole story. Once any
+  // constant qualifies it re-READS every source file in the union (it does not re-parse
+  // them), i.e. a SECOND full read pass of the tree, and that scales with the tree: 621ms
+  // measured on a 7,200-file project. It runs on every full build, including every one an
+  // incremental drift-escalates into. So: negligible for a small or constant-free tree,
+  // a real fraction of a large build. Read the number as O(files), not as a constant.
+  //
+  // THIS HALF IS METADATA ABOUT THE SOURCE TREE — how many seams the walk found, and which
+  // contracts dirs it discovered — so it is safe to record before the db is touched, and
+  // it is deliberately kept SEPARATE from the two fingerprint stamps below. The stamps used
+  // to ride along in this same updateState, inside this same bare `catch {}`, which coupled
+  // them to the two inference passes: any throw out of clusterSeams / clusterResourceSeams
+  // silently left the OLD stamp, so the next save saw drift, escalated to a full rebuild,
+  // which threw here again, which escalated again — a full rebuild per file save, forever,
+  // visible only as repeating lines in refresh.log. Two writes, two failure domains.
+  try {
+    updateState(project, {
+      inferredSeams: clusterSeams(candidates, { exclude: declaredTokens }).length
+        + clusterResourceSeams(candidates, roots, { comments, exclude: declaredTokens }).length,
+      contractsDir: handWritten,
+      contractsDirs: handWrittenDirs,
+    });
+  }
+  catch (e) { log(`  seam/contracts-dir metadata not recorded (${e.message}) — the graph is unaffected`); }
 
   const stats = graph.stats();
   log('graph stats: ' + JSON.stringify(stats, null, 2));
@@ -245,14 +473,72 @@ function fullBuild(opts, roots, project) {
   } finally {
     db.close();
   }
+
+  // --- THE PARTITION STAMPS, AFTER THE GRAPH IS ON DISK -----------------------
+  // Both fingerprints assert ONE thing: "the graph in the db was built against THIS
+  // partition". Only a full build may assert it — runBuild forces reset for every
+  // non-`--files` build and reset deletes every row in every table, so a completed full
+  // build really does re-derive the whole union under the partition it just resolved.
+  //
+  // THAT ENTITLEMENT IS EARNED BY COMPLETING, NOT BY STARTING. This used to be stamped
+  // before the db was even opened, ~25 lines above, with a comment claiming a full build
+  // "is the only operation that is safe by construction" — true of the operation, false of
+  // the attempt. Any throw between the stamp and the write left state asserting the graph
+  // matched the NEW partition over a db still holding the OLD one, which PERMANENTLY
+  // disarms both guards: changedSince stops escalating and incrementalBuild stops refusing,
+  // for every subsequent save, with no self-heal. Observed (1 -> 2 compartments, then a
+  // full build failing at the db open): stamp moved to the new partition, compartmentsDrift
+  // went null, and the next ordinary save produced a live WIRE seam pointing into a
+  // compartment that no longer existed, which trace_contract reported as real.
+  //
+  // The reachable failure points between the two positions are not exotic: ENOSPC or EACCES
+  // on the db path, a `<db>.lock` that cannot be taken (connect acquires it before reading),
+  // loadGraph's newer-schema refusal, and — worst — loadGraph's member-losing-reset
+  // backstop, a guard that exists to PREVENT corruption and whose firing used to corrupt the
+  // baseline instead. It is also stamped nowhere on the `--no-load` path now, which is
+  // correct for the same reason: --no-load writes no db, so nothing about the db changed.
+  //
+  // MERGED, not replaced (stampCompartmentsFingerprint / stampContractsFingerprint): a
+  // member that is transiently unmounted, or deliberately excluded by unlink's reduced
+  // union, keeps its baseline instead of dropping out and forging a partition change. Same
+  // rule, same reason, as the reposLastSha merge in refresh.mjs.
+  //
+  // The two honesty flags are cleared HERE and not with the metadata above, for the same
+  // reason: "no structural drift since the last full build" is a claim about the GRAPH.
+  //
+  // NOT FATAL, BUT NEVER SILENT. The graph on disk is correct and queryable; only the guard
+  // baseline is stale, and a stale baseline fails SAFE (drift -> escalate -> full rebuild).
+  // But that is also the M3 loop if it recurs, so it is logged rather than swallowed —
+  // refresh.log then names the reason instead of showing an unexplained rebuild per save.
+  try {
+    updateState(project, {
+      structuralDriftSinceFullBuild: false,
+      seamStaleSinceInference: false,
+      compartmentsFingerprint: stampCompartmentsFingerprint(project, roots, { partitionOf: (r) => ctx.compartments(r) }),
+      contractsFingerprint: stampContractsFingerprint(project, roots, { contracts: opts.contracts || null, specsOf: (r) => ctx.specs(r) }),
+    });
+  } catch (e) {
+    log(`wiregraph: WARNING — the graph was written but its partition fingerprints could NOT be stamped (${e.message}). `
+      + 'The graph is correct; until this is fixed every incremental update will escalate to a full rebuild.');
+  }
+}
+
+// The compartment names ALREADY in the db for this project — the last full build's
+// complete set. Best-effort by construction: an unreadable/empty db just means the caller
+// falls back to whatever its in-memory graph knows, which is the pre-existing behaviour.
+function dbCompartmentNames(db, project) {
+  try { return db.prepare('SELECT DISTINCT name FROM compartments WHERE project = ?').all(project).map((r) => r.name); }
+  catch { return []; }
 }
 
 // --- incremental build ------------------------------------------------------
 // Re-index only the given files: delete their prior nodes, extract just them,
 // resolve their OUTGOING calls against the whole project (read from the db), then
 // reload. Incoming name-based CALLS to a renamed symbol may dangle until a full
-// rebuild; WIRE (cross-compartment derived) edges are not rebuilt here — both are
-// the documented full-rebuild backstop.
+// rebuild — THAT is the one documented full-rebuild backstop here. The DERIVED seams
+// (WIRE and RESOURCE) are NOT in that category any more: pruneFile drops the seams
+// touching a re-indexed symbol and rederiveWireEdges rebuilds both from the now-fresh
+// REFERENCES at the end of this function, so a seam survives an ordinary save.
 function incrementalBuild(opts, root, project) {
   if (!opts.load) throw new Error('--files (incremental) requires a load; remove --no-load');
 
@@ -261,11 +547,93 @@ function incrementalBuild(opts, root, project) {
   // under a linked member is attributed with the member's own boundaries/basename,
   // matching that member's full build. Works for existing AND deleted files.
   const roots = memberRoots(project, opts);
-  const infoCache = new Map();
-  const infoFor = (r) => {
-    if (!infoCache.has(r)) infoCache.set(r, { compartmentRoots: findCompartmentRoots(r), rootName: basename(r) });
-    return infoCache.get(r);
-  };
+
+  // BELT AND BRACES against a stale partition. The declared-compartment boundaries are
+  // read fresh below (infoFor → the shared discoveryContext), but pruneFile deletes by
+  // `(project, compartment, file)` — so if the declaration changed since the last full
+  // build, the prune targets rows that no longer exist under that key, MISSES, and the
+  // reload inserts the same symbols a second time under the NEW compartment: duplicate
+  // symbols under two compartments plus orphaned CALLS edges, silently. changedSince
+  // already escalates the auto-catch-up to a full rebuild for this; this refusal covers
+  // every OTHER incremental entry point (post-edit --files, update_graph incremental,
+  // the read-time self-heal). An ABSENT stamp means "no baseline recorded", never
+  // "changed" - a project last built before this key existed must not be refused.
+  //
+  // AND IT COVERS THE DISK HALF, NOT JUST THE DECLARATION TEXT. Renaming or deleting a
+  // declared source directory re-partitions the graph exactly as editing the declaration
+  // does, and used to sail straight through here because nothing hashed disk state; the
+  // fingerprint now derives from the partition the read path RESOLVES to, so a vanished
+  // declared path moves it (see scripts/lib/state.mjs).
+  // ONE discovery context for this incremental (see discoveryContext): the live partition
+  // this refusal needs is the SAME partition infoFor then attributes against, and the live
+  // contracts walk the refusal below needs is the same one resolveContractsDirs then uses.
+  // `opts.ctx` widens that to ONE PER SAVE — the post-edit hook has already resolved both
+  // to compare the fingerprints, and without sharing it this process resolves them twice,
+  // one function call apart. Absent (every other entry point) it is one context per build
+  // exactly as before; it is never a cross-CALL cache.
+  const ctx = opts.ctx || discoveryContext();
+
+  // Held, not just compared: armAbsentFingerprints stamps EXACTLY these values at the end
+  // of a successful incremental, so the baseline it writes is the partition this update
+  // actually attributed and pruned against, resolved once.
+  const liveCompartments = compartmentsFingerprint(roots, { project, partitionOf: (r) => ctx.compartments(r) });
+  const drift = compartmentsDrift(
+    readState(project)?.compartmentsFingerprint,
+    liveCompartments,
+  );
+  if (drift) {
+    throw new Error(
+      // "the compartment partition changed" is the ONE phrase all three sites use for this
+      // condition — here, changedSince's escalation reason (scripts/lib/git.mjs) and the
+      // refresh hook's greppable label (scripts/hooks/refresh.mjs#healPartitionDrift). It
+      // deliberately does NOT say "declared": global mode is fingerprinted too, so this
+      // branch is reachable on a project where NOTHING was ever declared and a manifest
+      // merely appeared in a subdirectory. The parenthetical says which kind moved. If you
+      // reword one site, reword all three — they are matched by grep, not by a constant.
+      'wiregraph: the compartment partition changed since the last full build '
+      + `(${drift}; the partition may be DECLARED in state.json or INFERRED from .git / build `
+      + 'manifests — either one re-partitions every id). An incremental update would '
+      + 'attribute files to the NEW compartments while pruning under the OLD ones, leaving '
+      + 'duplicate symbols and orphaned edges. Run a full rebuild (/wiregraph-rebuild, or '
+      + 'update_graph {full:true}) - it is safe by construction.',
+    );
+  }
+
+  // BELT AND BRACES against a stale CONTRACT SCOPE — the same shape as the partition
+  // refusal above, for the other thing a full build resolves and an incremental inherits.
+  // Scope is applied at MATCH time and persisted nowhere (the design's schema bet), which
+  // is sound only while every stored REFERENCES row was minted under the scope in force
+  // NOW. pruneFile deletes rows for the EDITED file only, and rederiveWireEdges then groups
+  // EVERY REFERENCES row in the db by contractId|token with no scope of its own — so a row
+  // minted under a WIDER scope is indistinguishable from a fresh one and gets re-created.
+  //
+  // The subject is the resolved SPEC set, not the dir set (see contractsFingerprint): the
+  // narrowing that fabricates the false seam is a SPEC moving inward, which two already
+  // -existing contracts dirs hide completely, and a RETITLED spec orphans its old id's rows
+  // the same way. Likewise a `--contracts` build followed by an ordinary incremental, a
+  // spec added since the last full build, and — global mode included — one DELETED, which
+  // otherwise left a ghost contract with live REFERENCES and a WIRE edge for a spec no
+  // longer on disk. An ABSENT stamp is "no baseline", never "changed".
+  const liveContracts = contractsFingerprint(roots, { project, contracts: opts.contracts || null, specsOf: (r) => ctx.specs(r) });
+  const cDrift = contractsDrift(
+    readState(project)?.contractsFingerprint,
+    liveContracts,
+  );
+  if (cDrift) {
+    throw new Error(
+      'wiregraph: the contract specs in force changed since the last full build '
+      + `(${cDrift}). Contract SCOPE is applied when REFERENCES are minted and is not stored, `
+      + 'so an incremental update would re-derive seams over rows minted under the OLD scopes '
+      + '- fabricating cross-scope WIRE edges a full rebuild does not produce, and leaving stale '
+      + 'REFERENCES rows that trace_contract reports as real. Run a full rebuild '
+      + '(/wiregraph-rebuild, or update_graph {full:true}) - it is safe by construction.',
+    );
+  }
+
+  // Attribution reads the partition from the SAME context the refusal above compared, so
+  // the boundaries this update attributes against are byte-for-byte the ones it just
+  // certified as matching the graph — and the tree is resolved once per save, not twice.
+  const infoFor = (r) => ({ compartmentRoots: ctx.compartments(r).roots, rootName: basename(r) });
   const ownerOf = (abs) => {
     let best = null;
     for (const r of roots) if (abs === r || abs.startsWith(r + sep)) { if (!best || r.length > best.length) best = r; }
@@ -304,12 +672,23 @@ function incrementalBuild(opts, root, project) {
     const graph = new Graph(project);
     let structuralDrift = false;
     const calls = [];
+    // Candidates are collected here for ONE reason: the constant-DEFINITION index the
+    // re-match needs (see matchContracts). Without it the incremental path would re-mint
+    // exactly the definition-site REFERENCES the full build excludes, so a save of the
+    // constants module would resurrect a phantom seam half that a rebuild then removes.
+    const candidates = [];
+    // …and the comment ranges, for the same reason: a re-match that could not see
+    // comments would re-mint exactly the prose "references" the full build excludes.
+    const comments = new Map();
 
     // Contract wiring is resolved ONCE up front (not just inside the present branch)
     // so both the WIRE re-derive (Change 1) and the seam-staleness flag (Change 2) can
     // see it even on a deletion-only update. `contracts` is the merged set matchContracts
     // used, reused by the re-derive so orientation matches a full build.
-    const contractsDirs = resolveContractsDirs(opts, roots, project);
+    // Resolved from THIS call's context, so the walk the fingerprint check above already
+    // paid for is reused rather than repeated. (Global-mode roots never walk at all — their
+    // discovery is one readdir, so the legacy save loop is untouched.)
+    const contractsDirs = resolveContractsDirs(opts, roots, project, ctx);
     let contracts = null;
     // Compartments this update touched, and a reader for the compartments that CURRENTLY
     // reference a contract in the db — used by Change 2's contract-relevance heuristic.
@@ -323,6 +702,8 @@ function incrementalBuild(opts, root, project) {
         if (!owners.has(r)) continue;
         const res = extractCode(graph, r, log, fileFilter);
         calls.push(...res.calls);
+        candidates.push(...res.candidates);
+        for (const [k, v] of res.comments || []) comments.set(k, v);
       }
     }
 
@@ -342,12 +723,18 @@ function incrementalBuild(opts, root, project) {
       // against a narrower set, a body-only edit to a producer would fail to re-mint its
       // REFERENCES to the inferred/sibling-member contract, silently dropping the
       // cross-repo seam until a full rebuild (M1). Re-match on each OWNER root that holds
-      // a changed file, mirroring fullBuild's per-root matchContracts. (WIRE is NOT
-      // re-derived here — that stays a full-rebuild backstop; only REFERENCES are
-      // restored.)
+      // a changed file, mirroring fullBuild's per-root matchContracts. (This step restores
+      // REFERENCES only; the derived WIRE/RESOURCE seams are rebuilt from them by
+      // rederiveWireEdges at the end of this function — see Change 1 below.)
       if (contractsDirs.length) {
-        contracts = loadAllContracts(graph, contractsDirs, log);
-        for (const r of owners) matchContracts(graph, r, contracts, log, fileFilter);
+        // The compartment set this graph really has, for validateResourceRoles: THIS
+        // graph holds only the edited files' compartments, so validating against it made
+        // every save warn that a real compartment "does not exist in this graph" and list
+        // a "Known compartments" set of one. The db's compartments are the last full
+        // build's complete set, and the fresh graph adds any this save just created.
+        contracts = loadAllContracts(graph, contractsDirs, log, { knownCompartments: dbCompartmentNames(db, project) });
+        const constDefs = constDefIndex(candidates);
+        for (const r of owners) matchContracts(graph, r, contracts, log, fileFilter, constDefs, comments);
       }
       // Structural drift: did this update change the symbol NAME-set (add / remove /
       // rename) rather than only edit a body? If so, callers resolved by name in
@@ -423,12 +810,64 @@ function incrementalBuild(opts, root, project) {
   } finally {
     db.close({ persist: ok });
   }
+  if (ok) armAbsentFingerprints(project, liveCompartments, liveContracts);
+}
+
+// --- arming the guards on the INSTALLED BASE ---------------------------------
+// `fingerprintDrift` reads an ABSENT stamp as "no baseline", never as "changed", and that
+// is deliberate and correct (§14): it is what stops a wiregraph upgrade from force-
+// rebuilding every project on its next catch-up. Its consequence, unnoticed, is that
+// EVERY project whose graph was built by a release that predates a given key carries an
+// UNGUARDED graph — and stays that way for as long as nobody runs a full rebuild by hand,
+// which for the save loop is forever. All three corruptions the guards exist to stop
+// reproduce verbatim on such a project: a manifest added to a subdirectory (duplicate
+// symbols under two compartments, no self-heal); a declaration change waved through by an
+// incremental (duplicate symbols plus stale CALLS edges); a deleted contracts dir leaving
+// a ghost contract whose WIRE edge trace_contract reports as real.
+//
+// So: when the stamp for a root is ABSENT and an incremental has just COMPLETED against
+// that root, stamp what THAT INCREMENTAL USED. The promise is kept exactly, because
+// STAMPING IS NOT COMPARING:
+//   - it runs AFTER both refusals, so it cannot make this save escalate — the very first
+//     post-upgrade save is byte-for-byte what it was before, refusal included;
+//   - it runs only when `ok` is set, i.e. the incremental really completed;
+//   - it FILLS ABSENT KEYS ONLY. An existing baseline is never rewritten, so a stamp that
+//     legitimately disagrees with the live tree keeps disagreeing and keeps escalating,
+//     and the copy-poison value (a string under '.') is never papered over.
+// From the SECOND save on, the guard is armed against the partition the graph was last
+// indexed under. That is strictly better than the status quo ante, which was never.
+//
+// It cannot certify what it did not see: if the db was ALREADY built against a different
+// partition before this upgrade, that corruption predates the stamp and no stamp can
+// undo it — a full rebuild does. This closes the window going forward; it does not
+// retroactively validate an unguarded graph.
+function armAbsentFingerprints(project, liveCompartments, liveContracts) {
+  try {
+    const st = readState(project);
+    if (!st) return; // no state file — not an initialized project; writing one here is not this function's job
+    const patch = {};
+    const fill = (key, live) => {
+      const raw = st[key];
+      const prior = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : null;
+      const add = {};
+      for (const [k, v] of Object.entries(live || {})) if (!prior || prior[k] === undefined) add[k] = v;
+      if (Object.keys(add).length) patch[key] = { ...(prior || {}), ...add };
+    };
+    fill('compartmentsFingerprint', liveCompartments);
+    fill('contractsFingerprint', liveContracts);
+    if (Object.keys(patch).length) updateState(project, patch);
+  } catch { /* metadata only — an incremental must never fail over its baseline stamp */ }
 }
 
 // Programmatic entry point — used by the MCP update_graph tool and the hooks so
 // they can refresh the graph in-process without shelling out. opts mirrors the
-// CLI flags: { target, project?, files?, reset?, contracts?, db?, load?, dump? }.
+// CLI flags: { target, project?, files?, reset?, contracts?, db?, load?, dump? }, plus
+// `ctx?` — a discoveryContext the CALLER already resolved contracts against, honoured only
+// on the incremental path (see incrementalBuild). It rides through in `o` via the spread.
 export async function runBuild(opts = {}) {
+  // Before anything can warn (see installBuildWarningCapture). Idempotent, and transparent
+  // to whatever else is writing to stderr.
+  installBuildWarningCapture();
   const o = { load: true, reset: false, dump: null, contracts: null, project: null, files: null, db: null, ...opts };
   const root = realpathSync(resolve(o.target));
   const project = o.project ? realpathSync(resolve(o.project)) : root;
@@ -446,19 +885,35 @@ export async function runBuild(opts = {}) {
   // manual step. registerProject writes only when the root is new, so the steady state
   // is a cheap read. Best-effort — a registry write must never fail a build.
   try { registerProject(project); } catch { /* best-effort */ }
-  if (o.files && o.files.length) return incrementalBuild(o, root, project);
-  // A full (non-`files`) build is a COMPLETE re-derivation of the whole union, so it
-  // must always reset: loadGraph upserts nodes idempotently but INSERTs edges (deduped
-  // only within a batch), so accumulating a full build on top of existing rows would
-  // re-insert every edge additively — doubling counts on the 2nd run, tripling on the
-  // 3rd (M7). Force reset here regardless of --reset; the incremental (`--files`) path
-  // above legitimately keeps reset:false + per-file prune. (unlink's reduced-union
-  // rebuild already passes reset:true + allowReducedUnion:true, so it's unaffected.)
-  o.reset = true;
-  // Every reset/full build funnels here, so the union walk is the single source of
-  // truth: a stray single-root rebuild can't silently drop linked members.
-  const roots = memberRoots(project, o);
-  return fullBuild(o, roots, project);
+  // `kind` decides WHICH record this build may write, and `complete` decides whether it may
+  // assert cleanliness (recordBuildWarnings). A build that throws part-way has usually
+  // already emitted its content-dropping warnings and is entitled to record THOSE — losing
+  // them to a later, unrelated failure is exactly the silence this fixes.
+  const kind = (o.files && o.files.length) ? 'incremental' : 'full';
+  let complete = false;
+  try {
+    if (o.files && o.files.length) {
+      const r = incrementalBuild(o, root, project);
+      complete = true;
+      return r;
+    }
+    // A full (non-`files`) build is a COMPLETE re-derivation of the whole union, so it
+    // must always reset: loadGraph upserts nodes idempotently but INSERTs edges (deduped
+    // only within a batch), so accumulating a full build on top of existing rows would
+    // re-insert every edge additively — doubling counts on the 2nd run, tripling on the
+    // 3rd (M7). Force reset here regardless of --reset; the incremental (`--files`) path
+    // above legitimately keeps reset:false + per-file prune. (unlink's reduced-union
+    // rebuild already passes reset:true + allowReducedUnion:true, so it's unaffected.)
+    o.reset = true;
+    // Every reset/full build funnels here, so the union walk is the single source of
+    // truth: a stray single-root rebuild can't silently drop linked members.
+    const roots = memberRoots(project, o);
+    const r = fullBuild(o, roots, project);
+    complete = true;
+    return r;
+  } finally {
+    flushBuildWarnings(project, kind, complete);
+  }
 }
 
 // --- edit-sync primitive ----------------------------------------------------
@@ -476,7 +931,11 @@ export async function runBuild(opts = {}) {
 //      is 'off'. `target: M` makes attribution use M's own compartment boundaries
 //      (matching M's full build); `project: G` tags the rows and picks G's db.
 // Files MUST be absolute. Returns the set of graph roots that were rebuilt.
-export async function reindexFiles(files, editingProject, { fanOut = false } = {}) {
+// `ctx` is an optional discoveryContext (see discoveryContext) the caller has ALREADY
+// resolved contracts against — refresh.mjs passes the one healPartitionDrift used, so a
+// save resolves the contracts dirs once instead of twice in the same process. Purely a
+// cost knob: every value it carries is resolved live within this one hook invocation.
+export async function reindexFiles(files, editingProject, { fanOut = false, ctx = null } = {}) {
   const byMember = new Map();
   for (const f of files || []) {
     const abs = resolve(f);
@@ -496,7 +955,7 @@ export async function reindexFiles(files, editingProject, { fanOut = false } = {
       // Skipping the editing target here would index nothing yet still let the caller
       // advance reposLastSha and report success — a permanently-missed change.
       if (G !== editingProject && readState(G)?.autoUpdate === 'off') continue;
-      await runBuild({ target: m, project: G, files: filesForM });
+      await runBuild({ target: m, project: G, files: filesForM, ctx });
       rebuilt.add(G);
     }
   }

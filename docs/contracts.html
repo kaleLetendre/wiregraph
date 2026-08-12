@@ -184,8 +184,17 @@
     display:flex;gap:14px;align-items:flex-start;
   }
   .how-note .b{color:var(--amber);flex:0 0 auto;font-size:18px;line-height:1.2}
+  .how-note>div{min-width:0}
   .how-note b{color:var(--ink);font-weight:600}
   .how-note code{font-family:var(--mono);color:var(--amber);font-size:12.5px}
+  .how-note pre{
+    font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--dim);
+    margin:12px 0 0;padding:12px 14px;border-radius:8px;border:1px solid var(--line);
+    background:rgba(0,0,0,.18);overflow-x:auto;max-width:100%;white-space:pre;
+  }
+  .how-note pre b{color:var(--cyan);font-weight:500}
+  .how-note ul{margin:10px 0 0;padding-left:18px}
+  .how-note li{margin:5px 0}
 
   /* ---------- sources ---------- */
   .src-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:36px}
@@ -492,6 +501,64 @@
       <span class="b">⚑</span>
       <div>Detection is a <b>heuristic</b>, and contracts are <b>proposed, not written</b>. wiregraph reads the shared tokens straight out of your code and drafts the seam — it never edits your source or invents a spec you didn't declare. Run <code>/wiregraph-contracts</code> to review the inferred wires as a draft AsyncAPI spec before you trust them.</div>
     </div>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
+      <div><b>Wire contracts are AsyncAPI — 2.x and 3.x are both read.</b> A wire spec is an <code>&lt;name&gt;.asyncapi.yaml</code> (or <code>.yml</code>) in a directory named <code>contracts/</code>, <code>asyncapi/</code> or <code>*-contracts</code>. The version decides only <i>where the route is written</i>, and wiregraph reads it in the right place for the version it declares. In <b>3.x</b> the route is <code>channels.&lt;key&gt;.address</code> and the channel <i>key</i> is an arbitrary id that is deliberately <b>not</b> a token (naming a 3.x channel <code>submit-order</code> mints nothing on its own); direction comes from the top-level <code>operations:</code> map. In <b>2.x</b> there is no <code>address:</code> field: the channel <b>key <i>is</i> the address</b> and is read as the token, rooted (<code>/alerts/{id}/escalate</code>) or unrooted (<code>smartylighting/streetlights/event/measured</code>, the idiomatic 2.x spelling), and both forms match the route as your source writes it, <code>{param}</code> segments included; direction comes from each channel's own <code>publish</code> / <code>subscribe</code>. Payload field names under <code>properties:</code> are tokens in both versions. A version that is neither 2 nor 3 is <b>warned about by file and by version</b> — a 1.x or 4.x doc is read with the 3.x rules, which may find nothing, and the build logs <code>⚠ &lt;file&gt;: asyncapi &lt;version&gt; — wiregraph reads AsyncAPI 2.x and 3.x only.</code> A spec with no <code>asyncapi:</code> line at all is treated as 3.x-shaped. Separately, a spec that ends up with <b>zero matchable tokens</b> gets its own named warning (<code>⚠ &lt;file&gt;: … this spec defines NO matchable tokens</code>) — that, not the version, is the line to look for when a contract loads and governs nothing.
+      <pre>asyncapi: '3.0.0'            <b># 2.x is read too — see the 2.x example below</b>
+info:
+  title: Terminal Wire       <b># the contract id — UNIQUE across all specs</b>
+  version: 0.1.0
+channels:
+  submit-order:
+    address: /orders/{id}/items          <b># matched token, kept parameterized</b>
+    x-wiregraph-producers: [terminal]    <b># COMPARTMENT names that call it</b>
+    x-wiregraph-consumers: [orders_api]  <b># COMPARTMENT names that serve it</b>
+    messages:
+      request:
+        payload:
+          type: object
+          properties:
+            order_id: { type: string }   <b># payload fields are tokens too</b>
+operations:
+  receive-submit-order:
+    action: receive                      <b># server receives ⇒ client-to-server</b>
+    channel: { $ref: '#/channels/submit-order' }
+    messages: [{ $ref: '#/channels/submit-order/messages/request' }]</pre>
+      <p>The same contract in <b>2.x</b>, where the channel key carries the route and the channel's own <code>publish</code>/<code>subscribe</code> carries the direction:</p>
+      <pre>asyncapi: '2.6.0'
+info:
+  title: Terminal Wire       <b># the contract id — UNIQUE across all specs</b>
+  version: 0.1.0
+channels:
+  /orders/{id}/items:                    <b># 2.x: the KEY is the address = the token</b>
+    x-wiregraph-producers: [terminal]
+    x-wiregraph-consumers: [orders_api]
+    publish:                             <b># 2.x: published INTO the app ⇒ client-to-server</b>
+      message:
+        payload:
+          type: object
+          properties:
+            order_id: { type: string }   <b># payload fields are tokens too</b></pre>
+      <ul>
+        <li><b><code>info.title</code> is the id.</b> It must be unique across every spec in the project, in both formats — two specs sharing a title merge into one contract node.</li>
+        <li><b>Two kinds of token are matched against your code:</b> every channel address (3.x <code>address:</code>, 2.x the channel <i>key</i>), and every key under any <code>properties:</code> map. An address starting with <code>/</code> is matched as a route, with each <code>{param}</code> segment matching however the source writes it (<code>:id</code>, <code>${id}</code>, <code>{id}</code>, or a concrete value); an address that does not start with <code>/</code> is matched literally, which is how topics, 2.x channel keys, routing keys and env-var names work.</li>
+        <li><b>Tokens must be distinctive</b> or they are dropped: a route needs 5+ characters and must not be a generic endpoint (<code>/health</code>, <code>/metrics</code>, <code>/api</code>, <code>/status</code>, <code>/version</code>…); a non-route needs a dotted/colon key, an underscore with 6+ characters, or a 10+ character camelCase name. Generic words (<code>id</code>, <code>type</code>, <code>state</code>, <code>message</code>…) and ubiquitous env vars (<code>DATABASE_URL</code>, <code>PORT</code>, <code>LOG_LEVEL</code>…) are always dropped — a generic token would match every file and manufacture phantom seams.</li>
+        <li><b><code>x-wiregraph-producers</code> / <code>x-wiregraph-consumers</code> are what make the edge directed.</b> They are arrays of <i>compartment names</i> on the channel — the names <code>graph_status</code> reports. Omit them and you still get references, but a weaker seam.</li>
+        <li><b>Direction is read wherever the version keeps the operations,</b> server-perspective either way. In 3.x that is the top-level <code>operations:</code> map: <code>action: receive</code> tags that operation's fields client→server, <code>action: send</code> tags them server→client, and an operation's <code>reply.messages</code> get the opposite. In 2.x it is the channel's own members: <code>publish</code> is published <i>into</i> the app (client→server) and <code>subscribe</code> is what the app publishes out (server→client). A <code>/</code>-leading token with no operation on either shape defaults to client→server.</li>
+      </ul>
+      </div>
+    </div>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
+      <div><b>A mention in a comment is not a reference.</b> A token named only inside a comment mints no contract edge — a comment quoting a route is not an implementation of it. If you are upgrading a graph built by an older wiregraph, a legacy contract whose only reference on one side sat in a comment flips from <b>satisfied</b> to <b>one-sided</b> at its next full rebuild. That is the true reading arriving, not a regression: that side was never implemented.</div>
+    </div>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
+      <div><b>Resource contracts</b> — coupling through a shared <i>thing</i> rather than a wire: a file or sentinel path, a DB table+key, a shared-memory region, a named pipe. The roles are <b>writer</b> and <b>reader</b>, not request and reply, and the semantics are presence/state. They live in a <code>&lt;name&gt;.resource.yaml</code> in your contracts dir listing each resource's <code>id</code>, <code>kind</code>, <code>semantics</code>, <code>writers</code> and <code>readers</code>, and <code>trace_contract</code> / <code>path_between</code> traverse them exactly like a wire. <code>/wiregraph-contracts</code> drafts them for you from constants two compartments share — it can see <i>that</i> they share one but never which side writes, so an inferred draft lists every compartment on both sides and you prune it. The <code>id</code> is the shared <b>constant name</b> (<code>GAME_STATE_PATH</code>), never the path literal: wiregraph is deliberately literal-blind, so a compartment that only ever writes <code>'/var/run/game/state.json'</code> and never names the constant is missed <i>by design</i>. Declare <code>single_writer: true</code> and a second <i>declared</i> writer is reported as a violation instead of being quietly merged &mdash; but note the limit: wiregraph detects <b>references</b>, never writes, so it cannot identify an <i>undeclared</i> writer as a writer at all. What it does report, exactly, is an <b>undeclared participant</b>: a compartment whose code touches the resource while the spec names it as neither writer nor reader.</div>
+    </div>
   </section>
 
   <!-- ============ SOURCES ============ -->
@@ -504,7 +571,7 @@
       <a class="card src reveal d1" href="https://www.asyncapi.com/docs/reference/specification/v3.0.0">
         <span class="kind">specification</span>
         <h3>AsyncAPI 3.0</h3>
-        <p>A machine-readable way to describe message-driven APIs — channels, operations, and the shapes that flow over them. wiregraph drafts its inferred wire contracts in this format.</p>
+        <p>A machine-readable way to describe message-driven APIs — channels, operations, and the shapes that flow over them. wiregraph drafts its inferred wire contracts in this format, and reads hand-written specs in 2.x just as well.</p>
         <span class="go">asyncapi.com · v3.0.0 ↗</span>
       </a>
       <a class="card src reveal d2" href="https://martinfowler.com/articles/consumerDrivenContracts.html">

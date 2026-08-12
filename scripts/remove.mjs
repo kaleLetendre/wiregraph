@@ -101,6 +101,15 @@ async function main() {
   else log('  – no .wiregraph/ folder (skipped)');
 
   // 4. dangling ~/.wiregraph symlink (legacy runtime pointer) ----------------
+  // DEAD FOR EVERY PROJECT THIS VERSION CREATED, and kept deliberately. No code in this
+  // repo calls symlinkSync at all (the only occurrences are in the test suite, on unrelated
+  // fixtures), so nothing wiregraph ships can produce this link any more; it can only exist
+  // as an artifact of a much older version that used a $HOME pointer instead of a
+  // per-project .wiregraph/. Removing the branch would leave that artifact behind forever on
+  // exactly the machines an uninstall is meant to clean, so it stays — as cleanup for a
+  // legacy footprint, NOT as part of the current one. commands/wiregraph-remove.md says the
+  // same thing to the user ("a legacy pointer no current version creates … its absence is
+  // not a failure"); keep the two in step.
   const home = join(process.env.HOME || '', '.wiregraph');
   try {
     if (lstatSync(home).isSymbolicLink()) {

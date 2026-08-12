@@ -1,0 +1,35 @@
+# Hand-written RESOURCE contract: compartments coupled through shared files rather
+# than through a wire. Ids are the shared CONSTANT NAMES from common/constants.js —
+# never the path literals (a token containing "/" would be matched as an HTTP route).
+# BOOT_FLAG_PATH is the VENDORED-copy layout: bootw/ and bootr/ each hold their own
+# copy of the constant, so no import links them — only this contract does.
+title: game-state-files
+resources:
+  - id: GAME_STATE_PATH
+    kind: path
+    semantics: last-writer-wins
+    single_writer: true
+    writers: [alpha]
+    readers: [beta, gamma]
+
+  - id: BOOT_FLAG_PATH
+    kind: path
+    semantics: presence-as-state
+    writers: [bootw]
+    readers: [bootr]
+
+  - id: LOCK_FILE_PATH
+    kind: path
+    semantics: presence-as-state
+    single_writer: true
+    writers: [alpha, delta]
+    readers: [beta]
+
+  # zeta appears as BOTH a writer and a reader — it owns the cache index and consumes
+  # it. Declared on purpose: a resource seam is cross-compartment by definition, so
+  # every same-compartment pair must be skipped and only zeta<->gamma is a real seam.
+  - id: CACHE_INDEX_PATH
+    kind: path
+    semantics: last-writer-wins
+    writers: [zeta]
+    readers: [zeta, gamma]

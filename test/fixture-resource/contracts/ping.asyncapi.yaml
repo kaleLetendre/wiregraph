@@ -1,0 +1,13 @@
+# A wire contract living in the SAME dir as the resource spec, so one build exercises
+# both formats through the extension dispatch and proves the wire path is unchanged.
+asyncapi: 3.0.0
+info: { title: resource-fixture-wire, version: 1.0.0 }
+channels:
+  ping:
+    address: /api/resource-ping
+    x-wiregraph-producers: [alpha]
+    x-wiregraph-consumers: [beta]
+operations:
+  recv:
+    action: receive
+    channel: { $ref: "#/channels/ping" }

@@ -7,11 +7,12 @@
 // Gated on the project's autoUpdate posture: only 'balanced' and 'aggressive'
 // re-index on every edit. Posture lives in <project>/.wiregraph/state.json.
 
-import { realpathSync } from 'node:fs';
+import { realpathSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readState, findIndexedRoot, owningMember } from '../lib/state.mjs';
+import { openRefreshErrFd } from '../lib/hooklog.mjs';
 import { langForFile } from '../../src/extract/lang.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -51,12 +52,20 @@ async function main() {
   if (!owningMember(abs, PROJECT)) return;
   if (!langForFile(abs)) return;
 
+  // Give the child a REAL fd 2. With `stdio: 'ignore'` every byte the build wrote to
+  // stderr went to /dev/null — including the refusals that DELETE graph content and any
+  // failure that happens before refresh.mjs's own warning tee is installed (an import-time
+  // throw after a plugin update left no record anywhere and the graph silently stopped
+  // updating). Falls back to 'ignore' when the log can't be opened: losing the log must
+  // never stop the refresh from being spawned.
+  const errFd = openRefreshErrFd(PROJECT);
   const child = spawn('node', [join(HERE, 'refresh.mjs'), '--files', abs], {
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', errFd === null ? 'ignore' : errFd],
     env: process.env,
   });
   child.unref();
+  if (errFd !== null) { try { closeSync(errFd); } catch { /* the child holds its own dup */ } }
 }
 
 main().then(() => process.exit(0)).catch(() => process.exit(0));

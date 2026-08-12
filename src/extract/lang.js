@@ -26,6 +26,12 @@ const EXT = {
   '.java': { lang: 'java', variant: 'java' },
   '.kt': { lang: 'kotlin', variant: 'kotlin' },
   '.kts': { lang: 'kotlin', variant: 'kotlin' },
+  // Rust. `Cargo.toml` was ALREADY a MODULE_MANIFEST (walk.js) and `target` was already
+  // in IGNORE_DIRS, so a Rust tree already knew where its compartment BOUNDARIES were —
+  // but a compartment only reaches the db as a side effect of walking a PARSEABLE source
+  // file, so without this entry a Rust project indexed to nothing at all: no files, no
+  // symbols, and not even the compartment rows its Cargo.tomls had already earned.
+  '.rs': { lang: 'rust', variant: 'rust' },
 };
 
 export function langForFile(path) {

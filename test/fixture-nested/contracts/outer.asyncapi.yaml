@@ -1,0 +1,17 @@
+asyncapi: 3.0.0
+# OUTER contract. Its dir is <root>/contracts, so in recursive mode its scope root is the
+# PROJECT ROOT — it governs the whole tree, which is exactly what "server <-> client"
+# means. /api/state is DELIBERATELY also declared by server/contracts/inner.asyncapi.yaml:
+# that is the shared-route case, and longest-prefix scoping is what resolves it.
+info:
+  title: Nested Outer Wire
+  version: 1.0.0
+channels:
+  state:
+    address: /api/state
+    x-wiregraph-producers: [netcli]
+    x-wiregraph-consumers: [netsrv]
+  harnessProbe:
+    address: /harness/probe
+    x-wiregraph-producers: [harness]
+    x-wiregraph-consumers: [netsrv]

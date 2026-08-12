@@ -72,7 +72,7 @@ function openInBrowser(file) {
 const PALETTE = ['#E15554', '#4D9DE0', '#3BB273', '#7768AE', '#E67E22', '#1B9AAA', '#D81159', '#8F2D56'];
 const CONTRACT_COLOR = '#F2C94C';
 // Contract-edge colors by drift status: a wire you can trust vs one to look at.
-const DRIFT_COLORS = { ok: '#3BB273', 'one-sided': '#E6A23C', drift: '#E15554' };
+const DRIFT_COLORS = { ok: '#3BB273', 'one-sided': '#E6A23C', violation: '#D81159', drift: '#E15554' };
 
 // Escape a string for safe interpolation into server-side HTML markup (mirrors the
 // xml() helper in export-gexf.js). Used for values that land in the page's <head>/
@@ -311,7 +311,7 @@ DATA.links.forEach(l=>{ const s=(typeof l.source==='object'?l.source.id:l.source
   const k = s<t? s+'|'+t : t+'|'+s; const a=pairIdx.get(k)||[]; a.push(l); pairIdx.set(k,a); });
 pairIdx.forEach(a=>{ const n=a.length; a.forEach((l,i)=>{ l._curv = n===1?0:(i-(n-1)/2); }); });
 
-const driftFlag = d => d.status==='drift' ? ' 🔴 DRIFT' : d.status==='one-sided' ? ' ⚠️ one-sided' : '';
+const driftFlag = d => d.status==='drift' ? ' 🔴 DRIFT' : d.status==='violation' ? ' 🛑 single-writer violation' : d.status==='one-sided' ? ' ⚠️ one-sided' : '';
 const linkStroke = d => d.type==='CONTRACT' ? contractCol(d) : (d.type==='REFERENCES' ? '#E0A458' : '#7B8CDE');
 const linkWidth = d => d.type==='CONTRACT' ? Math.min(6, 1.4 + Math.log2(1+d.tokens.length)*1.4)
   : d.type==='REFERENCES' ? Math.min(7, 1 + d.count*0.6) : Math.min(3.5, 0.8 + d.count*0.3);

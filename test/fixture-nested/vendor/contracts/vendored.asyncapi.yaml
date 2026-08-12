@@ -1,0 +1,12 @@
+asyncapi: 3.0.0
+# UNDER vendor/, which is in IGNORE_DIRS. Recursive discovery must never find this dir.
+# /vendored/only is declared NOWHERE else, and harness/harness.js mentions it — so if the
+# IGNORE_DIRS filter is ever dropped, this contract node appears and mints REFERENCES.
+info:
+  title: Vendored Leak
+  version: 1.0.0
+channels:
+  leak:
+    address: /vendored/only
+    x-wiregraph-producers: [harness]
+    x-wiregraph-consumers: [netsrv]

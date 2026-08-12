@@ -9,11 +9,12 @@
 // Gated on posture: 'off' does nothing; 'conservative'/'balanced'/'aggressive'
 // all do the SessionStart catch-up (PostToolUse is the part balanced adds).
 
-import { realpathSync } from 'node:fs';
+import { realpathSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readState, findIndexedRoot, updateState } from '../lib/state.mjs';
+import { openRefreshErrFd } from '../lib/hooklog.mjs';
 import { changedSince } from '../lib/git.mjs';
 import { record, migrateMetrics } from '../lib/metrics.mjs';
 
@@ -86,21 +87,40 @@ async function main() {
   // off (hooks not enabled in this Claude Code), which the doctor should flag.
   try { updateState(PROJECT, { hooksLastFired: new Date().toISOString() }); } catch { /* best-effort */ }
 
-  // Indexed: spawn the detached catch-up worker.
+  // Indexed: spawn the detached catch-up worker, with a REAL fd 2. `stdio: 'ignore'` sent
+  // every byte of the build's stderr to /dev/null — including the refusals that DELETE
+  // graph content, and any failure raised before refresh.mjs's own warning tee is
+  // installed. Falls back to 'ignore' when the log can't be opened: losing the log must
+  // never stop the catch-up from being spawned.
+  const errFd = openRefreshErrFd(PROJECT);
   const child = spawn('node', [join(HERE, 'refresh.mjs')], {
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', errFd === null ? 'ignore' : errFd],
     env: process.env,
   });
   child.unref();
+  if (errFd !== null) { try { closeSync(errFd); } catch { /* the child holds its own dup */ } }
 
   // Nudge toward inferring contracts only when there's REAL, uncovered potential:
   // the last full build found cross-repo seams (messaging/state/HTTP) AND no
   // contracts dir is present. Both come from state (persisted at build time), so
   // this stays a cheap read — no scan. Appended to whichever note fires below,
   // since emit() exits. Silent for contracted or signal-free workspaces.
+  //
+  // The gate reads the SINGULAR and the PLURAL. That is BELT AND BRACES, not a fix for a
+  // real hole, and the justification this comment used to carry was false: it claimed a
+  // recursive project whose contracts all live in `server/contracts/` and
+  // `client/contracts/` "has nothing at depth 1 for the singular to name", so gating on the
+  // singular alone would nag forever. It cannot happen. `contractsDir` is
+  // `contractsDirs[0]` (src/build.js#fullBuild), and in recursive mode detectContractsDirs
+  // returns the WHOLE discovered list — nested dirs included, shallowest first — so the
+  // singular is null EXACTLY when the plural is empty. What the plural genuinely buys is
+  // robustness against a state written by a version (or a code path) that fills only one of
+  // them: `/wiregraph-contracts apply` writes both, but a legacy state.json predating the
+  // plural has only the singular. Both keys are stamped by every full build in BOTH modes,
+  // so this stays one cheap state read.
   const seams = state.inferredSeams || 0;
-  const contractsHint = (seams > 0 && !state.contractsDir)
+  const contractsHint = (seams > 0 && !state.contractsDir && !(state.contractsDirs?.length))
     ? ` wiregraph spotted ${seams} cross-repo seam(s) (messaging/state/HTTP) with no contract yet — run /wiregraph-contracts to capture them.`
     : '';
 

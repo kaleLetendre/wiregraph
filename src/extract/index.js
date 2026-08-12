@@ -5,7 +5,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { walkSources } from './walk.js';
-import { parseSource } from './parse.js';
+import { parseSource, shapeCandidate } from './parse.js';
 import { symbolId, moduleId } from '../model.js';
 
 const MAX_BYTES = 2_000_000; // skip pathologically large/generated files
@@ -15,7 +15,11 @@ const MAX_BYTES = 2_000_000; // skip pathologically large/generated files
 // so a changed file is attributed to the right compartment.
 export function extractCode(graph, rootDir, log = () => {}, fileFilter = null) {
   const calls = []; // { fromId, compartment, relPath, name, line }
-  const candidates = []; // contract signals { kind, token, role, label, compartment, file, line }
+  const candidates = []; // contract signals; shape owned by shapeCandidate (parse.js)
+  // `${compartment}\0${relPath}` -> [[start,end), …] comment ranges, from the SAME parse.
+  // matchContracts scans raw file text and cannot see comments on its own; handing it
+  // these is what stops a token mentioned only in prose from minting a REFERENCES edge.
+  const comments = new Map();
   let fileCount = 0;
 
   for (const f of walkSources(rootDir)) {
@@ -75,14 +79,13 @@ export function extractCode(graph, rootDir, log = () => {}, fileFilter = null) {
       const fromId = c.enclosing == null ? modId : localIds[c.enclosing];
       calls.push({ fromId, compartment: f.compartment, relPath: f.relPath, name: c.name, line: c.line });
     }
-    for (const c of parsed.candidates || []) {
-      candidates.push({ kind: c.kind, token: c.token, role: c.role, label: c.label, compartment: f.compartment, file: f.relPath, line: c.line });
-    }
+    for (const c of parsed.candidates || []) candidates.push(shapeCandidate(c, f));
+    if (parsed.comments?.length) comments.set(`${f.compartment}\0${f.relPath}`, parsed.comments);
 
     fileCount++;
     if (fileCount % 200 === 0) log(`  parsed ${fileCount} files...`);
   }
 
   log(`  parsed ${fileCount} files total`);
-  return { calls, candidates };
+  return { calls, candidates, comments };
 }

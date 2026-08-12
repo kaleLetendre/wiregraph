@@ -33,7 +33,9 @@ function callsAdj(db, project) {
   return { fwd, rev };
 }
 
-// gather for GEXF (symbol-centric: WIRE surface / --all CALLS+WIRE / --contract).
+// gather for GEXF (symbol-centric: the derived cross-compartment seam surface —
+// WIRE (wire contracts) and RESOURCE (shared-resource contracts) — / --all
+// CALLS+seams / --contract).
 export function gatherGexf(db, project, opts) {
   const syms = symbolNodes(db, project);
   const nodes = new Map();
@@ -42,12 +44,12 @@ export function gatherGexf(db, project, opts) {
   const addSym = (id) => { const n = syms.get(id); if (n && keep(n.file)) { nodes.set(id, n); return true; } return false; };
 
   if (opts.contract) {
-    const wires = db.prepare("SELECT src,dst,token,direction FROM edges WHERE project=? AND type='WIRE' AND contract=?").all(project, opts.contract);
+    const wires = db.prepare("SELECT src,dst,token,direction,type FROM edges WHERE project=? AND type IN ('WIRE','RESOURCE') AND contract=?").all(project, opts.contract);
     if (!wires.length) return null;
     const seeds = new Set();
     for (const w of wires) {
       if (addSym(w.src) && addSym(w.dst)) {
-        links.push({ source: w.src, target: w.dst, type: 'WIRE', token: w.token, contract: opts.contract, direction: w.direction });
+        links.push({ source: w.src, target: w.dst, type: w.type, token: w.token, contract: opts.contract, direction: w.direction });
         seeds.add(w.src); seeds.add(w.dst);
       }
     }
@@ -71,15 +73,15 @@ export function gatherGexf(db, project, opts) {
 
   if (opts.all) {
     for (const [id, n] of syms) if (keep(n.file)) nodes.set(id, n);
-    for (const e of db.prepare("SELECT src,dst,type,token,contract,direction,cnt FROM edges WHERE project=? AND type IN ('CALLS','WIRE')").all(project)) {
+    for (const e of db.prepare("SELECT src,dst,type,token,contract,direction,cnt FROM edges WHERE project=? AND type IN ('CALLS','WIRE','RESOURCE')").all(project)) {
       if (nodes.has(e.src) && nodes.has(e.dst)) links.push({ source: e.src, target: e.dst, type: e.type, token: e.token, contract: e.contract, direction: e.direction, count: e.cnt != null ? Number(e.cnt) : 1 });
     }
     return { nodes: [...nodes.values()], links };
   }
 
-  // default: the WIRE surface
-  for (const e of db.prepare("SELECT src,dst,token,contract,direction FROM edges WHERE project=? AND type='WIRE'").all(project)) {
-    if (addSym(e.src) && addSym(e.dst)) links.push({ source: e.src, target: e.dst, type: 'WIRE', token: e.token, contract: e.contract, direction: e.direction });
+  // default: the derived seam surface (wire + resource)
+  for (const e of db.prepare("SELECT src,dst,token,contract,direction,type FROM edges WHERE project=? AND type IN ('WIRE','RESOURCE')").all(project)) {
+    if (addSym(e.src) && addSym(e.dst)) links.push({ source: e.src, target: e.dst, type: e.type, token: e.token, contract: e.contract, direction: e.direction });
   }
   return { nodes: [...nodes.values()], links };
 }

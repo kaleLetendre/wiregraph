@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { findGitRepos } from '../../src/extract/walk.js';
 import { langForFile } from '../../src/extract/lang.js';
-import { memberRoots } from './state.mjs';
+import { memberRoots, readState, compartmentsFingerprint, compartmentsDrift, contractsFingerprint, contractsDrift } from './state.mjs';
 
 // Raw git output — NOT trimmed. `git status --porcelain` encodes file state in
 // the first two columns, so the leading status space is significant; a global
@@ -22,8 +22,10 @@ import { memberRoots } from './state.mjs';
 // revision) is expected and handled by the null return, not a printed "fatal:".
 //
 // `-c core.quotePath=false` makes git emit raw UTF-8 paths instead of octal-escaped,
-// double-quoted ones for names with non-ASCII/special chars, so the `slice(3)` /
-// ` -> ` porcelain parse below sees the real path (config flags precede the subcommand).
+// double-quoted ones for names with non-ASCII/special chars (config flags precede the
+// subcommand). The parsers below additionally ask for `-z`, which suppresses quoting
+// outright and delimits with NUL — belt and braces, and the only way to read a rename
+// record without splitting on a ` -> ` that a filename is allowed to contain.
 function git(repoRoot, args) {
   try {
     return execFileSync('git', ['-C', repoRoot, '-c', 'core.quotePath=false', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
@@ -113,16 +115,55 @@ export function changedSince(project, reposLastSha = {}) {
       // Call git ONCE and test === null: null is a failed revision range (the stored
       // baseline is gone), "" is a valid range with no changes. A null diff no longer
       // escalates the WHOLE project — it flags THIS repo for a content-reconcile instead.
-      const diff = git(repo.root, ['diff', '--name-only', `${last}..${repo.head}`]);
+      //
+      // BOTH SIDES OF A RENAME, and this is the whole reason for --name-status -z over the
+      // older --name-only. `git diff` applies RENAME DETECTION by default (diff.renames is
+      // on since git 2.9), so `a/one.js -> a/renamed.js` is reported as ONE record naming
+      // only the NEW path. The OLD path then never reaches `files`, pruneFile is never
+      // called for it, and its rows — file, every symbol, DEFINED_IN, IN_COMPARTMENT and
+      // the CALLS between them — survive forever under a path that no longer exists:
+      // find_symbol reports two matches and get_source ENOENTs on the ghost. It never
+      // self-heals, because the sha advances and every later catch-up says "nothing
+      // changed". A plain `git rm` prunes correctly; it is specifically rename detection
+      // that loses the path. Feeding the old path in too makes it a normal deletion, which
+      // the incremental already prunes.
+      //
+      // -z is NUL-delimited (no quoting, no ` -> ` to mis-split on a path that contains
+      // it) and --name-status emits `R<score>\0<old>\0<new>` for a rename/copy and
+      // `<status>\0<path>` for everything else. We add BOTH paths, so the old/new field
+      // ORDER never has to be reasoned about — a set either contains the path or not.
+      const diff = git(repo.root, ['diff', '--name-status', '-M', '-z', `${last}..${repo.head}`]);
       if (diff === null) invalidBaselineRepos.push(repo);
-      else diff.split('\n').filter(Boolean).forEach((f) => rels.add(f));
+      else {
+        const f = diff.split('\0');
+        for (let i = 0; i < f.length; i++) {
+          const status = f[i];
+          if (!status) continue;
+          const paths = (status[0] === 'R' || status[0] === 'C') ? 2 : 1; // rename/copy carry old AND new
+          for (let k = 1; k <= paths; k++) if (f[i + k]) rels.add(f[i + k]);
+          i += paths;
+        }
+      }
     }
-    // Uncommitted changes (porcelain: "XY path" or rename "XY old -> new").
-    const porcelain = git(repo.root, ['status', '--porcelain']);
+    // Uncommitted changes. Same rename hazard, same remedy: a STAGED rename (`git mv`,
+    // which is what a rename normally looks like before it is committed) is reported as a
+    // single `R` record, and the pre-`-z` parse took `.pop()` of a ` -> ` split — again
+    // keeping only the NEW path and leaking the old one's rows. (An UNSTAGED `mv` already
+    // worked: git sees an unrelated ` D old` plus `?? new`.)
+    //
+    // Porcelain v1 -z: each record is `XY <path>` NUL-terminated, and a rename/copy adds
+    // the ORIGINAL path as the NEXT NUL-separated field. Both go in.
+    const porcelain = git(repo.root, ['status', '--porcelain', '-z']);
     if (porcelain) {
-      for (const line of porcelain.split('\n').filter(Boolean)) {
-        const path = line.slice(3).split(' -> ').pop();
-        if (path) rels.add(path);
+      const f = porcelain.split('\0');
+      for (let i = 0; i < f.length; i++) {
+        const rec = f[i];
+        if (!rec || rec.length < 4) continue; // "XY p" is the shortest possible record
+        rels.add(rec.slice(3));
+        if (rec[0] === 'R' || rec[0] === 'C' || rec[1] === 'R' || rec[1] === 'C') {
+          if (f[i + 1]) rels.add(f[i + 1]);
+          i++;
+        }
       }
     }
 
@@ -130,6 +171,56 @@ export function changedSince(project, reposLastSha = {}) {
       if (!langForFile(rel)) continue; // only source files wiregraph indexes
       files.add(join(repo.root, rel));
     }
+  }
+
+  // COMPARTMENT PARTITION CHANGE — a second, non-git reason an incremental apply would
+  // silently corrupt the graph. Compartment name is embedded in every id and relPath is
+  // relative to the compartment root, so re-partitioning changes BOTH halves of every
+  // affected id; pruneFile then deletes by the NEW `(project, compartment, file)` key,
+  // misses the old rows, and the reload duplicates every symbol across two compartments.
+  // Escalate to a full rebuild, which is safe by construction (it always resets).
+  //
+  // An ABSENT stamp means "no baseline", NEVER "outdated" — reading it as changed would
+  // force a full rebuild of every project built before this key existed on its very next
+  // catch-up, the same trap schemaOutdated() documents for its 0 stamp. THERE IS NO
+  // GLOBAL-MODE EXEMPTION ANY MORE: the per-root value used to be the constant 'global'
+  // for an inferred partition, so this branch could never fire on a project that declared
+  // nothing; the fingerprint now hashes the boundary set inference actually resolves to,
+  // so a manifest appearing in a subdirectory re-partitions a legacy project and escalates
+  // here exactly as an edited declaration does. Hence the wording: the subject is the
+  // PARTITION IN FORCE, declared or inferred, not a declaration that may not exist.
+  // The comparison is PER ROOT and only over the roots mounted right now, so a
+  // member that is transiently unmounted cannot forge a partition change out of a mount
+  // blip — the same failure the reposLastSha merge above exists to prevent.
+  //
+  // It also fires for a declared source directory that was RENAMED or DELETED on disk,
+  // not just for an edit to the declaration text: the fingerprint hashes the partition
+  // the read path resolves to, and a vanished declared path makes that declaration
+  // unusable (the build silently fell back to inference, so every id moved).
+  const partitionDrift = compartmentsDrift(readState(project)?.compartmentsFingerprint, compartmentsFingerprint(project));
+  if (partitionDrift) {
+    fullBuildReasons.push(`the compartment partition changed since the last full build (${partitionDrift})`);
+  }
+
+  // CONTRACT SPEC SET CHANGE — a third, non-git reason. Contract SCOPE is applied when
+  // REFERENCES are minted and stored nowhere, so an incremental re-derive over rows minted
+  // under a different resolved `{spec, scopeRoot, digest}` set fabricates cross-scope WIRE
+  // edges a full rebuild does not produce (moving a SPEC inward keeps the title and the
+  // contract id while shrinking the scope, with no change to the dir set at all) and leaves
+  // stale REFERENCES rows that trace_contract reports as real. Same escalation, same
+  // absent-means-no-baseline rule, same per-root-over-mounted-roots comparison as the
+  // partition check above.
+  //
+  // IT FIRES IN GLOBAL MODE TOO, and must. The earlier version hashed an all-unscoped set
+  // to the literal 'global', so the default mode was exempt from the whole guard — and
+  // global mode is where a deleted spec left a ghost contract with a live WIRE edge, and
+  // where `/wiregraph-contracts apply` (contractsHome is deliberately depth-1, so `apply`
+  // writes into a GLOBAL-mode contracts/) had a self-heal time of never. This is what
+  // finally gives that sequence one: `apply` creates contracts/ and tells the user to run
+  // the incremental, which now escalates to the full rebuild that indexes the new spec.
+  const contractsSetDrift = contractsDrift(readState(project)?.contractsFingerprint, contractsFingerprint(project));
+  if (contractsSetDrift) {
+    fullBuildReasons.push(`contract specs changed since the last full build (${contractsSetDrift})`);
   }
 
   return { files: [...files], newShas, repos, fullBuildNeeded: fullBuildReasons.length > 0, fullBuildReasons, invalidBaselineRepos };

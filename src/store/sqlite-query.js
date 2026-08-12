@@ -7,13 +7,37 @@
 import { readFileSync, statSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { readState, members, memberRoots } from '../../scripts/lib/state.mjs';
+import { decodeResourceDirection } from '../extract/resource-spec.js';
 
 const isTest = (f) => f.includes('tests/') || f.includes('/test/') || f.includes('.test.') || f.includes('_test.') || f.includes('/test_');
 const loc = (n) => `${n.compartment}:${n.file}:${n.startLine} ${n.name}${n.kind && n.kind !== 'function' ? ` (${n.kind})` : ''}`;
+// contract_tokens.producers/consumers is a comma-joined CSV on disk and an array once
+// definedContractTokens has split it. Accept both shapes so a caller handing over a
+// raw row is never read one character at a time — and ANY iterable besides, because
+// classifyContractToken is exported and its predecessor did `new Set(meta.producers)`,
+// which accepted a Set, a generator, anything. Narrowing that to "Array or string" would
+// have silently answered `hasRoles === false` for an outside caller passing a Set.
+// (The string test comes first: a string is itself iterable, one character at a time.)
+const roleNames = (v) => {
+  if (typeof v === 'string') return v ? v.split(',') : [];
+  if (Array.isArray(v)) return v;
+  if (v && typeof v[Symbol.iterator] === 'function') return [...v];
+  return [];
+};
 
-function symbolMatches(db, project, name, compartment, file) {
+// includeModules: allow the synthetic per-file `<module>` symbol (name '<module>',
+// kind 'module') to be returned. OFF by default — find_symbol / get_source /
+// trace_callers / trace_callees all want real definitions, and a bare `<module>`
+// lookup there would answer with one row per FILE. path_between turns it ON: a
+// top-level (module-scope) read or write of a contract token is attributed by
+// matchContracts to `<module>` (extract/contracts.js), so with the filter in place
+// that reference could be TRAVERSED as an intermediate hop but never named as a BFS
+// seed or goal — i.e. a resource written or read at file scope had no symbol to ask
+// about. Narrow the noise with fromCompartment/toCompartment.
+function symbolMatches(db, project, name, compartment, file, { includeModules = false } = {}) {
   let q = `SELECT id,compartment,file,name,kind,startLine,endLine FROM symbols
-           WHERE project=@project AND name=@name AND kind <> 'module'`;
+           WHERE project=@project AND name=@name`;
+  if (!includeModules) q += " AND kind <> 'module'";
   if (compartment) q += ' AND compartment=@compartment';
   if (file) q += ' AND instr(file,@file)>0';
   return db.prepare(q + ' ORDER BY compartment,file,startLine').all({ project, name, compartment, file });
@@ -102,9 +126,71 @@ export function graphStats(db, project) {
   return out.join('\n');
 }
 
+// --- DISAMBIGUATED COMPARTMENT NAMES ARE NOT A BUILD-LOG DETAIL ----------------
+// When the INFERRED partition puts two boundary dirs under the same basename, the walk
+// (src/extract/walk.js#disambiguateInferredNames) renames the colliding ones to their
+// project-relative path — `network` becomes `client/network` + `server/network` — and says
+// so on the build's stderr. On the hook path that stream goes to a log nobody reads, and
+// nothing downstream ever mentioned it: `graph_status` said `Mode: global — compartments
+// inferred…` with no hint that the name a user would type does not exist, and
+// `find_symbol {"compartment":"network"}` dead-ended with `No symbol named "x" in network.`
+//
+// The graph itself is the authoritative record of what happened: a declared name can never
+// contain `/` or `#` (validateDeclaration rejects `[:/\\]` and control characters), and the
+// walk's basename never does either — so a compartment name carrying one of those IS a
+// disambiguated name, in either mode, with no extra state to keep in sync and nothing to go
+// stale. Group them by the bare name they collided on.
+export function disambiguatedCompartments(db, project) {
+  let rows;
+  try { rows = db.prepare('SELECT DISTINCT name FROM compartments WHERE project=? ORDER BY name').all(project); }
+  catch { return []; }
+  const byBare = new Map();
+  for (const r of rows) {
+    const n = r?.name;
+    if (typeof n !== 'string' || !(n.includes('/') || n.includes('#'))) continue;
+    // `client/network` -> `network`; `network#2` -> `network`.
+    const bare = n.split('/').pop().split('#')[0];
+    if (!bare) continue;
+    if (!byBare.has(bare)) byBare.set(bare, []);
+    byBare.get(bare).push(n);
+  }
+  return [...byBare].map(([bare, names]) => ({ bare, names: names.sort() }))
+    .sort((a, b) => (a.bare < b.bare ? -1 : a.bare > b.bare ? 1 : 0));
+}
+
+// The graph_status lines for the above. Silent when nothing was renamed, so an ordinary
+// project's report is byte-identical.
+export function disambiguatedCompartmentLines(db, project) {
+  const groups = disambiguatedCompartments(db, project);
+  if (!groups.length) return [];
+  const lines = [
+    `⚠ RENAMED COMPARTMENTS: ${groups.length} compartment name(s) collided in the inferred partition and were `
+    + 'disambiguated — the BARE name is NOT in the graph, so query the exact names below (and any contract spec '
+    + 'naming the bare one in x-wiregraph-producers/-consumers or writers:/readers: no longer matches):',
+  ];
+  for (const g of groups.slice(0, 10)) lines.push(`  - "${g.bare}" → ${g.names.join(', ')}`);
+  if (groups.length > 10) lines.push(`  - …and ${groups.length - 10} more`);
+  return lines;
+}
+
+// Appended to a "no symbol / no match" answer when the compartment the caller ASKED for is
+// one of the bare names that no longer exists. Without it the dead end is indistinguishable
+// from "that symbol really isn't there".
+function compartmentNameHint(db, project, compartment) {
+  if (!compartment) return '';
+  try {
+    const exists = db.prepare('SELECT 1 x FROM compartments WHERE project=? AND name=?').get(project, compartment);
+    if (exists) return '';
+    const hit = disambiguatedCompartments(db, project).find((g) => g.bare === compartment);
+    if (!hit) return '';
+    return ` (NOTE: there is no compartment "${compartment}" in this graph — that name collided in the inferred`
+      + ` partition and was renamed to ${hit.names.join(' and ')}. Retry with one of those.)`;
+  } catch { return ''; }
+}
+
 export function findSymbol(db, project, name, repo) {
   const all = symbolMatches(db, project, name, repo);
-  if (!all.length) return `No symbol named "${name}"${repo ? ` in ${repo}` : ''}.`;
+  if (!all.length) return `No symbol named "${name}"${repo ? ` in ${repo}` : ''}.${compartmentNameHint(db, project, repo)}`;
   const CAP = 100;
   const rows = all.slice(0, CAP);
   const header = all.length > CAP
@@ -115,7 +201,7 @@ export function findSymbol(db, project, name, repo) {
 
 export function getSource(db, project, name, repo, file, context = 0) {
   const rows = symbolMatches(db, project, name, repo, file).filter((r) => r.endLine >= r.startLine && r.startLine > 0);
-  if (!rows.length) return `No symbol named "${name}"${repo ? ` in ${repo}` : ''} with a known line span.`;
+  if (!rows.length) return `No symbol named "${name}"${repo ? ` in ${repo}` : ''} with a known line span.${compartmentNameHint(db, project, repo)}`;
   if (rows.length > 1 && !file && !repo) {
     return `"${name}" is ambiguous (${rows.length}). Narrow with compartment/file:\n` +
       rows.map((r) => `  ${r.compartment}:${r.file}:${r.startLine} ${r.name}`).join('\n');
@@ -257,16 +343,37 @@ function definedContractTokens(db, project, contract, token) {
 // compartments touch it. The old count heuristic (n>=2 => satisfied) called that
 // healthy while buildWireEdges produced zero wire. This mirrors buildWireEdges' role
 // filter (pubs/cons) and its intra-compartment skip.
+// RESOURCE contracts ride the same classifier unchanged, and it is already
+// semantically right for them: producers = writers, consumers = readers, so
+// "satisfied" reads as "a writer and a reader, in different compartments" — exactly
+// the resource seam.
+//
+// The single-writer check is deliberately NOT a fourth value here. It answers a
+// different question — "is the DECLARATION self-consistent?" — from the one this
+// function answers, "does the CODE match the declaration?", and a token can fail both
+// at once. Folding it in as a fourth mutually-exclusive verdict (and checking it first)
+// meant a resource whose constant NO code references anywhere reported
+// `unreferenced: 0` and never showed the DRIFT flag: the tool's strongest signal
+// replaced by a declaration-hygiene complaint. Checking it LAST would be just as wrong
+// in the other direction — the violation would vanish on any drifted resource. So it is
+// an orthogonal flag, `singleWriterViolation`, and callers report both — along with
+// `undeclaredParticipants`, a third orthogonal fact about the same token.
+//
 //   refComps: Set/array of compartment names that reference the token
-//   meta: { producers:[], consumers:[] } (compartment names; may be empty/absent)
+//   meta: { direction?, producers:[], consumers:[] } (compartment names; may be empty/absent)
 // Returns 'unreferenced' | 'one-sided' | 'satisfied'.
 export function classifyContractToken(refComps, meta) {
   const refSet = refComps instanceof Set ? refComps : new Set(refComps || []);
+  // producers/consumers are arrays here but live in the db as a comma-joined CSV;
+  // accept either (and any other iterable) so a caller that hands over a raw
+  // contract_tokens row can't be silently misread one character at a time.
+  const roleList = roleNames(meta?.producers);
+  const consumerList = roleNames(meta?.consumers);
   if (refSet.size === 0) return 'unreferenced';
-  const hasRoles = (meta?.producers?.length || meta?.consumers?.length);
+  const hasRoles = (roleList.length || consumerList.length);
   if (hasRoles) {
-    const producers = new Set(meta.producers || []);
-    const consumers = new Set(meta.consumers || []);
+    const producers = new Set(roleList);
+    const consumers = new Set(consumerList);
     const refP = [...refSet].filter((c) => producers.has(c));
     const refC = [...refSet].filter((c) => consumers.has(c));
     // Both role sides referenced AND at least two DISTINCT compartments — so a
@@ -282,25 +389,285 @@ export function classifyContractToken(refComps, meta) {
   return refSet.size === 1 ? 'one-sided' : 'satisfied';
 }
 
+// ORTHOGONAL to classifyContractToken (see there): does this token's DECLARATION break
+// its own single-writer discipline? True only for a resource token that declares
+// `single_writer: true` and then names two or more writers. Independent of what any code
+// references, so it is reported ALONGSIDE the drift verdict, never instead of it.
+export function singleWriterViolation(meta) {
+  const res = decodeResourceDirection(meta?.direction);
+  return !!(res?.singleWriter && roleNames(meta?.producers).length >= 2);
+}
+
+// UNDECLARED PARTICIPANTS — a compartment whose code REFERENCES the resource constant
+// while the spec names it as neither a writer nor a reader.
+//
+// This replaces an "observed single-writer breach" check that could not see the case that
+// mattered. That check intersected the referencing compartments with the DECLARED writer
+// list, so observed was a SUBSET of declared BY CONSTRUCTION: it could only ever restate
+// a self-contradictory declaration, and the one thing a user actually needs — a second
+// compartment touching the resource WITHOUT being declared a writer — was invisible to
+// it, because that compartment is not in the list being intersected.
+//
+// THE LIMITATION, STATED PLAINLY RATHER THAN IMPLIED AWAY: wiregraph does not detect
+// WRITES. A REFERENCES edge means "this symbol mentions the constant", not "this symbol
+// writes through it" — there is no per-language table of fs/DB write APIs, by design
+// (the shared token is the signal; direction is the reviewer's call). So `single_writer`
+// is checkable only against the DECLARATION (singleWriterViolation above), and no amount
+// of graph data promotes it to an observation. What IS observable, exactly and without
+// guessing, is that a compartment touches the resource and the spec does not mention it
+// — the concrete thing to go and look at, and a strict superset of "an undeclared
+// writer".
+export function undeclaredParticipants(refComps, meta) {
+  if (!decodeResourceDirection(meta?.direction)) return [];   // resource tokens only
+  const declared = new Set([...roleNames(meta?.producers), ...roleNames(meta?.consumers)]);
+  if (!declared.size) return [];
+  const refSet = refComps instanceof Set ? refComps : new Set(refComps || []);
+  return [...refSet].filter((c) => !declared.has(c)).sort();
+}
+
+// A resource token whose persisted `direction` did not decode cleanly — corrupt db, or a
+// value written by a version that encoded a field this one does not know. Returned as a
+// list of human-readable reasons (empty when fine) so trace_contract can SAY so: a
+// mis-decoded single_writer used to turn a declared TRUE into an effective FALSE and take
+// the violation report down with it, with no signal anywhere.
+export function resourceMetaErrors(meta) {
+  return decodeResourceDirection(meta?.direction)?.errors || [];
+}
+
 // Human-readable detail for a one-sided token in trace_contract. When role metadata
 // exists, name which side is present and which half is missing (so a 2-same-role case
 // reads as "producer side present, consumer half missing" rather than the old,
 // misleading "only [comp]"); for a role-less token just name the compartment(s).
+// A resource token speaks writer/reader, not producer/consumer — the wording follows
+// the contract type so a report never tells a user their shared file has a "consumer
+// half missing".
 function oneSidedDetail(refComps, meta) {
   const comps = [...(refComps instanceof Set ? refComps : new Set(refComps || []))];
-  const hasRoles = (meta?.producers?.length || meta?.consumers?.length);
+  const hasRoles = (roleNames(meta?.producers).length || roleNames(meta?.consumers).length);
   if (!hasRoles) return `only [${comps.join(', ')}]`;
-  const producers = new Set(meta.producers || []);
-  const consumers = new Set(meta.consumers || []);
+  const res = decodeResourceDirection(meta?.direction);
+  const P = res ? 'writer' : 'producer';
+  const C = res ? 'reader' : 'consumer';
+  const producers = new Set(roleNames(meta.producers));
+  const consumers = new Set(roleNames(meta.consumers));
   const refP = comps.filter((c) => producers.has(c));
   const refC = comps.filter((c) => consumers.has(c));
-  if (refP.length && refC.length) return `only [${comps.join(', ')}] (same compartment produces & consumes — no cross-compartment seam)`;
-  if (refP.length) return `only producer side [${refP.join(', ')}] — consumer half missing`;
-  if (refC.length) return `only consumer side [${refC.join(', ')}] — producer half missing`;
-  return `only [${comps.join(', ')}] (no compartment matches the contract's producer/consumer roles)`;
+  if (refP.length && refC.length) return `only [${comps.join(', ')}] (same compartment ${res ? 'writes & reads' : 'produces & consumes'} — no cross-compartment seam)`;
+  if (refP.length) return `only ${P} side [${refP.join(', ')}] — ${C} half missing`;
+  if (refC.length) return `only ${C} side [${refC.join(', ')}] — ${P} half missing`;
+  return `only [${comps.join(', ')}] (no compartment matches the contract's ${P}/${C} roles)`;
+}
+
+// --- SHADOWED, NOT MISSING ----------------------------------------------------
+// The single most misleading thing trace_contract could say. In recursive mode an inner
+// `server/contracts/` and an outer `contracts/` may both declare the same route; the
+// longest-prefix rule (src/extract/contracts.js) gives code under `server/` to the INNER
+// contract, so the OUTER one legitimately sees only the halves outside that subtree and
+// reports the route as one-sided. Observed on the nested fixture's deliberately shared
+// route: `/api/state — only producer side [netcli] — consumer half missing`, while netsrv
+// implements it, is fully indexed, and is listed three lines BELOW in the same report under
+// `Server Inner Wire`. A user or an agent reading that goes looking for a handler that was
+// never missing.
+//
+// So: when a token is one-sided on contract C and the SAME token is declared by ANOTHER
+// contract that is referenced by compartments C does not see, say so BY NAME.
+//
+// TWO TESTS, BOTH REQUIRED — and the second is why this note is not a lie half the time.
+// The OBSERVATIONAL test (which other contract actually holds the half C is missing) is
+// true of a NARROWER contract and EQUALLY true of a DISJOINT SIBLING one. Observed:
+// `Client Inner Wire` (scope `client/`) and `Server Inner Wire` (scope `server/`) both
+// declare `/shared/thing`, the declared consumer genuinely does not exist anywhere in the
+// tree, and the report asserted IN CAPITALS that a real missing implementation was not one.
+// An agent reading that stops looking — strictly worse than the plain one-sided verdict.
+//
+// So it is ALSO gated STRUCTURALLY: the other contract's governing subtree must be a STRICT
+// DESCENDANT of mine. That is recoverable with no scope column — `contracts.file` holds the
+// spec's project-relative path (src/extract/contracts.js#contractFileLabel) and a contracts
+// dir governs its PARENT, so `dirname(dirname(file))` is the scope root:
+// `server/contracts/inner.asyncapi.yaml` -> `server`, `contracts/outer.asyncapi.yaml` ->
+// `.`. Siblings (`client` vs `server`) are neither's descendant, so no note. Scope itself
+// stays unpersisted and SCHEMA_VERSION stays 5: this reads a column that already exists.
+//
+// Global mode still cannot trip it, now for TWO independent reasons: every contract is
+// unscoped, so no other contract ever holds a half this one lacks (observational), and every
+// spec sits in the same depth-1 dir, so no scope root is a strict descendant of another
+// (structural). A db written before `file` became a path holds basenames, whose recovered
+// root is `.` for every contract — no strict descendants, so the note degrades to silence.
+//
+// KNOWN, DELIBERATE MISS: when the narrower contract's copy of the token has NO references
+// yet, `theirs` is empty and no note is printed. Left alone on purpose — with nothing
+// referencing it, naming that contract would say "the other half is implemented over there"
+// while nothing implements it anywhere, which is the same false reassurance in the other
+// direction. The plain one-sided verdict is the correct output in that case.
+//
+// Returns { declaredBy, refs, scopeOf }, built with two project-wide queries and ONLY when
+// the report actually has a one-sided token.
+function shadowIndex(db, project, includeTests) {
+  const declaredBy = new Map(); // token -> Set(contract name)
+  const refs = new Map();       // `${contract}\0${token}` -> Set(compartment)
+  const scopeOf = new Map();    // contract name -> governing subtree, as path segments
+  try {
+    for (const r of db.prepare(
+      'SELECT c.name cname, c.file cfile, ct.token tok FROM contract_tokens ct JOIN contracts c ON c.id=ct.contract WHERE ct.project=?',
+    ).all(project)) {
+      if (!scopeOf.has(r.cname)) scopeOf.set(r.cname, scopeSegments(r.cfile));
+      if (!r.tok) continue;
+      if (!declaredBy.has(r.tok)) declaredBy.set(r.tok, new Set());
+      declaredBy.get(r.tok).add(r.cname);
+    }
+    for (const r of db.prepare(
+      'SELECT c.name cname, e.token tok, s.compartment comp, s.file file FROM edges e '
+      + 'JOIN symbols s ON s.id=e.src JOIN contracts c ON c.id=e.dst '
+      + "WHERE e.project=? AND e.type='REFERENCES'",
+    ).all(project)) {
+      if (!r.tok) continue;
+      if (!includeTests && isTest(r.file)) continue;
+      const k = `${r.cname}\0${r.tok}`;
+      if (!refs.has(k)) refs.set(k, new Set());
+      refs.get(k).add(r.comp);
+    }
+  } catch { return null; } // old schema / missing table — degrade to the plain report
+  return { declaredBy, refs, scopeOf };
+}
+
+// The subtree a contract governs, as path segments, recovered from its spec's
+// project-relative path: the spec sits IN a contracts dir, and a contracts dir governs its
+// PARENT. `server/contracts/inner.asyncapi.yaml` -> ['server']; `contracts/outer.yaml` ->
+// [] (the project root). A bare basename (a pre-path db) and an absolute path (a spec
+// outside the project — a `--contracts` override, a linked member) both collapse to [], the
+// root, which participates in no strict-descendant relationship in the direction that
+// matters and therefore prints no note.
+function scopeSegments(file) {
+  if (!file || file.startsWith('/') || /^[A-Za-z]:[\\/]/.test(file)) return [];
+  const segs = file.split('/').filter((s) => s && s !== '.');
+  // `.wiregraph/inferred/` is ALWAYS unscoped (src/build.js#resolveContractsDirs) — it sits
+  // outside every source subtree and its seams are union-wide by construction. Recovering
+  // `.wiregraph` as its subtree would make it look narrower than a root-scoped contract and
+  // let it print a note claiming it governs a half it merely also matched.
+  if (segs[0] === '.wiregraph') return [];
+  return segs.length > 2 ? segs.slice(0, -2) : [];
+}
+
+// Is `b` STRICTLY inside `a`? Equal subtrees are not (two specs in the same contracts dir
+// govern the same code and neither takes anything from the other).
+function strictlyInside(a, b) {
+  return b.length > a.length && a.every((s, i) => s === b[i]);
+}
+
+// The other contracts that hold a half `cname` is missing for `tok`, named — but only the
+// ones whose subtree is strictly inside `cname`'s, i.e. the ones that could actually have
+// taken that half away from it.
+function shadowedBy(idx, cname, tok, comps) {
+  if (!idx) return [];
+  const others = idx.declaredBy.get(tok);
+  if (!others) return [];
+  const mine = comps instanceof Set ? comps : new Set(comps || []);
+  const myScope = idx.scopeOf.get(cname) || [];
+  const out = [];
+  for (const other of others) {
+    if (other === cname) continue;
+    if (!strictlyInside(myScope, idx.scopeOf.get(other) || [])) continue;
+    const theirs = idx.refs.get(`${other}\0${tok}`);
+    if (!theirs) continue;
+    const extra = [...theirs].filter((c) => !mine.has(c)).sort();
+    if (extra.length) out.push({ contract: other, compartments: extra });
+  }
+  return out.sort((a, b) => (a.contract < b.contract ? -1 : a.contract > b.contract ? 1 : 0));
+}
+
+function shadowNote(shadows) {
+  if (!shadows.length) return '';
+  const parts = shadows.map((s) => `"${s.contract}" (referenced there by [${s.compartments.join(', ')}])`);
+  return ` — NOT A MISSING IMPLEMENTATION: the same token is also declared by ${parts.join(' and ')}, which is where that half is governed. A narrower contract takes the code inside its subtree, so this contract legitimately sees only the halves outside it.`;
+}
+
+// …and the same fact for a token with NO references left at all — the FULLY shadowed case,
+// which is where the note was needed most and was not applied.
+//
+// THE ONE-SIDED BRANCH WAS ONLY HALF THE PROBLEM. When a narrower contract takes ONE half of
+// a token the outer contract is `one-sided` and got the note above. When it takes BOTH halves
+// the outer contract's token lands in `unreferenced` — and unreferenced is rendered as
+// `🔴 unreferenced … NO code references it (code has drifted off the contract…)` and raises
+// `🔴 DRIFT`, the tool's strongest signal. Observed on the canonical recursive layout, the
+// exact layout the mode exists to serve: `grep` finds the token in six places, the db holds
+// six REFERENCES rows for it, and every one is attributed to the INNER contract, so the outer
+// one sees zero and reports drift that does not exist.
+//
+// SO THE VERDICT CHANGES, not just the wording. A fully shadowed token is not drift by any
+// reading of the word: the contract is satisfied, by the narrower contract that governs that
+// subtree, and there is nothing for anyone to go and fix. Counting it as `unreferenced` would
+// keep firing DRIFT on a healthy nested graph, which is how a strong signal becomes one
+// people learn to ignore. It is NOT folded into `satisfied` either — nothing under THIS
+// contract's remaining reach exercises it, and a reader deciding whether the outer spec still
+// earns the declaration needs to see that. So it is its own bucket, its own line, and no flag.
+//
+// The gate is exactly the one the one-sided note already uses — `shadowedBy`, whose
+// strict-descendant scope-root test (recovered from `contracts.file`) is what keeps a
+// DISJOINT SIBLING scope from earning the same reassurance (traceShadowedSiblingTest). With
+// an empty `comps` every compartment referencing the token under the narrower contract is
+// "extra", so the observational half is satisfied by construction and the structural half is
+// doing all the work — which is the right division of labour for this case.
+function shadowedVerdictNote(shadows) {
+  const parts = shadows.map((s) => `"${s.contract}" (referenced there by [${s.compartments.join(', ')}])`);
+  return `NOT DRIFT: no code references this token under THIS contract because a NARROWER contract inside its subtree governs every reference — ${parts.join(' and ')}. The seam is intact there; this contract legitimately sees nothing.`;
+}
+
+// Detail line for a declared single_writer resource that lists several writers.
+function violationDetail(meta) {
+  const res = decodeResourceDirection(meta?.direction);
+  const writers = roleNames(meta?.producers);
+  return `declared single_writer (${res?.semantics || 'resource'}, kind ${res?.kind || '?'}) but ${writers.length} writers are declared: [${writers.join(', ')}] — two writers on a single-writer resource is a discipline violation, not a merge`;
+}
+
+// …and for an UNDECLARED PARTICIPANT: name the compartments whose code touches the
+// resource while the spec does not mention them at all.
+function undeclaredDetail(comps) {
+  return `referenced by [${comps.join(', ')}], which the spec declares as neither writer nor reader — add them to writers:/readers:, or find out why they touch this resource. (wiregraph cannot tell a write from a read, so it cannot say which list they belong in.)`;
+}
+
+// --- LISTING THE CONTRACTS IS A FIRST-CLASS QUESTION ---------------------------
+// "which contracts does this project even have?" had no answer. trace_contract needed a
+// name substring (the schema marked it REQUIRED), and `{"contract":""}` only worked by
+// accident — the empty string makes the `LIKE '%'||''||'%'` match everything, dumping the
+// full drift report for every contract at once, undocumented and unusable as a directory.
+//
+// So an OMITTED or EMPTY `contract` is now the official listing: one line per contract with
+// its kind and defined-token count, and nothing else. Kind is derived, not stored: a token
+// whose `direction` decodes as a resource descriptor (src/extract/resource-spec.js) came
+// from a `*.resource.yaml`, so a contract with any such token is a RESOURCE contract and one
+// with none is a WIRE contract. A contract with no distinctive tokens at all is listed too,
+// with `0 token(s)` — that is a real and easily-missed condition (it mints no REFERENCES and
+// derives no seam), and omitting it would make the directory lie by silence.
+function contractListing(db, project) {
+  let rows;
+  try {
+    rows = db.prepare(
+      'SELECT c.name name, c.file file, ct.token token, ct.direction direction '
+      + 'FROM contracts c LEFT JOIN contract_tokens ct ON ct.contract=c.id AND ct.project=c.project '
+      + 'WHERE c.project=? ORDER BY c.name').all(project);
+  } catch { return null; } // pre-v4 db (no contract_tokens) — caller falls back
+  const byName = new Map();
+  for (const r of rows) {
+    if (!byName.has(r.name)) byName.set(r.name, { file: r.file || null, tokens: new Set(), resource: false });
+    const e = byName.get(r.name);
+    if (r.token) e.tokens.add(r.token);
+    if (r.direction && decodeResourceDirection(r.direction)) e.resource = true;
+  }
+  if (!byName.size) return `No contracts in this project (${project}). Run /wiregraph-contracts to infer some, or add an AsyncAPI / *.resource.yaml spec under a contracts/ dir.`;
+  const out = [`${byName.size} contract(s) in this project — call trace_contract again with a name substring for the full drift report:`];
+  for (const [name, e] of [...byName].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+    out.push(`  ${name} — ${e.resource ? 'resource' : 'wire'} · ${e.tokens.size} token(s)${e.file ? ` · ${e.file}` : ''}`);
+  }
+  return out.join('\n');
 }
 
 export function traceContract(db, project, contract, token, includeTests) {
+  // Omitted / empty / whitespace-only => the directory, not a 30-contract dump.
+  if (contract === undefined || contract === null || String(contract).trim() === '') {
+    const listing = contractListing(db, project);
+    if (listing !== null) return listing;
+    contract = ''; // pre-v4 db: fall through to the legacy match-everything behaviour
+  }
   let q = `SELECT c.name contract, s.compartment compartment, s.file file, s.name name, s.startLine startLine, e.token token
            FROM edges e JOIN symbols s ON s.id=e.src JOIN contracts c ON c.id=e.dst
            WHERE e.project=@project AND e.type='REFERENCES' AND lower(c.name) LIKE '%'||lower(@contract)||'%'`;
@@ -343,31 +710,86 @@ export function traceContract(db, project, contract, token, includeTests) {
 
   const out = [];
   const allNames = new Set([...contractNames, ...byContract.keys()]);
+  // Built ONCE, lazily: only a report that actually has a one-sided token pays for the two
+  // project-wide queries shadowIndex runs.
+  let shadowIdx;
+  const shadows = (cname, tok, comps) => {
+    if (shadowIdx === undefined) shadowIdx = shadowIndex(db, project, includeTests);
+    return shadowedBy(shadowIdx, cname, tok, comps);
+  };
   for (const cname of [...allNames].sort()) {
     // --- drift summary (only when we have the defined-token set) --------------
     const definedTokens = defined ? defined.get(cname) : null;
     const refMap = refCompartments.get(cname) || new Map();
     let driftLines = [];
     if (definedTokens && definedTokens.size) {
-      const unreferenced = [], oneSided = [];
+      const unreferenced = [], oneSided = [], violations = [], undeclared = [], unreadable = [], shadowed = [];
       let satisfied = 0;
       for (const [tok, meta] of definedTokens) {
         const comps = refMap.get(tok) || new Set();
+        // Drift verdict and declaration violation are INDEPENDENT (see
+        // classifyContractToken): a token can be unreferenced AND in violation, and the
+        // report says both. It used to say only the second.
         const verdict = classifyContractToken(comps, meta);
-        if (verdict === 'unreferenced') unreferenced.push(tok);
-        else if (verdict === 'one-sided') oneSided.push([tok, oneSidedDetail(comps, meta)]);
+        if (verdict === 'unreferenced') {
+          // FULLY SHADOWED IS NOT DRIFT (see shadowedVerdictNote). Same gate as the
+          // one-sided note, so a disjoint sibling scope still earns nothing.
+          const sh = shadows(cname, tok, comps);
+          if (sh.length) shadowed.push([tok, shadowedVerdictNote(sh)]);
+          else unreferenced.push(tok);
+        }
+        else if (verdict === 'one-sided') oneSided.push([tok, oneSidedDetail(comps, meta) + shadowNote(shadows(cname, tok, comps))]);
         else satisfied++;
+        if (singleWriterViolation(meta)) violations.push([tok, violationDetail(meta)]);
+        // Orthogonal again: a token can be satisfied by its declared roles AND still be
+        // touched by a compartment nobody declared.
+        const extra = undeclaredParticipants(comps, meta);
+        if (extra.length) undeclared.push([tok, undeclaredDetail(extra)]);
+        const errs = resourceMetaErrors(meta);
+        if (errs.length) unreadable.push([tok, errs.join('; ')]);
       }
       const total = definedTokens.size;
-      const flag = unreferenced.length ? ' 🔴 DRIFT' : (oneSided.length ? ' ⚠️' : '');
-      out.push(`Contract: ${cname} — ${satisfied}/${total} tokens satisfied · ${oneSided.length} one-sided · ${unreferenced.length} unreferenced${flag}`);
+      // Violation/unreadable segments and flags are appended ONLY when non-empty, so a
+      // contract with no resource tokens renders byte-identically to before. DRIFT and
+      // VIOLATION can both appear — they are different findings about the same contract.
+      const flag = (unreferenced.length ? ' 🔴 DRIFT' : '')
+        + (violations.length ? ' 🛑 VIOLATION' : '')
+        + (undeclared.length ? ' ⚠️ UNDECLARED' : '')
+        + (unreadable.length ? ' 🛑 UNREADABLE' : '')
+        + (!unreferenced.length && !violations.length && !unreadable.length && oneSided.length ? ' ⚠️' : '');
+      const vSeg = violations.length ? ` · ${violations.length} single-writer violation${violations.length > 1 ? 's' : ''}` : '';
+      const oSeg = undeclared.length ? ` · ${undeclared.length} with undeclared participant${undeclared.length > 1 ? 's' : ''}` : '';
+      // Appended ONLY when non-empty, so every report without a fully-shadowed token
+      // renders byte-identically to before.
+      const sSeg = shadowed.length ? ` · ${shadowed.length} shadowed by a narrower contract` : '';
+      out.push(`Contract: ${cname} — ${satisfied}/${total} tokens satisfied · ${oneSided.length} one-sided · ${unreferenced.length} unreferenced${sSeg}${vSeg}${oSeg}${flag}`);
+      if (violations.length) {
+        driftLines.push('  🛑 single-writer violation — the resource declares single_writer but more than one compartment is declared as a writer (concurrent writers on a last-writer-wins/presence resource lose updates):');
+        for (const [t, detail] of violations.slice(0, 40)) driftLines.push(`       ${t} — ${detail}`);
+        if (violations.length > 40) driftLines.push(`       … +${violations.length - 40} more`);
+      }
+      if (undeclared.length) {
+        driftLines.push('  ⚠️ undeclared participant — a compartment REFERENCES the resource but the spec names it as neither writer nor reader (wiregraph detects references, NOT writes, so it cannot tell you which side it belongs on — but it can tell you the spec is incomplete):');
+        for (const [t, detail] of undeclared.slice(0, 40)) driftLines.push(`       ${t} — ${detail}`);
+        if (undeclared.length > 40) driftLines.push(`       … +${undeclared.length - 40} more`);
+      }
+      if (unreadable.length) {
+        driftLines.push('  🛑 unreadable resource metadata — the stored kind/semantics/single_writer did not decode, so the declared discipline for these tokens is UNKNOWN (rebuild the graph; if it persists the spec or the db is corrupt):');
+        for (const [t, detail] of unreadable.slice(0, 40)) driftLines.push(`       ${t} — ${detail}`);
+        if (unreadable.length > 40) driftLines.push(`       … +${unreadable.length - 40} more`);
+      }
       if (unreferenced.length) {
         driftLines.push('  🔴 unreferenced — defined in the contract, NO code references it (code has drifted off the contract, or the compartment is not indexed):');
         for (const t of unreferenced.slice(0, 40)) driftLines.push(`       ${t}`);
         if (unreferenced.length > 40) driftLines.push(`       … +${unreferenced.length - 40} more`);
       }
+      if (shadowed.length) {
+        driftLines.push('  ⓘ shadowed — defined here, and EVERY reference to it is governed by a narrower contract inside this contract\'s subtree. This is NOT drift and there is nothing to fix; the seam is checked under that contract:');
+        for (const [t, detail] of shadowed.slice(0, 40)) driftLines.push(`       ${t} — ${detail}`);
+        if (shadowed.length > 40) driftLines.push(`       … +${shadowed.length - 40} more`);
+      }
       if (oneSided.length) {
-        driftLines.push('  ⚠️ one-sided — only one compartment references the token (a cross-compartment seam needs both sides; the other half is missing):');
+        driftLines.push('  ⚠️ one-sided — only one side of the seam references the token under THIS contract (a cross-compartment seam needs both; the other half is either missing, or governed by a narrower contract — which is named per token below when so):');
         for (const [t, detail] of oneSided.slice(0, 40)) driftLines.push(`       ${t} — ${detail}`);
         if (oneSided.length > 40) driftLines.push(`       … +${oneSided.length - 40} more`);
       }
@@ -403,7 +825,9 @@ export function contractDriftByName(db, project, includeTests = false) {
   const out = new Map();
   let defined;
   try {
-    defined = db.prepare('SELECT c.name name, ct.token token, ct.producers producers, ct.consumers consumers FROM contract_tokens ct JOIN contracts c ON c.id=ct.contract WHERE ct.project=?').all(project);
+    // `direction` is selected too: for a resource token it carries the encoded
+    // kind/semantics/single_writer the classifier needs to spot a violation.
+    defined = db.prepare('SELECT c.name name, ct.token token, ct.direction direction, ct.producers producers, ct.consumers consumers FROM contract_tokens ct JOIN contracts c ON c.id=ct.contract WHERE ct.project=?').all(project);
   } catch {
     return out; // contract_tokens table absent (old schema)
   }
@@ -425,21 +849,39 @@ export function contractDriftByName(db, project, includeTests = false) {
   for (const d of defined) {
     if (!byName.has(d.name)) byName.set(d.name, new Map());
     byName.get(d.name).set(d.token, {
+      direction: d.direction || null,
       producers: d.producers ? d.producers.split(',') : [],
       consumers: d.consumers ? d.consumers.split(',') : [],
     });
   }
   for (const [name, toks] of byName) {
-    let satisfied = 0, oneSided = 0, unreferenced = 0;
+    let satisfied = 0, oneSided = 0, unreferenced = 0, violations = 0, undeclared = 0;
     const m = refMap.get(name) || new Map();
     for (const [t, meta] of toks) {
-      const verdict = classifyContractToken(m.get(t) || new Set(), meta);
+      const refs = m.get(t) || new Set();
+      const verdict = classifyContractToken(refs, meta);
       if (verdict === 'unreferenced') unreferenced++;
       else if (verdict === 'one-sided') oneSided++;
       else satisfied++;
+      if (singleWriterViolation(meta)) violations++; // orthogonal — see classifyContractToken
+      if (undeclaredParticipants(refs, meta).length) undeclared++; // orthogonal again
     }
-    const status = unreferenced > 0 ? 'drift' : (oneSided > 0 ? 'one-sided' : 'ok');
-    out.set(name, { total: toks.size, satisfied, oneSided, unreferenced, status });
+    // `status` is still ONE value because it drives a single edge colour in export-html.
+    // Precedence: drift beats violation beats one-sided. A contract that is both drifted
+    // and in violation shows as drift AND reports `violations > 0` alongside, so the
+    // second finding is not lost the way it was when the two shared a bucket.
+    const status = unreferenced > 0 ? 'drift' : (violations > 0 ? 'violation' : (oneSided > 0 ? 'one-sided' : 'ok'));
+    // `violations` / `undeclared` are OMITTED when zero. They are embedded
+    // verbatim into export-html's DATA blob, so emitting a zero on every row would change
+    // the bytes of every generated visualization for every wire-only project — a diff in
+    // output for a feature they do not use, and it would falsify the byte-identical claim
+    // the export tests make. Present-and-non-zero is the same information.
+    out.set(name, {
+      total: toks.size, satisfied, oneSided, unreferenced,
+      ...(violations ? { violations } : {}),
+      ...(undeclared ? { undeclared } : {}),
+      status,
+    });
   }
   return out;
 }
@@ -455,8 +897,11 @@ export function pathBetween(db, project, from, to, fromRepo, toRepo, maxHops = 1
     db.prepare('SELECT id,compartment,file,name FROM symbols WHERE id=?').get(id) ||
     db.prepare('SELECT id,NULL compartment,file,name FROM contracts WHERE id=?').get(id) ||
     { compartment: null, file: null, name: id };
-  const starts = symbolMatches(db, project, from, fromRepo).map((r) => r.id);
-  const goals = new Set(symbolMatches(db, project, to, toRepo).map((r) => r.id));
+  // includeModules: `<module>` is a legitimate endpoint here (see symbolMatches) —
+  // module-scope code is where top-level resource writes/reads and route
+  // registrations live. Every other caller keeps the old, filtered behavior.
+  const starts = symbolMatches(db, project, from, fromRepo, null, { includeModules: true }).map((r) => r.id);
+  const goals = new Set(symbolMatches(db, project, to, toRepo, null, { includeModules: true }).map((r) => r.id));
   if (!starts.length || !goals.size) return `No path found between "${from}" and "${to}" within ${hops} hops.`;
   // undirected adjacency over CALLS + REFERENCES + IMPORTS (cross-compartment deps)
   const adj = new Map();

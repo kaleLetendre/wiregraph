@@ -1,6 +1,6 @@
 ---
 description: ↳ alias of /wiregraph-stats
-argument-hint: "(no args — uses the active project)"
+argument-hint: "(no args — aggregates all your graphs; use /wiregraph-stats-local for just this one)"
 allowed-tools: Bash, Read
 ---
 Short alias for **/wiregraph-stats**. Run that command now:

@@ -1,7 +1,9 @@
 // Graph model: deterministic node/edge identity so re-runs MERGE cleanly.
 //
 // Node kinds : Compartment, File, Symbol, Contract
-// Edge kinds : IN_COMPARTMENT, DEFINED_IN, CALLS, REFERENCES, WIRE
+// Edge kinds : IN_COMPARTMENT, DEFINED_IN, CALLS, REFERENCES, WIRE, RESOURCE
+//              (WIRE = derived producer->consumer seam from a wire contract;
+//               RESOURCE = derived writer->reader seam from a resource contract)
 //
 // Every id is a stable string derived from content, never a random value, so a
 // second build over unchanged code produces identical ids and the loader's
@@ -66,7 +68,21 @@ export class Graph {
   }
 
   addContract(c) {
-    if (!this.contracts.has(c.id)) this.contracts.set(c.id, { ...c, project: this.project });
+    const prior = this.contracts.get(c.id);
+    // First-wins, like every other add* here — a second registration of the same id is
+    // DROPPED, tokenMeta and all. That is right for two specs of the SAME format sharing
+    // a title (extract/contracts.js merges them into one descriptor before they ever get
+    // here), and quietly destructive across formats: an AsyncAPI node and a resource node
+    // under one id describe different things, so keeping whichever arrived first yields a
+    // contract whose `file` names one format while its tokens are half of one and none of
+    // the other. Loud, because there is no correct silent answer.
+    if (prior && (prior.kind || 'asyncapi') !== (c.kind || 'asyncapi')) {
+      throw new Error(
+        `contract id "${c.id}" is already registered as kind "${prior.kind || 'asyncapi'}" (${prior.file}) `
+        + `and cannot be re-registered as "${c.kind || 'asyncapi'}" (${c.file}). `
+        + 'A contract title must be unique across formats — rename one of them.');
+    }
+    if (!prior) this.contracts.set(c.id, { ...c, project: this.project });
     return c.id;
   }
 
