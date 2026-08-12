@@ -6,6 +6,40 @@ the Neo4j-vs-SQLite parity/perf/token experiments — are kept out of this repo.
 
 ---
 
+## D12 — Recursive mode implements a named architecture, and the docs say which of its rules wiregraph actually checks — 2026-08-12
+
+**Decision.** Treat **Compartments & Contracts** — a language- and tool-independent architecture
+document that exists outside this repo — as the thing recursive mode implements, and record the
+correspondence rule by rule in ONE place: the README's
+[Nested compartments](README.md#nested-compartments-recursive-mode) table. Every rule R1–R6 gets one
+of three verdicts, and the three are kept distinct because conflating them is the failure this
+entry exists to prevent: **enforced** (wiregraph detects a violation and says so — R3, R4),
+**assumed** (its behaviour depends on the rule and goes silent or wrong without it — R2, R5),
+**unaddressed** (nothing in wiregraph relates to it — R1, R6). The load-bearing case is **R4**, "a
+contract lives in the shared parent's `contracts/`, never inside either side," which is
+character-for-character what `scopeRoot = dirname(dir)` computes in
+`src/contracts-dirs.js#rootContractsEntries` (consumed by `src/build.js#resolveContractsDirs` and
+`src/extract/contracts.js#scopeDepthFor`). The rule and the code were arrived at independently and
+nothing in either place recorded that they are the same rule.
+
+**Why.** The scoping rule reads as an implementation detail — "which subtree does this contracts dir
+govern" — and was documented as one, at three code sites, in the vocabulary of directories. Named as
+R4 it is instead the single reason the layout works, and the reason the misfiling diagnostic exists:
+a contract filed inside one of its own sides governs only that side, so its far half reports
+one-sided. Without the correspondence written down, the next change to `scopeRoot` looks like a free
+choice of convention rather than an implementation of a rule with a stated purpose. The verdict
+column carries the other half of the honesty: four of the six rules are NOT machine-checked, and a
+reader who saw "wiregraph supports this architecture" would reasonably assume the tool was holding
+boundaries it does not hold.
+
+**Cost.** A correspondence claim in the README that nothing tests — it can rot the way any prose can,
+and the two `assumed` verdicts in particular would have to be revisited if the compartment partition
+ever became nested rather than flat, or if role names were ever validated against a contract's scope.
+It also puts a second project's vocabulary (whoami, R1–R6, levels) into wiregraph's docs, which is a
+dependency on a document this repo does not own. The alternative — leaving the two descriptions
+independent and hoping they stay compatible — is what produced a scoping rule nobody could explain
+the purpose of.
+
 ## D10 — Freshness = "differs from what was indexed" (mtime/size), and reads self-heal — 2026-06-17
 
 **Decision.** Track each file's on-disk `mtime`+`size` in the `files` table (schema

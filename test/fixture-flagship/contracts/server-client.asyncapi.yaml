@@ -1,0 +1,20 @@
+asyncapi: 3.0.0
+# LEVEL 1 — <root>/contracts. In recursive mode its scope root is the PROJECT ROOT, so it
+# governs the whole tree. That is what "server <-> client" means, and it is the only
+# contracts dir that can reach harness/, which lives under neither subtree.
+#
+# Per R2 the roles are named for the SIDES, not the directories — but a wiregraph role is
+# a compartment name, so the spec has to spell one. It spells the qualified/declared
+# names, which is the whole disambiguation question this fixture exists to pin.
+info:
+  title: Flagship Server Client
+  version: 1.0.0
+channels:
+  session:
+    address: /ws/session
+    x-wiregraph-producers: [srv_network]
+    x-wiregraph-consumers: [network, harness]
+  probeL1:
+    address: /shared/probe
+    x-wiregraph-producers: [harness]
+    x-wiregraph-consumers: [network]

@@ -30,7 +30,19 @@ import { readState, updateState, findIndexedRoot, wiregraphDir, owningMember, fa
 import { changedSince, projectRepos, upstreamDivergence } from '../../scripts/lib/git.mjs';
 import { record, estTokens } from '../../scripts/lib/metrics.mjs';
 
-const VERSION = '0.4.2';
+// Derived, never hand-written. This was a literal from 0.4.2 through 0.8.0 because no release
+// step touched it, and it is reported to MCP clients and stamped into every project's
+// state.json as pluginVersion — so the one number users could see was the one number nobody
+// updated. package.json ships with the plugin; if it is ever unreadable, say so rather than
+// asserting a version we did not read.
+const VERSION = (() => {
+  try {
+    const pkg = join(fileURLToPath(new URL('../../package.json', import.meta.url)));
+    return JSON.parse(readFileSync(pkg, 'utf8')).version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
 
 // Resolve the active project once at startup. realpath so it matches the build
 // (build.js tags nodes with realpathSync of the init root).

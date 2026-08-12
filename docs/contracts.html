@@ -559,6 +559,68 @@ channels:
       <span class="b">⚑</span>
       <div><b>Resource contracts</b> — coupling through a shared <i>thing</i> rather than a wire: a file or sentinel path, a DB table+key, a shared-memory region, a named pipe. The roles are <b>writer</b> and <b>reader</b>, not request and reply, and the semantics are presence/state. They live in a <code>&lt;name&gt;.resource.yaml</code> in your contracts dir listing each resource's <code>id</code>, <code>kind</code>, <code>semantics</code>, <code>writers</code> and <code>readers</code>, and <code>trace_contract</code> / <code>path_between</code> traverse them exactly like a wire. <code>/wiregraph-contracts</code> drafts them for you from constants two compartments share — it can see <i>that</i> they share one but never which side writes, so an inferred draft lists every compartment on both sides and you prune it. The <code>id</code> is the shared <b>constant name</b> (<code>GAME_STATE_PATH</code>), never the path literal: wiregraph is deliberately literal-blind, so a compartment that only ever writes <code>'/var/run/game/state.json'</code> and never names the constant is missed <i>by design</i>. Declare <code>single_writer: true</code> and a second <i>declared</i> writer is reported as a violation instead of being quietly merged &mdash; but note the limit: wiregraph detects <b>references</b>, never writes, so it cannot identify an <i>undeclared</i> writer as a writer at all. What it does report, exactly, is an <b>undeclared participant</b>: a compartment whose code touches the resource while the spec names it as neither writer nor reader.</div>
     </div>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
+      <div><b>The import detector is language-limited</b>, and it is worth knowing which side of the line you are on. An <code>IMPORTS</code> edge is resolved for <b>TypeScript/JavaScript</b> — a relative specifier, or a bare one matching another compartment's <code>package.json</code> <code>name</code> — and for <b>C</b>'s quoted <code>#include "…"</code>. <b>Python, Java, Kotlin and Rust emit no import candidates at all</b>: a Rust <code>use</code> path names a crate-relative <i>namespace</i> rather than a file, and a guess that lands on the wrong one is a false edge. In those languages an in-process cross-compartment link is described by a contract or it is not in the graph.</div>
+    </div>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
+      <div><b>Contracts at every level — a contracts dir governs its parent.</b> A tree whose compartments nest (a <code>server/</code> split into crates, a <code>client/</code> split into modules) can put a <code>contracts/</code> directory at each level, and in <b>recursive mode</b> (<code>/wiregraph-init</code> sets it) wiregraph finds all of them, not just the one at the root. The subtree a contract governs is the <b>parent of the directory holding it</b>: <code>server/contracts/</code> applies to files under <code>server/</code> and nowhere else, the root's <code>contracts/</code> applies to everything. That is not a naming convention — it is the placement rule of the architecture recursive mode was built for: a contract belongs to the shared parent of its two sides, never inside either one. File a contract inside one of its own sides and wiregraph will not say &ldquo;misfiled&rdquo;, but you will see the consequence: its scope covers only that side, the other half's references fall outside it, and the token reports <b>one-sided</b>.
+      <ul>
+        <li><b>The innermost contract wins a shared token.</b> When an outer and an inner contract both declare the same route, code under the inner one's subtree belongs to the inner contract — the same nearest-ancestor rule that decides which compartment a file is in.</li>
+        <li><b>Shadowed is not missing.</b> The outer contract then legitimately sees only the halves outside that subtree. <code>trace_contract</code> reports that as <b>ⓘ shadowed</b>, names the narrower contract, and keeps it out of the 🔴 drift count — so the drift flag still means something on a nested layout.</li>
+        <li><b><code>info.title</code> must be distinct across scopes.</b> Two specs sharing a title merge into one contract node, which would erase both scopes and let each spec's tokens match the other's subtree. That collision is refused by name, keeping the outer spec.</li>
+        <li><b>Name the compartments that hold the code.</b> Compartment attribution is flat: every file belongs to its <i>nearest</i> compartment, so a parent whose children are compartments in their own right holds only the files that are in none of them. A role naming <code>server</code> when the code lives in <code>server/ecs</code>, <code>server/sim</code>, … matches almost nothing and reports one-sided, with nothing said about why.</li>
+      </ul>
+      </div>
+    </div>
+
+    <div class="how-note reveal d1">
+      <span class="b">⚑</span>
+      <div><b>A hand-packed binary protocol needs one discipline to be traceable.</b> Every join wiregraph makes is a <i>string two compartments both write down</i> — a route, a topic, a payload field name, a constant name. A protocol that packs integer message tags into bytes over a socket puts none of those in the source, so a contract describing it matches nothing on either side and reports as drift, however correct the document is. The fix is not a setting. Give each message type a <b>named constant, spelled identically in both languages</b>, declare those names as the contract's tokens, and <i>use</i> them.
+      <pre><b>// server/network/src/codec.rs</b>
+pub const MSG_ENTITY_DELTA: u8 = 0x03;
+pub const MSG_INPUT_FRAME: u8 = 0x04;
+
+fn encode_delta(buf: &amp;mut Vec&lt;u8&gt;, d: &amp;Delta) {
+    buf.push(<b>MSG_ENTITY_DELTA</b>);          <b>// a USE — this is what mints the edge</b>
+    …
+}
+
+<b>// client/network/src/decode.ts</b>
+export const MSG_ENTITY_DELTA = 0x03;
+export const MSG_INPUT_FRAME  = 0x04;
+
+export function dispatch(view: DataView) {
+  switch (view.getUint8(0)) {
+    case <b>MSG_ENTITY_DELTA</b>: return readDelta(view);   <b>// the other half</b>
+    …
+  }
+}</pre>
+      <pre><b># contracts/server-client.asyncapi.yaml — beside the prose contract, not instead of it</b>
+asyncapi: '3.0.0'
+info:
+  title: Server ⇄ Client Wire
+  version: 0.1.0
+channels:
+  entity-delta:
+    address: MSG_ENTITY_DELTA            <b># no leading slash ⇒ matched literally</b>
+    x-wiregraph-producers: [server_network]   <b># COMPARTMENT names, as the graph knows them</b>
+    x-wiregraph-consumers: [client_network]
+  input-frame:
+    address: MSG_INPUT_FRAME
+    x-wiregraph-producers: [client_network]
+    x-wiregraph-consumers: [server_network]</pre>
+      <ul>
+        <li><b>Declaring the constant is not using it.</b> The line that declares a named constant is excluded from matching on purpose — a constants module that only <i>defines</i> the name would otherwise become a phantom half of the seam. Each side needs at least one real reference, which the encoder and the switch above are.</li>
+        <li><b>The name has to survive the distinctiveness gate.</b> <code>MSG_ENTITY_DELTA</code> passes (an underscore and 6+ characters). <code>Delta</code>, <code>kind</code> and <code>type</code> do not, and would be dropped — deliberately, since a generic token matches every file and manufactures seams.</li>
+        <li><b>Both sides must spell it the same.</b> The join is the literal string; <code>MSG_ENTITY_DELTA</code> in Rust and <code>MsgEntityDelta</code> in TypeScript is two tokens, and the seam stays dark. A vendored pair of constants kept in step by hand is the price of a protocol with no strings in it.</li>
+        <li><b>Only YAML specs are read.</b> A <code>contracts/</code> directory holding prose contracts keeps them; wiregraph reads <code>*.asyncapi.yaml</code> and <code>*.resource.yaml</code> and ignores every other file. The spec is a machine-readable projection of the part that can be string-matched, not a replacement for the document.</li>
+      </ul>
+      </div>
+    </div>
   </section>
 
   <!-- ============ SOURCES ============ -->

@@ -1,0 +1,6 @@
+# The flagship's workspace root. Cargo.toml is in MODULE_MANIFESTS unconditionally, so
+# this is what makes the project root itself a compartment boundary in the INFERRED
+# partition — the same thing the real Cargo.toml does.
+[workspace]
+members = ["server/ecs", "server/sim", "server/network", "server/host", "harness"]
+resolver = "2"

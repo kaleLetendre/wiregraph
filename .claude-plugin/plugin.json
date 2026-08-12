@@ -1,5 +1,6 @@
 {
   "name": "wiregraph",
+  "version": "0.9.0",
   "description": "Cross-compartment call/association graph in an embedded SQLite file (no daemon, no JVM), exposed to Claude as MCP tools. Index a project once; navigate/audit/refactor code reading ~half the file bytes a grep-and-read would. Project-scoped, balanced auto-update, self-refresh via update_graph.",
   "author": { "name": "Kale Letendre", "email": "kaleletendre@gmail.com" },
   "commands": [
@@ -11,6 +12,7 @@
     "./commands/wiregraph-stats-local.md",
     "./commands/wiregraph-posture.md",
     "./commands/wiregraph-contracts.md",
+    "./commands/wiregraph-review.md",
     "./commands/wiregraph-visualize.md",
     "./commands/wiregraph-linearize.md",
     "./commands/wiregraph-link.md",
@@ -27,6 +29,7 @@
     "./commands/wg-stats-local.md",
     "./commands/wg-posture.md",
     "./commands/wg-contracts.md",
+    "./commands/wg-review.md",
     "./commands/wg-visualize.md",
     "./commands/wg-linearize.md",
     "./commands/wg-link.md",

@@ -1,0 +1,12 @@
+asyncapi: 3.0.0
+# LEVEL 2 — <root>/client/contracts, scope root <root>/client. The mirror image of
+# server/contracts: /ui/present is named verbatim by server/network's route table and must
+# not match there.
+info:
+  title: Flagship Client Internal
+  version: 1.0.0
+channels:
+  present:
+    address: /ui/present
+    x-wiregraph-producers: [world_state]
+    x-wiregraph-consumers: [rendering]

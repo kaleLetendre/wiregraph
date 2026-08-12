@@ -1,0 +1,20 @@
+asyncapi: 3.0.0
+# LEVEL 2 — <root>/server/contracts, scope root <root>/server. Governs everything under
+# server/ and nothing else.
+#
+# /tick/loop is THE CONTROL for the collision tests: neither `ecs` nor `sim` collides with
+# anything, so this seam lights up in the INFERRED partition and in the DECLARED one
+# alike. When the sim-network channels next door go dark it is the colliding NAME that did
+# it, not the build.
+info:
+  title: Flagship Ecs Sim
+  version: 1.0.0
+channels:
+  tick:
+    address: /tick/loop
+    x-wiregraph-producers: [ecs]
+    x-wiregraph-consumers: [sim]
+  probeL2:
+    address: /shared/probe
+    x-wiregraph-producers: [ecs]
+    x-wiregraph-consumers: [sim]

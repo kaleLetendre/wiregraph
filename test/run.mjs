@@ -11704,6 +11704,420 @@ async function deferred2AlsoFindingsTest() {
 }
 // === DEFERRED-2 TESTS END ===
 
+// === FLAGSHIP CONFORMANCE TESTS START ===
+// =============================================================================
+// THE FLAGSHIP TREE (project-structure.md §01) THROUGH RECURSIVE MODE
+// =============================================================================
+// fixture-nested/ proves the MECHANISM (two levels, one shared route, IGNORE_DIRS).
+// fixture-flagship/ proves the mechanism survives the SHAPE the feature was built for,
+// which asks three things fixture-nested does not:
+//
+//   1. THREE levels of contracts dirs (`contracts/`, `server/contracts/`,
+//      `server/ecs/contracts/`), the deepest one deliberately EMPTY.
+//   2. A compartment BASENAME that occurs twice — `client/network` and `server/network`
+//      — with hand-written specs that name it.
+//   3. Compartments that exist ONLY in the declared partition (`server/`, `client/`
+//      carry a whoami.md and no build manifest), so the inferred and declared runs
+//      genuinely disagree about what the partition is.
+//
+// See test/fixture-flagship/README.md for the token table. Every "must NOT match"
+// assertion below is backed by a real literal in a real file, asserted present.
+const FIXTURE_FLAGSHIP = join(HERE, 'fixture-flagship');
+
+// The LEVEL-3 spec. Written by the helper rather than committed, because the flagship's
+// `server/ecs/contracts/` is deliberately empty today and git cannot carry an empty
+// directory — so the fixture's on-disk state IS the flagship's, and the populated state is
+// something a test opts into.
+//
+// Its roles name `ecs` on BOTH sides, which is not a mistake: `server/ecs/` holds exactly
+// one compartment, so a contracts dir scoped to it has nothing else to connect. That is
+// the flagship's `queries-storage` contract, whose two sides are MODULES inside one crate,
+// and it is the one entry in the contract index recursive mode cannot express.
+const FLAGSHIP_L3_SPEC = 'asyncapi: 3.0.0\ninfo: { title: Flagship Queries Storage, version: 1.0.0 }\nchannels:\n'
+  + '  read: { address: /ecs/storage/read, x-wiregraph-producers: [ecs], x-wiregraph-consumers: [ecs] }\n'
+  + '  probeL3: { address: /shared/probe, x-wiregraph-producers: [ecs], x-wiregraph-consumers: [ecs] }\n';
+
+// The flagship's ELEVEN whoami compartments as a declaration.
+//
+// THE BARE NAME `network` HAS TO GO TO EXACTLY ONE OF THEM. A declared name may not
+// contain '/' (compartment-decl.js NAME_BAD_CHARS — ids and fingerprints join on it), so
+// unlike the inferred partition a declaration cannot spell `server/network`; it must
+// invent a name for one side and may leave the bare basename on the other. `swap` flips
+// which side gets it, and the tests below assert the seams follow the declaration.
+const flagshipDecl = (swap = false) => [
+  { path: 'server', name: 'server' },
+  { path: 'server/ecs', name: 'ecs' },
+  { path: 'server/sim', name: 'sim' },
+  { path: 'server/network', name: swap ? 'network' : 'srv_network' },
+  { path: 'server/host', name: 'host' },
+  { path: 'client', name: 'client' },
+  { path: 'client/network', name: swap ? 'srv_network' : 'network' },
+  { path: 'client/world_state', name: 'world_state' },
+  { path: 'client/rendering', name: 'rendering' },
+  { path: 'client/input_handling', name: 'input_handling' },
+  { path: 'harness', name: 'harness' },
+];
+
+// Copy the fixture, materialize the empty level-3 dir, and write the state file.
+// `declare: false` keeps `mode: 'recursive'` (so contracts still scope) while leaving
+// `compartments` absent — which readDeclaration reads as NOT DECLARED, i.e. the INFERRED
+// partition. That combination is the flagship exactly as it stands today.
+function flagshipProject(work, { declare = true, swap = false, l3Spec = false } = {}) {
+  const root = realpathSync(work);
+  cpSync(FIXTURE_FLAGSHIP, root, { recursive: true });
+  mkdirSync(join(root, 'server', 'ecs', 'contracts'), { recursive: true });
+  if (l3Spec) writeFileSync(join(root, 'server', 'ecs', 'contracts', 'queries-storage.asyncapi.yaml'), FLAGSHIP_L3_SPEC);
+  mkdirSync(join(root, '.wiregraph'), { recursive: true });
+  const st = {
+    project: root, indexedRoots: [root], links: [], reposLastSha: {}, autoUpdate: 'balanced',
+    mode: 'recursive',
+  };
+  if (declare) st.compartments = flagshipDecl(swap);
+  writeFileSync(join(root, '.wiregraph', 'state.json'), JSON.stringify(st, null, 2));
+  return root;
+}
+
+// Every WIRE/RESOURCE edge as `contract|token|srcComp->dstComp`, which is the shape a
+// FABRICATED cross-scope edge is visible in: the compartments, not the symbol ids.
+function seamSet(db, project) {
+  return db.prepare(
+    'SELECT e.type, e.contract, e.token, ss.compartment sc, ds.compartment dc FROM edges e '
+    + 'JOIN symbols ss ON ss.id = e.src JOIN symbols ds ON ds.id = e.dst '
+    + "WHERE e.project = ? AND e.type IN ('WIRE','RESOURCE') ORDER BY e.type, e.contract, e.token, sc, dc",
+  ).all(project).map((r) => `${r.type} ${r.contract}|${r.token}|${r.sc}->${r.dc}`);
+}
+// The literal really is in the file — so "does not match" is a fact about SCOPE and not
+// about the fixture being quiet.
+const namesToken = (root, rel, tok) => readFileSync(join(root, rel), 'utf8').includes(tok);
+
+// --- 1. THREE LEVELS, AND THE R4 PROPERTY -------------------------------------
+// build.js:268 / contracts-dirs.js#rootContractsEntries set `scopeRoot = dirname(dir)`,
+// which is the spec's R4 ("a contract lives in the shared parent's contracts/, never
+// inside either side"). Asserting the right edges EXIST proves nothing about it — a
+// contract with no scope at all produces every one of them. What R4 is worth is the edges
+// it REFUSES, so the fixture is built so that a wrong scope FABRICATES one.
+async function flagshipThreeLevelScopeTest() {
+  const { detectContractsDirs } = await import('../src/build.js');
+  const { rootContractsEntries } = await import('../src/contracts-dirs.js');
+  const S = await import('../scripts/lib/state.mjs');
+  const work = mkdtempSync(join(tmpdir(), 'cg-flag3-'));
+  const root = flagshipProject(work, { l3Spec: true });
+  const rel = (p) => relative(root, p) || '.';
+
+  // (a) DISCOVERY at three depths, shallowest first then lexicographic.
+  eq(JSON.stringify(detectContractsDirs(root, { recursive: true }).map(rel)),
+    JSON.stringify(['contracts', 'client/contracts', 'server/contracts', 'server/ecs/contracts']),
+    'flag3: all four contracts dirs are discovered across THREE depths, shallowest first');
+
+  // (b) THE R4 RULE ITSELF, read straight off the resolver: each dir governs its PARENT,
+  //     and the root's own contracts/ governs the root — never dirname(root).
+  eq(JSON.stringify(rootContractsEntries(root, true).map((e) => [rel(e.dir), e.scopeRoot === null ? null : rel(e.scopeRoot)])),
+    JSON.stringify([['contracts', '.'], ['client/contracts', 'client'], ['server/contracts', 'server'], ['server/ecs/contracts', 'server/ecs']]),
+    'flag3: R4 — scopeRoot is dirname(dir) at every level, so a contract governs the shared parent and neither side alone');
+
+  const db = join(work, 'graph.db');
+  await runBuild({ target: root, project: root, db, reset: true });
+  const conn = connect(db, { readonly: true });
+  const m = refMap(conn, root);
+  const seams = seamSet(conn, root);
+
+  eq(conn.prepare('SELECT count(*) n FROM contracts WHERE project=?').get(root).n, 6,
+    'flag3: six distinct contract nodes — four dirs, three levels, two specs sharing server/contracts');
+
+  // (c) LEVEL 1 really is the whole tree: harness/ sits under neither server/ nor client/,
+  //     so only a root-scoped contract can reach it.
+  ok(refsFor(m, 'Flagship Server Client|/ws/session').includes('harness'),
+    'flag3: L1 — the root contract reaches harness/, which lies in no inner subtree');
+
+  // (d) LEVEL 2, both sides, each excluding a real mention on the other side.
+  eq(refsFor(m, 'Flagship Ecs Sim|/tick/loop'), JSON.stringify(['ecs', 'sim']),
+    'flag3: L2 server — /tick/loop stops at server/, though client/world_state names it');
+  ok(namesToken(root, 'client/world_state/ws.ts', '/tick/loop'), 'flag3: …and that mention is real');
+  eq(refsFor(m, 'Flagship Client Internal|/ui/present'), JSON.stringify(['rendering', 'world_state']),
+    'flag3: L2 client — /ui/present stops at client/, though server/network names it');
+  ok(namesToken(root, 'server/network/src/lib.rs', '/ui/present'), 'flag3: …and that mention is real too');
+
+  // (e) LEVEL 3 is the one two levels cannot fake: `sim` is a SIBLING inside the SAME
+  //     level-2 scope, so only a scope of `server/ecs` excludes it.
+  eq(refsFor(m, 'Flagship Queries Storage|/ecs/storage/read'), JSON.stringify(['ecs']),
+    'flag3: L3 — a contracts dir three deep excludes even its own SIBLING inside server/, not merely the other half of the tree');
+  ok(namesToken(root, 'server/sim/src/lib.rs', '/ecs/storage/read'), 'flag3: …and sim really does name it, one directory up');
+  ok(namesToken(root, 'client/world_state/ws.ts', '/ecs/storage/read'), 'flag3: …as does client/world_state, two subtrees away');
+
+  // (f) LONGEST PREFIX ACROSS THREE LEVELS. /shared/probe is declared at every level, so
+  //     the three contracts must PARTITION the compartments — no compartment twice, none
+  //     missing. A two-level implementation gets the L1/L2 split right and hands `ecs` to
+  //     the level-2 contract.
+  const p3 = JSON.parse(refsFor(m, 'Flagship Queries Storage|/shared/probe'));
+  const p2 = JSON.parse(refsFor(m, 'Flagship Ecs Sim|/shared/probe'));
+  const p1 = JSON.parse(refsFor(m, 'Flagship Server Client|/shared/probe'));
+  eq(JSON.stringify(p3), JSON.stringify(['ecs']), 'flag3: 3-level longest prefix — under server/ecs/ the DEEPEST declaration owns the shared token');
+  eq(JSON.stringify(p2), JSON.stringify(['host', 'sim', 'srv_network']),
+    'flag3: …the level-2 one keeps the rest of server/');
+  eq(JSON.stringify(p1), JSON.stringify(['harness', 'input_handling', 'network', 'rendering', 'world_state']),
+    'flag3: …and the level-1 one keeps everything outside server/');
+  const union = [...p1, ...p2, ...p3];
+  eq(new Set(union).size, union.length, 'flag3: …the three lists are DISJOINT — no compartment is claimed by two levels at once');
+  eq(union.length, conn.prepare('SELECT count(*) n FROM compartments WHERE project=?').get(root).n,
+    'flag3: …and together they cover every compartment, so the levels partition rather than merely narrow');
+
+  // (g) THE FABRICATED EDGE. server/contracts/sim-network names its consumer `network`,
+  //     which this declaration binds to client/network. A wrong scope mints REFERENCES for
+  //     client/network under a server-scoped contract, the role matches, and a
+  //     `sim -> client/network` WIRE edge appears across the server/client wall.
+  eq(refsFor(m, 'Flagship Sim Network|/snapshot/delta'), JSON.stringify(['sim', 'srv_network']),
+    'flag3: R4 negative — a server-scoped contract mints NO REFERENCES row for client/network');
+  ok(namesToken(root, 'client/network/net.ts', '/snapshot/delta'),
+    'flag3: …and client/network really does name the token, so only the scope excludes it');
+  ok(!seams.some((s) => s.includes('Flagship Sim Network|/snapshot/delta')),
+    `flag3: …so the fabricated cross-scope seam DOES NOT EXIST (got ${seams.filter((s) => s.includes('/snapshot/delta')).join(', ') || 'none'})`);
+  ok(!seams.some((s) => s.startsWith('WIRE Flagship Sim Network') && s.endsWith('->network')),
+    'flag3: …and no server-scoped wire seam lands in the client `network` compartment by any route');
+
+  // (h) THE POSITIVE CONTROL. Same spec, same dir, same producer, correctly-qualified
+  //     consumer — and it lights up. Without this, (g) passes on a build that does nothing.
+  ok(seams.includes('WIRE Flagship Sim Network|/snapshot/frame|sim->srv_network'),
+    `flag3: control — the correctly-named channel in the SAME spec DOES seam (got ${seams.filter((s) => s.includes('/snapshot/frame')).join(', ') || 'none'})`);
+
+  // (i) The level-3 contract produces no seam at all, and that is the honest answer:
+  //     `server/ecs/` holds ONE compartment, so a contract scoped to it has no second
+  //     party. The flagship's queries-storage seam is between MODULES in one crate.
+  ok(!seams.some((s) => s.includes('Flagship Queries Storage')),
+    'flag3: a level-3 contract over a single-compartment subtree derives NO seam — an intra-crate module contract is not expressible as a wire or resource contract');
+
+  has(S.modeLine(S.readState(root)), 'contracts SCOPED to 4 dir(s)',
+    'flag3: graph_status reports all four scoped dirs, the empty one included');
+
+  conn.close();
+  rmSync(work, { recursive: true, force: true });
+}
+
+// --- 2. THE `network` COLLISION WITHOUT DECLARED COMPARTMENTS -----------------
+// The flagship as it stands today: `mode: recursive` (so contracts scope) but no
+// `compartments` key, so the partition is INFERRED from Cargo.toml/package.json. Two
+// directories are called `network`. What happens to a spec that names the bare basename?
+async function flagshipInferredCollisionTest() {
+  const work = mkdtempSync(join(tmpdir(), 'cg-flaginf-'));
+  const root = flagshipProject(work, { declare: false });
+  const db = join(work, 'graph.db');
+  const build = () => execFileP(process.execPath, [BUILD, root, '--project', root, '--db', db, '--reset']);
+
+  const out = await build();
+  const all = out.stderr + '\n' + out.stdout;
+
+  // (a) THE WARNING FIRES (walk.js#warnNameCollision).
+  has(out.stderr, 'COMPARTMENT NAME COLLISION', 'flaginf: the inferred partition warns on the client/server `network` collision');
+  has(out.stderr, '"network" was claimed by 2 directories',
+    'flaginf: …naming the basename and how many directories claimed it');
+
+  // (b) WHAT HAPPENS TO THE COMPARTMENTS: RENAMED, not dropped and not merged. Both
+  //     directories survive under path-derived names.
+  const conn = connect(db, { readonly: true });
+  const comps = conn.prepare('SELECT name FROM compartments WHERE project=? ORDER BY name').all(root).map((r) => r.name);
+  ok(comps.includes('client/network') && comps.includes('server/network'),
+    `flaginf: both directories survive under DISTINCT path-derived names (got ${comps.join(', ')})`);
+  ok(!comps.includes('network'), 'flaginf: …and the bare basename names nothing at all afterwards');
+
+  // (c) WHAT HAPPENS TO THE EDGE: it DROPS. Not "one side is picked arbitrarily", not
+  //     "both are produced" — the role matches no compartment, so buildWireEdges derives
+  //     nothing and the token is reported as a one-sided gap. That is the defensible
+  //     answer: picking a side would invent a seam across a compiler-enforced wall, and
+  //     producing both would invent two. Silence would not be defensible, which is what
+  //     (d) is about.
+  const seams = seamSet(conn, root);
+  ok(!seams.some((s) => s.includes('/snapshot/delta')),
+    `flaginf: a spec naming the bare basename derives NO wire seam — the edge DROPS rather than picking a side (got ${seams.filter((s) => s.includes('/snapshot/delta')).join(', ') || 'none'})`);
+  ok(!seams.some((s) => s.includes('/ws/session')),
+    'flaginf: …and the level-1 seam that names it goes dark the same way');
+  eq(refsFor(refMap(conn, root), 'Flagship Sim Network|/snapshot/delta'), JSON.stringify(['server/network', 'sim']),
+    'flaginf: the REFERENCES rows are still correct and still scoped — only the ROLE lookup failed, so the seam is a gap and not a wrong edge');
+
+  // (d) …AND THE CONTROL: a token whose roles name non-colliding compartments is
+  //     untouched. So "no seam" above means the colliding NAME did it, not the build.
+  ok(seams.includes('WIRE Flagship Ecs Sim|/tick/loop|ecs->sim'),
+    `flaginf: control — a seam whose roles collide with nothing still lights up (got ${seams.join(', ') || 'none'})`);
+  conn.close();
+
+  // (e) THE FIX MUST BE READABLE OFF THE WARNINGS. Two messages carry it: the collision
+  //     warning prints the replacement names, and validateRoleCompartments prints the
+  //     whole known-compartment set next to the name that missed. An author never has to
+  //     guess the spelling.
+  has(out.stderr, 'now indexed as', 'flaginf: the collision warning states that the names CHANGED');
+  has(out.stderr, '- client/network', 'flaginf: …and prints the exact replacement string for one side');
+  has(out.stderr, '- server/network', 'flaginf: …and for the other');
+  has(out.stderr, 'Update those specs to the names above',
+    'flaginf: …and says, in the same breath, that hand-written specs are what must be updated');
+  has(all, 'names producer/consumer compartment(s) [network] that do not exist in this graph',
+    'flaginf: the WIRE role check names the role that missed');
+  has(all, 'Known compartments: [client/network, ecs, harness, host, input_handling, rendering, server/network, sim, world_state]',
+    'flaginf: …and lists every legal spelling, so the remedy is copyable rather than guessable');
+  has(all, 'resource "SNAPSHOT_SHM_PATH" names compartment(s)',
+    'flaginf: the RESOURCE role check reports the identical mistake on writers:/readers: — a separate code path, equally covered');
+
+  // (f) APPLY THE REMEDY THE WARNING GIVES, VERBATIM, AND THE SEAM COMES BACK — on
+  //     exactly the intended side. This is the answer to "what must a spec author write":
+  //     in the INFERRED partition it is the directory path relative to the walked root,
+  //     forward-slashed. Nothing else in the message would have worked.
+  const spec = join(root, 'server', 'contracts', 'sim-network.asyncapi.yaml');
+  writeFileSync(spec, readFileSync(spec, 'utf8').replace('x-wiregraph-consumers: [network]', 'x-wiregraph-consumers: [server/network]'));
+  await build();
+  const conn2 = connect(db, { readonly: true });
+  const fixed = seamSet(conn2, root);
+  ok(fixed.includes('WIRE Flagship Sim Network|/snapshot/delta|sim->server/network'),
+    `flaginf: the path-derived name from the warning is the disambiguation syntax — the seam returns (got ${fixed.filter((s) => s.includes('/snapshot/delta')).join(', ') || 'none'})`);
+  ok(!fixed.some((s) => s.includes('/snapshot/delta') && s.endsWith('->client/network')),
+    'flaginf: …and it resolves to EXACTLY the server side, never the client one');
+  conn2.close();
+
+  rmSync(work, { recursive: true, force: true });
+}
+
+// --- 3. THE SAME COLLISION WITH DECLARED COMPARTMENTS -------------------------
+// walk.js:113's example is literally `{ "path": "server/ecs", "name": "ecs" }` — the
+// flagship shape. With a declaration, the author chooses the names, so a bare `network` in
+// a spec resolves to whichever directory the DECLARATION gave it. The test runs the same
+// tree twice with the binding SWAPPED and asserts the seams follow, on both the wire path
+// and the resource path.
+async function flagshipDeclaredCollisionTest() {
+  const runOne = async (swap) => {
+    const work = mkdtempSync(join(tmpdir(), `cg-flagdecl-${swap ? 'b' : 'a'}-`));
+    const root = flagshipProject(work, { swap });
+    const db = join(work, 'graph.db');
+    const out = await execFileP(process.execPath, [BUILD, root, '--project', root, '--db', db, '--reset']);
+    const conn = connect(db, { readonly: true });
+    const res = { work, root, seams: seamSet(conn, root), m: refMap(conn, root), out: out.stderr + '\n' + out.stdout };
+    conn.close();
+    return res;
+  };
+
+  // BINDING A — the bare name `network` is the CLIENT's; the server's is `srv_network`.
+  const a = await runOne(false);
+  ok(!a.out.includes('COMPARTMENT NAME COLLISION'),
+    'flagdecl: a declaration silences the inferred-collision warning outright — the names were chosen, not guessed');
+  ok(!a.out.includes('do not exist in this graph'),
+    'flagdecl: …and no role in any spec misses, so nothing here is dark for the reason the inferred run was');
+
+  // WIRE. `[network]` resolves to client/network — the WRONG side of the wall — and scope
+  // is what stops it; `[srv_network]` resolves to the intended side and seams.
+  ok(a.seams.includes('WIRE Flagship Sim Network|/snapshot/frame|sim->srv_network'),
+    'flagdecl(wire): a qualified declared name resolves to EXACTLY the intended compartment');
+  ok(!a.seams.some((s) => s.includes('Flagship Sim Network|/snapshot/delta')),
+    'flagdecl(wire): …while the bare name, bound to the other subtree, is refused by the scope rather than seamed');
+
+  // RESOURCE — a separate code path (buildResourceEdges / writers:+readers:), so it gets
+  // its own pair. REPLAY_LOG_PATH is qualified on both ends and both ends are under
+  // server/, so it seams. SNAPSHOT_SHM_PATH reads `[network]`, i.e. client/network, whose
+  // VENDORED copy of the constant genuinely matches — and only the scope excludes it.
+  ok(a.seams.includes('RESOURCE Flagship Replay Log|REPLAY_LOG_PATH|srv_network->host'),
+    `flagdecl(resource): a qualified writers:/readers: pair inside the scope derives its RESOURCE edge (got ${a.seams.filter((s) => s.startsWith('RESOURCE')).join(', ') || 'none'})`);
+  eq(refsFor(a.m, 'Flagship Replay Log|SNAPSHOT_SHM_PATH'), JSON.stringify(['srv_network']),
+    'flagdecl(resource): …while the reader named by the bare name mints no REFERENCES row, being outside the scope');
+  ok(namesToken(a.root, 'client/network/net.ts', 'SNAPSHOT_SHM_PATH'),
+    'flagdecl(resource): …though client/network really does hold a vendored copy of that constant name');
+  ok(!a.seams.some((s) => s.includes('SNAPSHOT_SHM_PATH')),
+    'flagdecl(resource): …so no RESOURCE edge crosses the server/client wall either');
+
+  // BINDING B — the SAME tree and the SAME specs, with the two names swapped. Every
+  // verdict above inverts. Nothing but the declaration changed, which is what proves the
+  // declaration is what decided it (and not, say, a lucky alphabetical tie-break).
+  const b = await runOne(true);
+  ok(b.seams.includes('WIRE Flagship Sim Network|/snapshot/delta|sim->network'),
+    `flagdecl(swap): the bare name now resolves to the SERVER side, and its seam appears (got ${b.seams.filter((s) => s.includes('/snapshot/delta')).join(', ') || 'none'})`);
+  ok(!b.seams.some((s) => s.includes('Flagship Sim Network|/snapshot/frame')),
+    'flagdecl(swap): …while the formerly-good channel now points at client/network and is refused by the scope');
+  ok(!b.seams.some((s) => s.includes('REPLAY_LOG_PATH')),
+    'flagdecl(swap): …and the resource seam follows the declaration too — its writer is now out of scope, so it goes dark');
+
+  // THE SPELLING RULE, asserted directly: a declaration CANNOT use the inferred partition's
+  // path-derived name, because '/' is an id separator. So the answer to "what does a spec
+  // author write" is mode-dependent, and this is the half that constrains it.
+  const { validateDeclaration } = await import('../src/extract/compartment-decl.js');
+  const bad = validateDeclaration(a.root, [{ path: 'server/network', name: 'server/network' }]);
+  eq(bad.ok, false, 'flagdecl: a DECLARED name may not be the path-derived `server/network` — the inferred spelling is not portable to a declaration');
+  has(bad.errors.join('\n'), "contains ':', '/'", 'flagdecl: …and the rejection says which characters are reserved, so the author can pick a legal name');
+
+  rmSync(a.work, { recursive: true, force: true });
+  rmSync(b.work, { recursive: true, force: true });
+}
+
+// --- 4. A DELIBERATELY EMPTY contracts/ IS A CORRECT STATE --------------------
+// compartments-and-contracts.md §08: a contracts dir created before the contract is
+// written is correct, not a missing partition. The flagship is in exactly that state —
+// every one of its contracts dirs is empty of specs today. Two things must hold: it must
+// be quiet, and creating or deleting it must not churn the partition fingerprint, or every
+// `mkdir contracts` costs the user a full rebuild for a graph that cannot have changed.
+async function flagshipEmptyContractsDirTest() {
+  const S = await import('../scripts/lib/state.mjs');
+  const work = mkdtempSync(join(tmpdir(), 'cg-flagempty-'));
+  const root = flagshipProject(work);            // server/ecs/contracts exists and is EMPTY
+  const EMPTY = join(root, 'server', 'ecs', 'contracts');
+  const db = join(work, 'graph.db');
+  const build = (args) => execFileP(process.execPath, [BUILD, root, '--project', root, '--db', db, ...args]);
+
+  const out = await build(['--reset']);
+  const all = out.stderr + '\n' + out.stdout;
+  eq(readdirSync(EMPTY).length, 0, 'flagempty: the level-3 contracts dir is genuinely empty');
+
+  // (a) QUIET. Not a warning, not an error, not a "missing" anything.
+  ok(!/⚠[^\n]*ecs\/contracts/.test(all) && !all.includes('empty contracts'),
+    `flagempty: an empty contracts dir produces NO warning (stderr+stdout mentioning it: ${all.split('\n').filter((l) => l.includes('ecs/contracts')).join(' | ') || 'none'})`);
+
+  // (b) It is still a DISCOVERED, scoped dir — it is a declaration of intent, and
+  //     graph_status should show the author their own layout.
+  const st = S.readState(root);
+  ok((st.contractsDirs || []).map((d) => relative(root, d)).includes('server/ecs/contracts'),
+    'flagempty: …but it IS recorded as one of the scoped contracts dirs, so the intent stays visible');
+  has(S.modeLine(st), 'server/ecs/contracts', 'flagempty: …and graph_status names it');
+
+  // (c) It mints nothing: five contract nodes from the three populated dirs, none from it.
+  const conn = connect(db, { readonly: true });
+  eq(conn.prepare('SELECT count(*) n FROM contracts WHERE project=?').get(root).n, 5,
+    'flagempty: an empty dir contributes no contract node — the other three dirs account for all five');
+  conn.close();
+
+  // (d) THE FINGERPRINT DOES NOT MOVE. `rmdir` and `mkdir` of a spec-less contracts dir
+  //     change no graph row, so charging a full rebuild for either would be a rebuild for
+  //     nothing — and the incremental must not refuse.
+  const withDir = S.contractsFingerprint([root])['.'];
+  rmSync(EMPTY, { recursive: true, force: true });
+  eq(S.contractsFingerprint([root])['.'], withDir, 'flagempty: REMOVING an empty contracts dir does not move the fingerprint');
+  const edited = join(root, 'server', 'sim', 'src', 'lib.rs');
+  appendFileSync(edited, '\npub fn sim_tail() -> i32 { 1 }\n');
+  let refused = null;
+  try { await build(['--files', edited]); } catch (e) { refused = e.message; }
+  eq(refused, null, `flagempty: …so the next incremental runs instead of demanding a full rebuild (got ${String(refused).split('\n')[0]})`);
+
+  mkdirSync(EMPTY, { recursive: true });
+  eq(S.contractsFingerprint([root])['.'], withDir, 'flagempty: …and re-CREATING it does not move it either — `mkdir contracts` is free');
+
+  // THE FLAGSHIP'S ACTUAL STATE is README-only, not bare: §01 gives every contracts dir a
+  // README.md naming the contracts that belong there and the build step that produces
+  // each. That is a spec-less dir by a different route, and it must be just as inert —
+  // otherwise editing the plan for a contract nobody has written yet costs a full rebuild.
+  writeFileSync(join(EMPTY, 'README.md'), '# queries-storage, at step 1\n');
+  eq(S.contractsFingerprint([root])['.'], withDir,
+    'flagempty: a contracts dir holding only a README.md — the flagship\'s real state — is inert too');
+  writeFileSync(join(EMPTY, 'README.md'), '# queries-storage, at step 1 (moved to step 3)\n');
+  eq(S.contractsFingerprint([root])['.'], withDir, 'flagempty: …and EDITING that README does not move it either');
+  appendFileSync(edited, '\npub fn sim_tail2() -> i32 { 2 }\n');
+  refused = null;
+  try { await build(['--files', edited]); } catch (e) { refused = e.message; }
+  eq(refused, null, 'flagempty: …and that incremental runs too, so the round trip costs nothing');
+
+  // (e) THE EVENT THAT MATTERS still fires: writing the FIRST spec into it narrows a scope
+  //     and MUST escalate. An inert empty dir is only correct while it stays inert.
+  writeFileSync(join(EMPTY, 'queries-storage.asyncapi.yaml'), FLAGSHIP_L3_SPEC);
+  ok(S.contractsFingerprint([root])['.'] !== withDir, 'flagempty: writing the FIRST spec into it DOES move the fingerprint');
+  appendFileSync(edited, '\npub fn sim_tail3() -> i32 { 3 }\n');
+  refused = null;
+  try { await build(['--files', edited]); } catch (e) { refused = e.message; }
+  has(refused || '', 'contract specs in force changed since the last full build',
+    'flagempty: …and the incremental refuses, because a level-3 scope now narrows what server/contracts governed');
+
+  rmSync(work, { recursive: true, force: true });
+}
+// === FLAGSHIP CONFORMANCE TESTS END ===
+
 await rootFallbackPartitionTest();
 await legacyCodegraphHookLogTest();
 await unmountedMemberFanOutTest();
@@ -11800,6 +12214,40 @@ await deferred2ScopeNoteTest();
 await deferred2WireDeclinedTest();
 await deferred2RustScanTest();
 await deferred2AlsoFindingsTest();
+
+// --- FLAGSHIP CONFORMANCE ---
+await flagshipThreeLevelScopeTest();
+await flagshipInferredCollisionTest();
+await flagshipDeclaredCollisionTest();
+await flagshipEmptyContractsDirTest();
+
+// --- REVIEW (test/review.mjs, run as a child) ---
+// review.mjs is standalone: it owns its own counters and exits on its own. We fold its
+// totals into ours rather than just checking its exit code, so the number this file prints
+// stays the whole suite's number and can still be checked by arithmetic. Parsing its
+// summary is deliberate — a child that fails to print one contributes a hard failure here
+// instead of silently contributing zero.
+await (async () => {
+  let out = '';
+  let childFailed = false;
+  try {
+    out = (await execFileP(process.execPath, [join(HERE, 'review.mjs')])).stdout;
+  } catch (e) {
+    out = e.stdout || '';
+    childFailed = true;
+  }
+  const m = out.match(/(\d+) passed, (\d+) failed/);
+  if (!m) {
+    fail++;
+    console.error(`  FAIL: test/review.mjs printed no summary${childFailed ? ' and exited non-zero' : ''}`);
+    if (out) console.log(out);
+    return;
+  }
+  pass += Number(m[1]);
+  fail += Number(m[2]);
+  if (Number(m[2])) console.log(out); // only surface the child's detail when something broke
+})();
+
 rmSync(process.env.WIREGRAPH_REGISTRY, { force: true }); // drop the throwaway registry
 rmSync(process.env.WIREGRAPH_LINKS_HISTORY, { force: true }); // and the throwaway tombstone
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -1,0 +1,29 @@
+asyncapi: 3.0.0
+# LEVEL 2 — <root>/server/contracts, scope root <root>/server. THE R4 CASE.
+#
+# `delta` names its consumer with the BARE BASENAME `network`, which is what an author
+# sitting inside server/ naturally writes. Two directories in this tree answer to that
+# basename (server/network and client/network), and in the declared partition the tests
+# bind the bare name to the CLIENT one — the wrong side of a compiler-enforced wall.
+#
+# Nothing about the ROLE catches that: `network` is a real compartment, so
+# validateRoleCompartments has nothing to complain about. The ONLY thing standing between
+# this spec and a fabricated `sim -> client/network` WIRE edge is the subtree scope, which
+# stops server/contracts/ from ever minting a REFERENCES row for a file under client/.
+#
+# `frame` is the same channel written CORRECTLY, with the qualified name. Same spec, same
+# dir, same producer, same shape of code on both ends — and its seam does light up. It is
+# the control that makes "delta has no edge" mean "scope excluded the client" rather than
+# "nothing in this file works".
+info:
+  title: Flagship Sim Network
+  version: 1.0.0
+channels:
+  delta:
+    address: /snapshot/delta
+    x-wiregraph-producers: [sim]
+    x-wiregraph-consumers: [network]
+  frame:
+    address: /snapshot/frame
+    x-wiregraph-producers: [sim]
+    x-wiregraph-consumers: [srv_network]

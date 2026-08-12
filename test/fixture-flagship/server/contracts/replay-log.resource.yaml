@@ -1,0 +1,25 @@
+# LEVEL 2 resource contract, scope root <root>/server. The resource path
+# (writers:/readers:) is a SEPARATE code path from the wire one, so the collision and the
+# scope both have to be pinned on it independently.
+#
+# REPLAY_LOG_PATH is the correctly-qualified case: writers/readers are both genuinely under
+# server/, and the seam must light up.
+#
+# SNAPSHOT_SHM_PATH is the resource half of the R4 trap — `network` again, bound to
+# client/network. client/network holds a VENDORED copy of the same constant name, so the
+# id genuinely matches there and only the scope excludes it.
+title: Flagship Replay Log
+resources:
+  - id: REPLAY_LOG_PATH
+    kind: path
+    semantics: append-log
+    single_writer: true
+    writers: [srv_network]
+    readers: [host]
+
+  - id: SNAPSHOT_SHM_PATH
+    kind: shm
+    semantics: last-writer-wins
+    single_writer: true
+    writers: [srv_network]
+    readers: [network]
