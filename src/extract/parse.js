@@ -275,10 +275,37 @@ function rustDef(node) {
     case 'struct_item':
     case 'enum_item':
     case 'union_item':
-    case 'trait_item':
-    case 'mod_item': {
+    case 'trait_item': {
       const n = field(node, 'name');
       return n ? { name: n.text, kind: 'class' } : null;
+    }
+    // `mod_item` covers TWO unrelated constructs that share one node type, and only one of
+    // them is a definition:
+    //   mod foo { … }   an INLINE module — a real container whose body holds the code.
+    //   mod foo;        a FILE REFERENCE — the declaration that pulls in foo.rs. It has no
+    //                   body, so the symbol it used to mint spanned one line, had nothing
+    //                   worth a get_source, and — because resolve.js indexes definitions by
+    //                   NAME — became a resolution target that a same-named call could land
+    //                   on. Every real lib.rs carries 5-15 of them.
+    // The `body` field is the whole distinction, and it is the same test the grammar makes:
+    // a bodiless mod_item simply has no `body` child. This is exactly the rule already
+    // applied to a trait's bodiless `function_signature_item` two cases up — a declaration
+    // that names something defined elsewhere is not itself a definition.
+    case 'mod_item': {
+      if (!field(node, 'body')) return null;
+      const n = field(node, 'name');
+      return n ? { name: n.text, kind: 'class' } : null;
+    }
+    // `macro_rules! name { … }`. A macro is INVOKED like a function and has a body worth
+    // reading, so it is a definition; without a row here find_symbol and trace_callers on
+    // a macro return nothing at all. Kind 'function' rather than 'class' because
+    // rustMacroCall below emits a CALLS edge INTO it — a container kind would be a
+    // resolution target that nothing ever calls. Declarative macros only: a proc-macro
+    // lives in its own crate behind `#[proc_macro]` on an ordinary `function_item`, which
+    // is already a symbol via the case below.
+    case 'macro_definition': {
+      const n = field(node, 'name');
+      return n ? { name: n.text, kind: 'function' } : null;
     }
     case 'function_item': {
       const n = field(node, 'name');
@@ -290,30 +317,220 @@ function rustDef(node) {
   }
 }
 
-// Rust callee shapes, all reduced to the LAST path segment — the same name resolveCalls
-// indexes DEFINITIONS under, and the same choice every other language makes (tsCall's
-// member `property`, cCall's `field`, javaCall's `name`, ktCall's last navigation
-// identifier):
+// The separator a callee NAME uses to carry its TYPE qualifier through to resolve.js.
+// Only rustCallee ever produces one: no other grammar here admits `::` in an identifier,
+// so a name containing it is unambiguously a Rust type-qualified callee.
+//
+// Why the qualifier has to travel at all. Reducing `Type::new()` to `new` — which is what
+// every other language's rule does with its member/field/property — generalizes badly to
+// Rust, because `new` is a naming CONVENTION rather than a keyword. `Vec::new()`,
+// `String::new()`, `HashMap::new()`, `Instant::now()` and `Default::default()` all alias
+// onto whatever inherent methods the crate happens to define, and resolve.js then fans the
+// call out to every one of them (up to AMBIGUOUS_CAP = 6). Measured on a crate with two
+// inherent `new`s and three `Vec::new()` call sites: 5 of the 7 CALLS edges produced were
+// fabrications, including one from a method to a method it cannot reach.
+//
+// The qualifier does NOT decide locality here — parse.js sees one file and a type is
+// usually defined in another. It only says "this callee was reached through a TYPE named
+// Q"; resolve.js checks Q against the actual symbol table (see its qualifier arm).
+export const CALLEE_QUALIFIER_SEP = '::';
+
+// Rust type names that need no `use` to be in scope, so their presence in a path is not
+// corroborated by anything in the file. Without this list the prelude constructors — the
+// single largest source of the fabrication above — would land in the "no evidence" bucket
+// and keep resolving by bare name. Everything ELSE external (HashMap, Instant, Arc, a
+// third-party type) arrives through a `use`, which rustFileContext already records, or
+// through a multi-segment path, which is evidence on its own.
+const RUST_PRELUDE_TYPES = new Set([
+  'Vec', 'String', 'Box', 'Option', 'Result', 'Default', 'From', 'Into', 'TryFrom',
+  'TryInto', 'ToString', 'ToOwned', 'Clone', 'Copy', 'Drop', 'Iterator', 'IntoIterator',
+  'AsRef', 'AsMut', 'Ord', 'PartialOrd', 'Eq', 'PartialEq', 'Hash', 'Send', 'Sync',
+  'Sized', 'Fn', 'FnMut', 'FnOnce',
+  // Primitive types are lowercase, so the "starts with a capital" test below would read
+  // `u32::from(x)` as a MODULE path and let `from` resolve by bare name. They are types.
+  'bool', 'char', 'str', 'u8', 'u16', 'u32', 'u64', 'u128', 'usize',
+  'i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'f32', 'f64',
+]);
+
+// The last segment of a path node — the namespace a callee was reached through.
+//   svc::inner   scoped_identifier  -> "inner"   (its own `name` field)
+//   Vec::<u8>    generic_type       -> "Vec"     (its `type` field)
+// `crate`/`self`/`super` and a `<T as Trait>` bracketed_type yield null: they name no
+// segment we could check against the symbol table, so the callee stays unqualified.
+function rustPathTail(n) {
+  if (!n) return null;
+  if (n.type === 'identifier' || n.type === 'type_identifier') return n.text;
+  if (n.type === 'scoped_identifier') return rustPathTail(field(n, 'name'));
+  if (n.type === 'generic_type') return rustPathTail(field(n, 'type'));
+  return null;
+}
+
+// Decide whether a callee keeps its qualifier. Returns the name to emit.
+//
+// The qualifier is kept only when the file gives POSITIVE evidence that `q` is a type:
+// it is defined here, a `use` in this file introduced it, it is a prelude/primitive type,
+// it is a single capital letter (a generic parameter — `T::new()` can never be resolved),
+// or the path had two or more segments (`std::collections::HashMap::new`). With no
+// evidence at all the qualifier is DROPPED and the callee resolves by bare name exactly
+// as it did before — a deliberately conservative default, since an unrecognized capital
+// in a single-segment path is more likely a type this parser failed to see than proof of
+// anything. That default is the fix's one gap; see the note on the false-negative cost.
+//
+// A snake_case qualifier is a MODULE path (`svc::inner::make()`), not a type, and Rust's
+// own naming lints make that distinction reliable. Module paths are left alone: dropping
+// them would cost real cross-module edges, which are the common case in a Rust crate.
+// `Self::` is likewise left alone — the impl it refers to is by definition in this file,
+// which resolve.js's same-file preference already handles.
+function rustQualify(q, member, ctx, multiSegment) {
+  if (!q || q === 'Self' || !member) return member || null;
+  const isType = /^[A-Z]/.test(q) || RUST_PRELUDE_TYPES.has(q);
+  if (!isType) return member;
+  const evidenced = multiSegment
+    || RUST_PRELUDE_TYPES.has(q)
+    || /^[A-Z]$/.test(q)
+    || !!ctx?.knownTypes?.has(q);
+  return evidenced ? `${q}${CALLEE_QUALIFIER_SEP}${member}` : member;
+}
+
+// Rust callee shapes. Every one reduces to the member name resolveCalls indexes
+// DEFINITIONS under — the same choice every other language makes (tsCall's member
+// `property`, cCall's `field`, javaCall's `name`, ktCall's last navigation identifier) —
+// except that a TYPE-qualified path also carries its qualifier (see rustQualify):
 //   foo()          identifier         -> "foo"
-//   module::foo()  scoped_identifier  -> "foo"  (the `name` field; the `path` is a
-//   Type::new()    scoped_identifier  -> "new"   MODULE or TYPE namespace, not a callee,
-//                                                and resolution is name-based anyway)
+//   module::foo()  scoped_identifier  -> "foo"        (snake_case path: a MODULE namespace)
+//   Type::new()    scoped_identifier  -> "Type::new"  (CamelCase path: a type namespace)
 //   x.method()     field_expression   -> "method"
 //   foo::<T>()     generic_function   -> unwrap to its `function` and recurse
 // A parenthesized/closure/index callee (`(f)()`, `fs[0]()`) yields null: there is no
 // name to resolve, exactly as tsCall returns null for a non-identifier callee.
-function rustCallee(fn) {
+function rustCallee(fn, ctx) {
   if (!fn) return null;
   if (fn.type === 'identifier') return fn.text;
-  if (fn.type === 'scoped_identifier') return field(fn, 'name')?.text || null;
   if (fn.type === 'field_expression') return field(fn, 'field')?.text || null;
-  if (fn.type === 'generic_function') return rustCallee(field(fn, 'function'));
+  if (fn.type === 'generic_function') return rustCallee(field(fn, 'function'), ctx);
+  if (fn.type === 'scoped_identifier') {
+    const member = field(fn, 'name')?.text || null;
+    if (!member) return null;
+    const path = field(fn, 'path');
+    return rustQualify(rustPathTail(path), member, ctx, path?.type === 'scoped_identifier');
+  }
   return null;
 }
 
-function rustCall(node) {
-  if (node.type !== 'call_expression') return null;
-  return rustCallee(field(node, 'function'));
+// --- macros -----------------------------------------------------------------
+// tree-sitter-rust does not parse macro ARGUMENTS as expressions: `println!("{}", f())`
+// yields a `token_tree` and no `call_expression` at all, so every call inside every macro
+// was invisible. A `token_tree` is not opaque, though — it is a flat token stream in which
+// a call still has a recognizable SHAPE:
+//
+//     identifier  token_tree("…")        f(x)        a function/method call
+//     identifier  !  token_tree          f!(x)       a nested macro invocation
+//
+// Scanning for that shape rather than regexing the text is what keeps it honest: string
+// bodies land in `string_literal`/`string_content` and comments in `line_comment`, neither
+// of which is tokenized into identifiers, so `m!("call f() here")` and `m!(// f()\n)` yield
+// nothing. Rust keywords are anonymous tokens, so `if (c) { a() }` inside a macro finds
+// `a()` and not `if`. Requiring the argument token_tree to open with `(` is what rejects
+// `else { … }` and `arr[0]`.
+//
+// What this does NOT cover, deliberately: a macro that GENERATES a call from tokens that
+// are not themselves call-shaped (`concat_idents!`, most of `quote!`) is unreachable
+// without expanding the macro, which needs rustc. And a DSL macro whose grammar reuses the
+// call shape for something else — `html! { div(class="x") }` — yields a call named `div`.
+// That costs an edge only if the compartment also defines a symbol with that name, and
+// resolve.js drops it as unresolved otherwise.
+const MACRO_SCAN_MAX_DEPTH = 12;
+
+function rustScanTokenTree(tt, out, ctx, depth = 0) {
+  if (!tt || depth > MACRO_SCAN_MAX_DEPTH) return;
+  for (let i = 0; i < tt.childCount; i++) {
+    const c = tt.child(i);
+    if (c.type === 'token_tree') { rustScanTokenTree(c, out, ctx, depth + 1); continue; }
+    if (c.type !== 'identifier') continue;
+    let j = i + 1;
+    const bang = tt.child(j)?.type === '!';
+    if (bang) j++;
+    const args = tt.child(j);
+    if (!args || args.type !== 'token_tree') continue;
+    if (!bang && !args.text.startsWith('(')) continue;
+    // `::` is an anonymous token, so the qualifier of a `Vec::new()` written INSIDE a macro
+    // is only visible by looking back over the raw child list. Without this the macro scan
+    // would reintroduce exactly the fabrication rustQualify exists to stop.
+    let name = c.text;
+    const prev = tt.child(i - 1);
+    if (prev?.type === '::') {
+      const q = tt.child(i - 2);
+      if (q && (q.type === 'identifier' || q.type === 'type_identifier')) {
+        name = rustQualify(q.text, c.text, ctx, tt.child(i - 3)?.type === '::');
+      }
+    }
+    if (name) out.push({ name, line: c.startPosition.row + 1 });
+  }
+}
+
+// A call_expression yields one name; a macro yields a LIST — the macro's own name plus
+// every call-shaped token sequence in its body — so rustCall returns an array in that
+// case and parseSource's walk accepts either.
+function rustCall(node, ctx) {
+  if (node.type === 'call_expression') return rustCallee(field(node, 'function'), ctx);
+  // The right-hand side of a `macro_rules!` arm is the macro's BODY: calls in it belong to
+  // the macro symbol rustDef now mints. The left-hand side is a `token_tree_pattern`, a
+  // different node type, so metavariable patterns are never scanned.
+  if (node.type === 'macro_rule') {
+    const out = [];
+    rustScanTokenTree(field(node, 'right'), out, ctx);
+    return out.length ? out : null;
+  }
+  if (node.type === 'macro_invocation') {
+    const out = [];
+    // `tokio::select!` is a scoped_identifier; rustCallee reduces it to `select`, and a
+    // macro invoked through a module path is not a type-qualified callee.
+    const m = rustCallee(field(node, 'macro'), ctx);
+    if (m) out.push({ name: m, line: node.startPosition.row + 1 });
+    for (let i = 0; i < node.childCount; i++) {
+      if (node.child(i).type === 'token_tree') rustScanTokenTree(node.child(i), out, ctx);
+    }
+    return out.length ? out : null;
+  }
+  return null;
+}
+
+// Per-file context for rustQualify: every name this file gives us reason to believe is a
+// TYPE. Two sources, both file-local by nature:
+//   * a `use` introduces a name into scope — the last path segment, or the `as` alias.
+//     Both local and external types land here; deciding WHICH is resolve.js's job, and it
+//     has the symbol table to do it with. A glob (`use foo::prelude::*;`) introduces names
+//     we cannot enumerate, which is a known gap.
+//   * a type DEFINED in this file: struct/enum/union/trait, and `type X = …` aliases,
+//     which are not symbols but are still types for qualification purposes.
+// Collected in one pre-pass so the main walk stays a single traversal.
+function rustUseNames(node, out) {
+  if (!node) return;
+  switch (node.type) {
+    case 'identifier': case 'type_identifier': out.add(node.text); break;
+    case 'scoped_identifier': rustUseNames(field(node, 'name'), out); break;
+    case 'use_as_clause': rustUseNames(field(node, 'alias'), out); break;
+    case 'scoped_use_list': rustUseNames(field(node, 'list'), out); break;
+    case 'use_list':
+      for (let i = 0; i < node.namedChildCount; i++) rustUseNames(node.namedChild(i), out);
+      break;
+    default: break; // use_wildcard: a glob names nothing we can enumerate
+  }
+}
+
+function rustFileContext(root) {
+  const knownTypes = new Set();
+  const visit = (n) => {
+    if (n.type === 'use_declaration') rustUseNames(field(n, 'argument'), knownTypes);
+    else if (n.type === 'struct_item' || n.type === 'enum_item' || n.type === 'union_item'
+             || n.type === 'trait_item' || n.type === 'type_item') {
+      const name = field(n, 'name')?.text;
+      if (name) knownTypes.add(name);
+    }
+    for (let i = 0; i < n.namedChildCount; i++) visit(n.namedChild(i));
+  };
+  visit(root);
+  return { knownTypes };
 }
 
 // --- HTTP route detection (for contract inference) --------------------------
@@ -952,7 +1169,11 @@ const RULES = {
   python: { def: pyDef, call: pyCall, sig: pySig },
   java: { def: javaDef, call: javaCall, sig: javaSig },
   kotlin: { def: ktDef, call: ktCall, sig: ktSig },
-  rust: { def: rustDef, call: rustCall, sig: rustSig },
+  // `context` (optional) is built ONCE per file and handed to `call` on every node. Rust
+  // is the only language that needs it: whether `Foo::bar()` is a type-qualified callee
+  // depends on the file's `use` lines and type definitions, which a per-node rule cannot
+  // see. A language without the hook gets `null` and behaves exactly as before.
+  rust: { def: rustDef, call: rustCall, sig: rustSig, context: rustFileContext },
 };
 
 // The ONE place a parsed candidate is re-shaped for a downstream consumer: the build
@@ -1012,6 +1233,7 @@ export function parseSource(source, lang, variant) {
   // already parsed exactly once — the alternative, a regex strip at scan time, cannot
   // tell a `//` inside a string from a comment.
   const comments = [];
+  const ctx = rules.context ? rules.context(tree.rootNode) : null;
 
   function walk(node, enclosingIdx) {
     let currentIdx = enclosingIdx;
@@ -1042,9 +1264,16 @@ export function parseSource(source, lang, variant) {
       currentIdx = idx;
     }
 
-    const callName = rules.call(node);
-    if (callName) {
-      calls.push({ enclosing: currentIdx, name: callName, line: node.startPosition.row + 1 });
+    // A call rule returns either one NAME (every language's ordinary call node) or a LIST
+    // of {name, line} (Rust's macros, where one macro_invocation node holds the macro's
+    // own name plus every call-shaped token sequence in its body, each on its own line).
+    const called = rules.call(node, ctx);
+    if (typeof called === 'string') {
+      calls.push({ enclosing: currentIdx, name: called, line: node.startPosition.row + 1 });
+    } else if (Array.isArray(called)) {
+      for (const c of called) {
+        if (c?.name) calls.push({ enclosing: currentIdx, name: c.name, line: c.line });
+      }
     }
 
     if (rules.sig) {

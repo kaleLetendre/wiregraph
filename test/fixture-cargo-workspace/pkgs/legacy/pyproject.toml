@@ -1,0 +1,4 @@
+# Linter config only — but setup.py beside it is what declares the distribution, which is
+# how a pre-PEP-621 package looks.
+[tool.black]
+line-length = 100

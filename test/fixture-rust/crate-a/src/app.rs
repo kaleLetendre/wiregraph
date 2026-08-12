@@ -29,3 +29,24 @@ pub fn run(n: i32) -> i32 {
     let s = Service::new();
     s.handle(n) + helper(n) + sock_path().len() as i32
 }
+
+// --- macros -----------------------------------------------------------------
+// tree-sitter-rust parses macro ARGUMENTS as an unstructured `token_tree`, never as
+// expressions, so before parse.js scanned that token stream every call written inside a
+// macro was invisible: `println!("{}", helper(n))` produced no edge at all, and a
+// `macro_rules!` definition produced no symbol, which left find_symbol and trace_callers
+// on a macro returning nothing. `host/` in the flagship is to be built out of
+// `tokio::select!`, whose whole body is macro arguments.
+#[macro_export]
+macro_rules! twice_run {
+    ($n:expr) => {
+        helper($n) + helper($n)
+    };
+}
+
+// Calls in a macro's BODY belong to the macro symbol; calls in an INVOCATION's arguments
+// belong to the function that wrote them, and the invocation itself is a call to the macro.
+pub fn shout(n: i32) -> i32 {
+    println!("{} {}", sock_path(), helper(n));
+    twice_run!(n)
+}

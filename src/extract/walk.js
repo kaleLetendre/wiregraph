@@ -6,7 +6,7 @@ import { readdirSync, statSync, existsSync, readFileSync, realpathSync } from 'n
 import { join, relative, basename, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { IGNORE_DIRS, langForFile } from './lang.js';
-import { validateDeclaration } from './compartment-decl.js';
+import { validateDeclaration, INFERRED_PATH_SEP, INFERRED_UNIQ_SEP } from './compartment-decl.js';
 
 // A COMPARTMENT is the unit code communicates ACROSS without a call edge (over
 // HTTP, a queue, shared state, an import) — what a contract connects. A git repo
@@ -14,7 +14,121 @@ import { validateDeclaration } from './compartment-decl.js';
 // of packages/services). So we detect a boundary from `.git` OR a module manifest,
 // and attribute each file to its NEAREST such ancestor. This is why contracts fire
 // inside a monorepo, not only across separately-cloned repos.
-const MODULE_MANIFESTS = new Set(['go.mod', 'Cargo.toml', 'pyproject.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts']);
+//
+// A MANIFEST FILE IS NOT PROOF OF A MODULE, and this table is where each manifest says
+// what would prove it. `package.json` carried that rule alone, as a bespoke branch in
+// isCompartmentBoundary ("a bare config/tooling package.json must not fragment the tree"),
+// while every other manifest was a bare name in a Set — so the identical failure for every
+// OTHER ecosystem's config-only or workspace-only manifest was not so much overlooked as
+// inexpressible. The one that bites hardest is Cargo's VIRTUAL MANIFEST: `server/Cargo.toml`
+// holding `[workspace] members = [...]` and no `[package]` is the ordinary spelling of a
+// Rust monorepo, and it minted a phantom `server` compartment that owns whatever stray
+// source sits beside it. So the Set became a Map from manifest name to its rule, and a
+// manifest cannot be added without one.
+//
+// EVERY RULE FAILS OPEN — an unreadable or unparseable manifest still declares a boundary —
+// with `package.json` the single documented exception. The asymmetry is deliberate in both
+// directions. Failing open is right for the rest because dropping a boundary MOVES EVERY ID
+// under it (the compartment name is baked into each one), so a manifest we merely could not
+// read must never silently re-partition a graph; the rules therefore key on POSITIVE
+// evidence of NON-modulehood (Cargo's own "virtual manifest", a pyproject that is nothing
+// but tool config), never on the absence of evidence. `package.json` keeps failing closed
+// because that is what it does today and changing it would move ids for no defect.
+//
+// A predicate takes `(dir, entries)` — the same readdir the walk already has — and reads
+// whatever it needs. Several manifests have NO virtual form and say so explicitly rather
+// than by omission: a `go.mod` always declares exactly one module (Go's workspace file is
+// `go.work`, which is deliberately NOT in this table); a `pom.xml` always carries the
+// artifactId that names a Maven module, aggregator poms included; a Gradle build script IS
+// the subproject declaration (Gradle's workspace file is `settings.gradle`, also not here).
+const MODULE_MANIFESTS = new Map([
+  ['go.mod', () => true],
+  ['pom.xml', () => true],
+  ['build.gradle', () => true],
+  ['build.gradle.kts', () => true],
+  ['Cargo.toml', declaresCargoPackage],
+  ['pyproject.toml', declaresPythonDistribution],
+  ['package.json', declaresNpmPackage],
+]);
+
+function readManifest(dir, name) {
+  try { return readFileSync(join(dir, name), 'utf8'); } catch { return null; }
+}
+
+// The top-level TOML table headers a file declares: `[package]` -> 'package',
+// `[tool.poetry]` -> 'tool.poetry'. Deliberately a LINE SCAN, not a TOML parser: node ships
+// no TOML parser, the only question asked here is "is this table header present", and a
+// header can only appear at the start of a line. A comment line cannot match (the `[` must
+// be the first non-blank character) and neither can an array-of-tables (`[[bin]]`), which
+// is never the evidence any rule below looks for. The one possible false positive is a
+// header spelled inside a multi-line string — and that can only ADD a boundary, never
+// remove one, which is the safe direction for a rule that moves ids.
+function tomlTables(text) {
+  const out = [];
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^[ \t]*\[[ \t]*([^[\]]+?)[ \t]*\][ \t]*(?:#.*)?$/.exec(line);
+    if (m) out.push(m[1]);
+  }
+  return out;
+}
+
+const tableIn = (tables, name) => tables.some((t) => t === name || t.startsWith(name + '.'));
+
+// Cargo: a manifest with a `[workspace]` table and NO `[package]` table is a VIRTUAL
+// MANIFEST — Cargo's own term for "this directory is not a crate, it only lists members".
+// `cargo build` here builds the members; there is no crate to name, no lib and no bin. A
+// workspace ROOT that is also a package (both tables present) is a crate and stays a
+// boundary. Anything else — including an empty or malformed file — fails open.
+function declaresCargoPackage(dir) {
+  const text = readManifest(dir, 'Cargo.toml');
+  if (text === null) return true;
+  const tables = tomlTables(text);
+  if (tableIn(tables, 'package')) return true;
+  return !tableIn(tables, 'workspace');
+}
+
+// The build backends that configure themselves under `[tool.X]` rather than `[project]`.
+// A pyproject naming one of these IS a distribution even if it declares nothing else
+// (poetry 1.x put the whole package definition in `[tool.poetry]`).
+const PY_BUILD_BACKENDS = new Set([
+  'poetry', 'setuptools', 'distutils', 'hatch', 'pdm', 'flit', 'maturin', 'mesonpy',
+  'scikit-build-core', 'py-build-cmake', 'whey', 'pbr', 'robotpy',
+]);
+
+// pyproject.toml: the direct analogue of the bare `package.json`. A file holding nothing
+// but `[tool.ruff]` / `[tool.black]` / `[tool.mypy]` / `[tool.pytest.ini_options]` is TOOL
+// CONFIG, not a distribution — a shape that is everywhere, including in directories that
+// hold no Python package at all. Anything that is not a `[tool.*]` table (`[project]`,
+// `[build-system]`, `[dependency-groups]`, …) declares a distribution; so does a `[tool.X]`
+// naming a build backend; and so does a sibling `setup.py`/`setup.cfg`, which is how a
+// pre-PEP-621 package is defined while its pyproject holds only linter config. No tables at
+// all — empty, or key-value only — fails open.
+function declaresPythonDistribution(dir, entries) {
+  if (entries.some((e) => e.isFile() && (e.name === 'setup.py' || e.name === 'setup.cfg'))) return true;
+  const text = readManifest(dir, 'pyproject.toml');
+  if (text === null) return true;
+  const tables = tomlTables(text);
+  if (!tables.length) return true;
+  for (const t of tables) {
+    const [head, second] = t.split('.');
+    if (head !== 'tool') return true;
+    if (PY_BUILD_BACKENDS.has(second)) return true;
+  }
+  return false;
+}
+
+// package.json counts only when it actually names a module or declares a workspace — a
+// bare config/tooling package.json must not fragment the tree. THE ONE RULE THAT FAILS
+// CLOSED: unreadable or not JSON ⇒ not a boundary. Unchanged from the bespoke branch this
+// replaces, on purpose — it is the pre-existing behaviour and moving it would move ids.
+function declaresNpmPackage(dir) {
+  const text = readManifest(dir, 'package.json');
+  if (text === null) return false;
+  try {
+    const pkg = JSON.parse(text);
+    return !!(pkg && (pkg.name || pkg.workspaces));
+  } catch { return false; }
+}
 
 // A LINKED WORKTREE (`git worktree add`) is an alternate checkout of a repo we may
 // ALREADY be indexing. We skip one nested under the scan root for two reasons: (a) it
@@ -56,20 +170,17 @@ function isLinkedWorktree(dir) {
   return gitDir !== commonDir;
 }
 
+// NO PER-MANIFEST SPECIAL CASES LIVE HERE ANY MORE. Every rule is in MODULE_MANIFESTS
+// above, so a manifest with no rule cannot be expressed and the next ecosystem's virtual /
+// config-only manifest has to answer the question rather than inherit "any file with this
+// name fragments the tree".
 function isCompartmentBoundary(dir, entries) {
   // A git repo is always a boundary.
   if (entries.some((e) => e.name === '.git')) return true;
   for (const e of entries) {
     if (!e.isFile()) continue;
-    if (MODULE_MANIFESTS.has(e.name)) return true;
-    // package.json counts only when it actually names a module or declares a
-    // workspace — a bare config/tooling package.json must not fragment the tree.
-    if (e.name === 'package.json') {
-      try {
-        const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
-        if (pkg && (pkg.name || pkg.workspaces)) return true;
-      } catch { /* unreadable/!JSON — not a boundary */ }
-    }
+    const declaresModule = MODULE_MANIFESTS.get(e.name);
+    if (declaresModule && declaresModule(dir, entries)) return true;
   }
   return false;
 }
@@ -262,6 +373,12 @@ function warnNameCollision(rootDir, groups) {
   }
   lines.push('  A compartment id is its NAME ALONE, so same-named compartments collapse into ONE row: one root wins, every file of the other resolves under it, and get_source reads the wrong path (or ENOENT). The names above are the compartment names now IN THE GRAPH.');
   lines.push('  Consequence to act on: any hand-written contract spec naming the bare basename in x-wiregraph-producers / x-wiregraph-consumers (or a resource writers:/readers: list) no longer matches and its seam goes dark. Update those specs to the names above, or declare compartments explicitly (/wiregraph-init, recursive mode) to choose your own.');
+  // THE NAMES ABOVE ARE NOT DECLARABLE, and saying so here is the point. They carry '/'
+  // (or '#'), which is exactly what marks them as machine-minted — and which
+  // validateDeclaration therefore rejects. Without this line the two halves of the advice
+  // contradict each other: an author who followed both, by copying a printed name into a
+  // declaration, got "name ... contains ':', '/'" and no hint of a legal spelling.
+  lines.push(`  If you declare your own, note that a DECLARED name may not contain '${INFERRED_PATH_SEP}' or '${INFERRED_UNIQ_SEP}' — those spell an auto-disambiguated name and nothing else — so pick a plain distinct name per side (e.g. server_network / client_network) rather than copying the names above verbatim.`);
   try { process.stderr.write(lines.join('\n') + '\n'); } catch { /* a warning must never fail a build */ }
 }
 
@@ -278,10 +395,15 @@ function disambiguateInferredNames(rootDir, roots) {
   const renamed = new Map(); // dir -> final name
   for (const r of sorted) {
     if (byName.get(r.name).length === 1) { renamed.set(r.dir, r.name); continue; }
+    // BOTH SEPARATORS COME FROM compartment-decl.js, which is also what NAME_BAD_CHARS is
+    // built from — so the characters this mints and the characters a DECLARED name may not
+    // contain cannot drift apart. Adding a third marker here means adding it there, which
+    // is what keeps the machine-minted namespace disjoint from the declarable one (and
+    // keeps src/store/sqlite-query.js#disambiguatedCompartments able to tell them apart).
     const rel = relative(rootDir, r.dir);
-    const base = rel ? rel.split(sep).join('/') : r.name; // the root itself keeps its basename
+    const base = rel ? rel.split(sep).join(INFERRED_PATH_SEP) : r.name; // the root itself keeps its basename
     let name = base;
-    for (let i = 2; used.has(name); i++) name = `${base}#${i}`;
+    for (let i = 2; used.has(name); i++) name = `${base}${INFERRED_UNIQ_SEP}${i}`;
     used.add(name);
     renamed.set(r.dir, name);
   }
@@ -385,4 +507,4 @@ export function* walkSources(roots) {
   for (const rootDir of list) yield* walkOneRoot(rootDir, seen);
 }
 
-export { findCompartmentRoots, compartmentNameFor, findGitRepos, isLinkedWorktree, readDeclaration, declaredCompartmentRoots, resolveDeclaration };
+export { findCompartmentRoots, compartmentNameFor, findGitRepos, isLinkedWorktree, readDeclaration, declaredCompartmentRoots, resolveDeclaration, isCompartmentBoundary, MODULE_MANIFESTS };

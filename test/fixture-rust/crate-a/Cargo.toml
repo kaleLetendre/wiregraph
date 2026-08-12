@@ -1,5 +1,8 @@
-# A Cargo.toml is already a MODULE_MANIFEST (extract/walk.js), so this directory has
-# always been a compartment BOUNDARY — but a compartment only reaches the db as a side
+# A Cargo.toml declaring `[package]` is a MODULE_MANIFEST (extract/walk.js), so this
+# directory has always been a compartment BOUNDARY. (Cargo.toml is no longer in that map
+# unconditionally: a `[workspace]`-only manifest declares no module and is not a
+# boundary — the `[package]` table below is what makes this one.) But a compartment only
+# reaches the db as a side
 # effect of walking a PARSEABLE source file, so before `.rs` was indexable this produced
 # no compartment row, no file row and no symbol. That is what the crate-a/crate-b pair
 # pins.

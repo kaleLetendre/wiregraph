@@ -1,0 +1,9 @@
+# A workspace root that is ALSO a crate. Both tables present, so the [package] wins and
+# this stays a boundary.
+[package]
+name = "harness"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+members = []

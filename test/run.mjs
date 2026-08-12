@@ -2141,7 +2141,10 @@ async function potentialTest() {
   await runBuild({ target: project, project, db: join(project, '.wiregraph', 'graph.db'), reset: true });
   const st = S.readState(project);
   eq(st && st.inferredSeams, 1, 'potential: full build persists the cross-repo seam count');
-  ok(st && !st.contractsDir, 'potential: no contracts dir → nudge gate (seams>0 && !contractsDir) would fire');
+  // The gate is uncoveredSeams(state) (scripts/lib/state.mjs): seams that no RECORDED
+  // contracts dir holds a written spec for. With no contracts dir at all, every seam is
+  // uncovered and the nudge fires.
+  ok(st && !st.contractsDir, 'potential: no contracts dir → uncoveredSeams(state) is the seam count and the nudge fires');
   rmSync(work, { recursive: true, force: true });
 }
 
@@ -2917,8 +2920,14 @@ async function walkSourcesTests() {
 //   (a) a bare/config package.json (no `name`, no `workspaces`) is NOT a boundary — and
 //       the test is TRUTHINESS, not key presence: {"name":""} and {"workspaces":null}
 //       are not boundaries, while {"workspaces":[]} is (walk.js:69);
-//   (b) EVERY entry of MODULE_MANIFESTS is a boundary — no fixture exercised any of
-//       go.mod / Cargo.toml / pyproject.toml / pom.xml / build.gradle[.kts];
+//   (b) a MODULE_MANIFESTS entry is a boundary when its own rule says the file DECLARES a
+//       module — no fixture exercised any of go.mod / Cargo.toml / pyproject.toml /
+//       pom.xml / build.gradle[.kts]. MODULE_MANIFESTS is a Map from manifest name to that
+//       rule (walk.js), not a bare list: go.mod/pom.xml/build.gradle[.kts] answer `true`
+//       unconditionally, while Cargo.toml, pyproject.toml and package.json each inspect
+//       their contents, so a VIRTUAL manifest — a `[workspace]`-only Cargo.toml, a
+//       tool-config-only pyproject.toml, a bare/config package.json — is NOT a boundary.
+//       The rule fails OPEN: a manifest it cannot read or parse still fragments the tree;
 //   (c) a manifest must be a FILE (walk.js:62) — a DIRECTORY named `pyproject.toml` is
 //       not one. `.git` is deliberately matched WITHOUT that guard (walk.js:60), because
 //       a normal repo's .git is a dir and a worktree's is a file and both are boundaries.
@@ -9102,18 +9111,41 @@ async function traceShadowedSiblingTest() {
 // `contractsDir` is single-valued and first-match-wins. A recursive project whose
 // contracts live ONLY in nested dirs has a null singular, so a gate reading it alone nags
 // forever. The plural closes that without going silent on a project that has none.
+//
+// REPOINTED, because this test had become a FALSE GREEN. It used to assert a local
+// re-implementation of the gate EXPRESSION — a lambda checked against itself, which no
+// production change could ever break — plus `has(src, '!(state.contractsDirs?.length)')`
+// against session-start.mjs. That gate has since been replaced by `uncoveredSeams`
+// (scripts/lib/state.mjs), and the substring assertion kept passing only because the
+// replacement's COMMENT quotes the old expression verbatim. Its subject was a comment: it
+// would have stayed green if the gate had been deleted outright.
+//
+// It now calls the real gate, on real directories. The PLURAL-ONLY shape — null singular,
+// populated plural — is this test's distinctive subject and the one thing the standalone
+// test/compartments.mjs uncoveredSeams block does not cover (it always passes a non-null
+// singular, or the legacy singular alone). Mutation-checked: making recordedContractsDirs
+// ignore `state.contractsDirs` turns the third assertion red.
 async function nudgeGatePluralTest() {
-  const gate = (state) => (state.inferredSeams || 0) > 0 && !state.contractsDir && !(state.contractsDirs?.length);
-  ok(gate({ inferredSeams: 3, contractsDir: null, contractsDirs: null }),
+  const { uncoveredSeams } = await import('../scripts/lib/state.mjs');
+  const work = mkdtempSync(join(tmpdir(), 'cg-rnudge-'));
+  const nested = [join(work, 'server', 'contracts'), join(work, 'client', 'contracts')];
+  for (const d of nested) mkdirSync(d, { recursive: true });
+
+  eq(uncoveredSeams({ inferredSeams: 3, contractsDir: null, contractsDirs: null }), 3,
     'rnudge: seams and NO contracts dir at all still fires (the legacy case, and the resource-only project Phase 1b fixed)');
-  ok(!gate({ inferredSeams: 3, contractsDir: '/p/contracts', contractsDirs: ['/p/contracts'] }),
-    'rnudge: a global project with a contracts dir stays silent');
-  ok(!gate({ inferredSeams: 3, contractsDir: null, contractsDirs: ['/p/server/contracts', '/p/client/contracts'] }),
-    'rnudge: a recursive project with ONLY nested dirs is silent — the plural is what stops the forever-nag');
-  ok(!gate({ inferredSeams: 0, contractsDir: null, contractsDirs: null }),
+  eq(uncoveredSeams({ inferredSeams: 3, contractsDir: null, contractsDirs: nested }), 3,
+    'rnudge: …and nested dirs that EXIST but hold no spec are not coverage either — a directory is not a contract');
+  writeFileSync(join(nested[1], 'tick.asyncapi.yaml'),
+    'asyncapi: 3.0.0\ninfo: { title: Nudge Plural, version: 1.0.0 }\nchannels:\n  tick: { address: events/tick }\n');
+  eq(uncoveredSeams({ inferredSeams: 3, contractsDir: null, contractsDirs: nested }), 0,
+    'rnudge: a recursive project whose contracts live ONLY in nested dirs goes silent once one is WRITTEN — the null singular is what made the old gate nag forever, so the plural must still be read');
+  eq(uncoveredSeams({ inferredSeams: 0, contractsDir: null, contractsDirs: nested }), 0,
     'rnudge: no seams, no nudge');
+  // The hook must actually call it. A substring assertion again — but on the CALL SITE, a
+  // line of code, not on an expression that survives only inside a comment.
   const src = readFileSync(join(HERE, '..', 'scripts', 'hooks', 'session-start.mjs'), 'utf8');
-  has(src, '!(state.contractsDirs?.length)', 'rnudge: …and the hook really uses that gate');
+  has(src, 'const seams = uncoveredSeams(state);', 'rnudge: …and the hook really uses that gate');
+  rmSync(work, { recursive: true, force: true });
 }
 
 // === WAVE 3 TESTS START ===
@@ -11740,10 +11772,18 @@ const FLAGSHIP_L3_SPEC = 'asyncapi: 3.0.0\ninfo: { title: Flagship Queries Stora
 // The flagship's ELEVEN whoami compartments as a declaration.
 //
 // THE BARE NAME `network` HAS TO GO TO EXACTLY ONE OF THEM. A declared name may not
-// contain '/' (compartment-decl.js NAME_BAD_CHARS — ids and fingerprints join on it), so
-// unlike the inferred partition a declaration cannot spell `server/network`; it must
-// invent a name for one side and may leave the bare basename on the other. `swap` flips
-// which side gets it, and the tests below assert the seams follow the declaration.
+// contain '/' (compartment-decl.js NAME_BAD_CHARS), so unlike the inferred partition a
+// declaration cannot spell `server/network`; it must invent a name for one side and may
+// leave the bare basename on the other. `swap` flips which side gets it, and the tests
+// below assert the seams follow the declaration.
+//
+// The reason '/' is reserved is NOT that ids or fingerprints would collide — ids join on
+// ':', and partitionValue (scripts/lib/state.mjs) JSON-encodes every component before
+// hashing, so a '/' in a name forges nothing. '/' and '#' are a reserved NAMESPACE MARKER
+// for machine-minted names: disambiguatedCompartments (src/store/sqlite-query.js) recovers
+// "this compartment was auto-renamed after a basename collision" from the graph alone, by
+// testing a name for exactly those two characters. A declared name containing one would be
+// indistinguishable from a name wiregraph minted itself.
 const flagshipDecl = (swap = false) => [
   { path: 'server', name: 'server' },
   { path: 'server/ecs', name: 'ecs' },
@@ -12029,8 +12069,11 @@ async function flagshipDeclaredCollisionTest() {
     'flagdecl(swap): …and the resource seam follows the declaration too — its writer is now out of scope, so it goes dark');
 
   // THE SPELLING RULE, asserted directly: a declaration CANNOT use the inferred partition's
-  // path-derived name, because '/' is an id separator. So the answer to "what does a spec
-  // author write" is mode-dependent, and this is the half that constrains it.
+  // path-derived name, because '/' (like '#') is reserved as the marker that identifies a
+  // name wiregraph MINTED for a basename collision — see disambiguatedCompartments in
+  // src/store/sqlite-query.js, which reads that fact back out of the graph alone. It is not
+  // an id separator (ids join on ':'). So the answer to "what does a spec author write" is
+  // mode-dependent, and this is the half that constrains it.
   const { validateDeclaration } = await import('../src/extract/compartment-decl.js');
   const bad = validateDeclaration(a.root, [{ path: 'server/network', name: 'server/network' }]);
   eq(bad.ok, false, 'flagdecl: a DECLARED name may not be the path-derived `server/network` — the inferred spelling is not portable to a declaration');
@@ -13298,17 +13341,354 @@ await inprocSpecLifecycleTest();
 await inprocCompartmentRenameTest();
 await inprocQuerySqlSchemaTest();
 
-// --- REVIEW (test/review.mjs, run as a child) ---
-// review.mjs is standalone: it owns its own counters and exits on its own. We fold its
-// totals into ours rather than just checking its exit code, so the number this file prints
-// stays the whole suite's number and can still be checked by arithmetic. Parsing its
-// summary is deliberate — a child that fails to print one contributes a hard failure here
-// instead of silently contributing zero.
+// ============================================================================
+// === RUST DEFECT ROUND: type-qualified callees, bodiless `mod`, macros ======
+// ============================================================================
+// Three reproduced defects in the Rust rules, each with its own block below.
+//
+// 1. `Type::new()` collided with every local `new()`. The callee was reduced to its last
+//    path segment, so `Vec::new()`, `String::new()`, `HashMap::new()`, `Instant::now()`
+//    and `Default::default()` all aliased onto whatever inherent methods the crate
+//    defined — `new` is a naming CONVENTION in Rust, not a keyword. Measured on a crate
+//    with two inherent `new`s and three `Vec::new()` call sites: 7 CALLS edges, 5 of them
+//    fabricated. The fix carries the TYPE qualifier through to resolve.js, which is the
+//    first place that knows which types the compartment actually defines.
+// 2. `mod foo;` — a bodiless FILE REFERENCE — minted a one-line kind:'class' symbol that
+//    a same-named call could resolve to. `mod foo { … }` is a real container and stays.
+// 3. Calls inside macro invocations were invisible: tree-sitter-rust parses macro
+//    arguments as a `token_tree`, never as expressions.
+//
+// Every lookup is `?.`-guarded so a rule that stopped firing prints a FAIL instead of
+// throwing and aborting the suite.
 await (async () => {
+  const { parseSource } = await import('../src/extract/parse.js');
+  const { resolveCalls } = await import('../src/extract/resolve.js');
+
+  const namesOf = (s, lang = 'rust', variant = 'rust') => {
+    try { return (parseSource(s, lang, variant)?.calls || []).map((c) => c?.name); }
+    catch (e) { return [`<error ${e.message}>`]; }
+  };
+  const callsOf = (s) => {
+    try { return parseSource(s, 'rust', 'rust')?.calls || []; }
+    catch { return []; }
+  };
+  const symsOf = (s) => {
+    try { return (parseSource(s, 'rust', 'rust')?.symbols || []); }
+    catch (e) { return [{ name: `<error ${e.message}>`, kind: 'error' }]; }
+  };
+  const shows = (a) => a.join(', ') || 'none';
+
+  // --- 1a. the qualifier survives the parser, for every shape that evidences a TYPE ---
+  // parse.js cannot decide LOCALITY — it sees one file and the type is usually in
+  // another — so it only decides "was this callee reached through a type?". The evidence
+  // is a prelude/primitive name, a `use` in this file, a definition in this file, a
+  // multi-segment path, or a single-capital generic parameter.
+  const q1 = namesOf('fn f() { let v = Vec::new(); }');
+  ok(q1.includes('Vec::new') && !q1.includes('new'),
+    `rust(qual): a PRELUDE type keeps its qualifier — Vec::new() is not a call to any local new (got ${shows(q1)})`);
+  const q2 = namesOf('use std::collections::HashMap;\nfn f() { let h = HashMap::new(); }');
+  ok(q2.includes('HashMap::new') && !q2.includes('new'),
+    `rust(qual): a type introduced by a \`use\` in this file keeps its qualifier (got ${shows(q2)})`);
+  const q3 = namesOf('use std::time::Instant as Clock;\nfn f() { let t = Clock::now(); }');
+  ok(q3.includes('Clock::now') && !q3.includes('now'),
+    `rust(qual): …including through an \`as\` alias, which is the name actually written (got ${shows(q3)})`);
+  const q4 = namesOf('use tokio::sync::{mpsc, Semaphore};\nfn f() { let s = Semaphore::new(1); }');
+  ok(q4.includes('Semaphore::new') && !q4.includes('new'),
+    `rust(qual): …and through a braced use-list (got ${shows(q4)})`);
+  const q5 = namesOf('fn f() { let t = std::time::Instant::now(); }');
+  ok(q5.includes('Instant::now') && !q5.includes('now'),
+    `rust(qual): a MULTI-SEGMENT path is evidence on its own — no \`use\` needed (got ${shows(q5)})`);
+  const q6 = namesOf('pub struct Svc;\nimpl Svc { pub fn make() -> Svc { Svc } }\nfn f() { let s = Svc::make(); }');
+  ok(q6.includes('Svc::make') && !q6.includes('make'),
+    `rust(qual): a type DEFINED in this file keeps its qualifier too (got ${shows(q6)})`);
+  const q7 = namesOf('type Handle = u32;\nfn f() { let h = Handle::from(1u8); }');
+  ok(q7.includes('Handle::from'),
+    `rust(qual): a \`type X = …\` alias counts as a type name even though it is not a symbol (got ${shows(q7)})`);
+  const q8 = namesOf('fn f<T: Default>() -> T { T::default() }');
+  ok(q8.includes('T::default') && !q8.includes('default'),
+    `rust(qual): a single-capital GENERIC PARAMETER is a type that can never be resolved (got ${shows(q8)})`);
+  const q9 = namesOf('fn f() { let n = u32::from(1u8); let m = f64::max(1.0, 2.0); }');
+  ok(q9.includes('u32::from') && q9.includes('f64::max') && !q9.includes('from'),
+    `rust(qual): PRIMITIVE types are lowercase but still types — u32::from is not a call to a local from (got ${shows(q9)})`);
+  const q10 = namesOf('fn f() { let v = Vec::<u8>::new(); }');
+  ok(q10.includes('Vec::new') && !q10.includes('new'),
+    `rust(qual): a turbofished type path (Vec::<u8>::new) resolves through its generic_type (got ${shows(q10)})`);
+  const q11 = namesOf('pub enum Shape { C(f32) }\nfn f() { let s = Shape::C(1.0); }');
+  ok(q11.includes('Shape::C') && !q11.includes('C'),
+    `rust(qual): a tuple-variant constructor is qualified by its enum, not a bare call to \`C\` (got ${shows(q11)})`);
+
+  // --- 1b. what the qualifier rule must NOT touch -----------------------------
+  // Each of these is a real edge today. Dropping any of them would trade false positives
+  // for false negatives, which is the worse bargain for a call graph.
+  const u1 = namesOf('fn f() { let t = svc::inner::make(); }');
+  ok(u1.includes('make') && !u1.some((n) => n?.includes('::')),
+    `rust(qual/keep): a snake_case path is a MODULE namespace, not a type — cross-module calls are the common case in a crate and stay unqualified (got ${shows(u1)})`);
+  const u2 = namesOf('impl S { fn f(&self) -> i32 { Self::helper() } }');
+  ok(u2.includes('helper') && !u2.includes('Self::helper'),
+    `rust(qual/keep): \`Self::\` names the impl this call physically sits in — the same-file preference already resolves it (got ${shows(u2)})`);
+  const u3 = namesOf('fn run() { let s = Service::new(); }');
+  ok(u3.includes('new') && !u3.includes('Service::new'),
+    `rust(qual/keep): a capitalized single-segment path with NO evidence in the file falls back to bare-name resolution — the conservative default, and what keeps the pre-existing rust(call) assertion above honest (got ${shows(u3)})`);
+  // `gen` is a reserved word in this grammar, so the turbofish case uses `generic`.
+  const u4 = namesOf('fn f(x: S) { x.go(); bare(); generic::<i32>(1); }');
+  ok(u4.includes('go') && u4.includes('bare') && u4.includes('generic'),
+    `rust(qual/keep): identifier, field_expression and generic_function callees are untouched (got ${shows(u4)})`);
+  const u5 = namesOf('fn f() { (g)(); h[0](); }');
+  ok(!u5.some((n) => n === 'g' || n === 'h'),
+    `rust(qual/keep): a parenthesized or indexed callee still yields no name (got ${shows(u5)})`);
+
+  // --- 1c. STRUCTURAL guard on the separator resolve.js splits on -------------
+  // resolve.js recovers the qualifier with a plain lastIndexOf('::'), which is only safe
+  // because no other grammar here admits `::` in a callee name. A comment saying so is not
+  // a check; this is. If a future language rule starts emitting one, this fails.
+  const otherLangs = [
+    ['typescript', 'typescript', 'const o = { a: { b() {} } }; function f() { o.a.b(); ns.Type.make(); new Foo(); }'],
+    ['typescript', 'tsx', 'function f() { return <div onClick={() => svc.go()} />; }'],
+    ['c', 'c', 'int f(void) { return g() + s->h() + T_new(); }'],
+    ['python', 'python', 'def f():\n    a.b.c()\n    Type.make()\n    bare()\n'],
+    ['java', 'java', 'class A { void f() { B.make(); this.g(); java.util.List.of(); } }'],
+    ['kotlin', 'kotlin', 'fun f() { B.make(); g(); a.b.c() }'],
+  ];
+  for (const [lang, variant, src] of otherLangs) {
+    const ns = namesOf(src, lang, variant);
+    ok(!ns.some((n) => String(n).includes('::')),
+      `rust(qual/sep): ${variant} emits no callee name containing '::', so resolve.js's split can only ever fire on Rust (got ${shows(ns)})`);
+  }
+  const rustSep = namesOf('fn f() { let v = Vec::new(); }');
+  eq(rustSep.filter((n) => n === 'Vec::new').length, 1,
+    'rust(qual/sep): …and a Rust qualified name carries EXACTLY one separator, which is what makes lastIndexOf lossless');
+
+  // --- 1d. resolve.js: the qualifier decides against the real symbol table -----
+  // A direct unit test, so the two branches (qualifier found / not found) are pinned
+  // independently of any fixture layout.
+  const mkGraph = (syms) => {
+    const g = new Graph('proj');
+    for (const s of syms) g.addSymbol({ lang: 'rust', startLine: 1, endLine: 2, ...s });
+    return g;
+  };
+  const defs = [
+    { id: 'W', compartment: 'c', file: 'world.rs', name: 'World', kind: 'class' },
+    { id: 'Wn', compartment: 'c', file: 'world.rs', name: 'new', kind: 'method' },
+    { id: 'S', compartment: 'c', file: 'sched.rs', name: 'Scheduler', kind: 'class' },
+    { id: 'Sn', compartment: 'c', file: 'sched.rs', name: 'new', kind: 'method' },
+    { id: 'caller', compartment: 'c', file: 'store.rs', name: 'empty', kind: 'method' },
+  ];
+  const resolveOne = (name, extraDefs = null) => {
+    const g = mkGraph(extraDefs ? defs.filter((d) => d.id === 'caller') : defs);
+    const r = resolveCalls(g, [{ fromId: 'caller', compartment: 'c', relPath: 'store.rs', name, line: 9 }],
+      () => {}, extraDefs ? defs.filter((d) => d.id !== 'caller') : null);
+    return { targets: g.edges.filter((e) => e.type === 'CALLS').map((e) => e.to).sort(), stats: r };
+  };
+  const rq = resolveOne('World::new');
+  eq(JSON.stringify(rq.targets), JSON.stringify(['Wn']),
+    `rust(resolve/qual): a LOCAL type narrows to the file that defines it — World::new() reaches World's new and not Scheduler's (got ${JSON.stringify(rq.targets)})`);
+  const rb = resolveOne('new');
+  eq(JSON.stringify(rb.targets), JSON.stringify(['Sn', 'Wn']),
+    `rust(resolve/qual): …which is a real narrowing: the SAME call unqualified still fans out to both (got ${JSON.stringify(rb.targets)})`);
+  const rx = resolveOne('Vec::new');
+  eq(JSON.stringify(rx.targets), JSON.stringify([]),
+    `rust(resolve/qual): a qualifier this compartment defines no type for is EXTERNAL — the call leaves the compartment and mints nothing (got ${JSON.stringify(rx.targets)})`);
+  eq(rx.stats?.unresolved, 1,
+    'rust(resolve/qual): …and is counted as unresolved rather than silently dropped, so the tally stays honest');
+  eq(rx.stats?.resolved, 0,
+    'rust(resolve/qual): …with no fallback to bare-name matching, which IS the fabrication');
+  const rk = resolveOne('World::missing');
+  eq(JSON.stringify(rk.targets), JSON.stringify([]),
+    `rust(resolve/qual): a local type with no such member resolves to nothing (got ${JSON.stringify(rk.targets)})`);
+  // The FALSE-NEGATIVE guard the fix is priced on: a type whose inherent impl lives in a
+  // different file from its declaration is legal Rust and invisible to any file-local
+  // signal. Narrowing must fall back to the compartment rather than drop the call.
+  const splitDefs = [
+    { id: 'W', compartment: 'c', file: 'world.rs', name: 'World', kind: 'class' },
+    { id: 'Wn', compartment: 'c', file: 'world_impl.rs', name: 'new', kind: 'method' },
+    { id: 'caller', compartment: 'c', file: 'store.rs', name: 'empty', kind: 'method' },
+  ];
+  const gsplit = mkGraph(splitDefs);
+  resolveCalls(gsplit, [{ fromId: 'caller', compartment: 'c', relPath: 'store.rs', name: 'World::new', line: 1 }], () => {});
+  eq(JSON.stringify(gsplit.edges.filter((e) => e.type === 'CALLS').map((e) => e.to)), JSON.stringify(['Wn']),
+    'rust(resolve/qual): an impl block in a DIFFERENT file from its struct still resolves — narrowing falls back to the compartment instead of dropping a real edge');
+  // A qualifier that names a FUNCTION rather than a container is not a type namespace.
+  const gfn = mkGraph([
+    { id: 'Wf', compartment: 'c', file: 'world.rs', name: 'World', kind: 'function' },
+    { id: 'Wn', compartment: 'c', file: 'world.rs', name: 'new', kind: 'method' },
+    { id: 'caller', compartment: 'c', file: 'store.rs', name: 'empty', kind: 'method' },
+  ]);
+  resolveCalls(gfn, [{ fromId: 'caller', compartment: 'c', relPath: 'store.rs', name: 'World::new', line: 1 }], () => {});
+  eq(gfn.edges.filter((e) => e.type === 'CALLS').length, 0,
+    'rust(resolve/qual): only a CONTAINER kind can be a type qualifier — a same-named function does not authorize the call');
+  // The incremental path reads the rest of the project's symbols out of the db as
+  // extraDefs; the qualifier has to be looked up there too or a one-file re-index would
+  // silently drop every cross-file Type::method() edge it used to have.
+  const ri = resolveOne('World::new', true);
+  eq(JSON.stringify(ri.targets), JSON.stringify(['Wn']),
+    `rust(resolve/qual): the qualifier resolves against extraDefs as well, so an incremental re-index of one file keeps its cross-file edges (got ${JSON.stringify(ri.targets)})`);
+  // Cross-compartment stays cross-compartment: the qualifier never authorizes a call
+  // across a boundary (that is Phase 2, and deliberately not this).
+  const gxc = mkGraph([
+    { id: 'W', compartment: 'other', file: 'world.rs', name: 'World', kind: 'class' },
+    { id: 'Wn', compartment: 'other', file: 'world.rs', name: 'new', kind: 'method' },
+    { id: 'Cn', compartment: 'c', file: 'cache.rs', name: 'new', kind: 'method' },
+    { id: 'caller', compartment: 'c', file: 'store.rs', name: 'empty', kind: 'method' },
+  ]);
+  resolveCalls(gxc, [{ fromId: 'caller', compartment: 'c', relPath: 'store.rs', name: 'World::new', line: 1 }], () => {});
+  eq(gxc.edges.filter((e) => e.type === 'CALLS').length, 0,
+    "rust(resolve/qual): a qualifier defined in ANOTHER compartment resolves nothing — not the local `new`, and not across the boundary either");
+
+  // --- 2. `mod foo;` is a file reference, not a definition ---------------------
+  const m1 = symsOf('mod svc;\npub mod query;\nmod inline { pub fn q() -> i32 { 1 } }\n');
+  const m1shown = m1.map((s) => `${s?.kind}:${s?.name}`).join(', ') || 'none';
+  ok(!m1.some((s) => s?.name === 'svc'),
+    `rust(mod): a bodiless \`mod svc;\` is a FILE REFERENCE and mints no symbol (got ${m1shown})`);
+  ok(!m1.some((s) => s?.name === 'query'),
+    `rust(mod): …with a visibility modifier too — \`pub mod query;\` is the shape every lib.rs has 5-15 of (got ${m1shown})`);
+  eq(m1.find((s) => s?.name === 'inline')?.kind, 'class',
+    `rust(mod): but an INLINE \`mod inline { … }\` is a real container and stays kind 'class' (got ${m1shown})`);
+  eq(m1.find((s) => s?.name === 'q')?.kind, 'function',
+    `rust(mod): …and a fn in its body is still a free function (got ${m1shown})`);
+  const m2 = symsOf('#[cfg(test)]\nmod tests { fn t() {} }\n');
+  eq(m2.find((s) => s?.name === 'tests')?.kind, 'class',
+    `rust(mod): an attributed inline mod is unaffected — the \`body\` field is the whole test (got ${m2.map((s) => `${s?.kind}:${s?.name}`).join(', ') || 'none'})`);
+  // The reason it matters beyond a symbol count: resolve.js indexes definitions by NAME,
+  // so a phantom `mod config;` was a live resolution target for any call named config().
+  const gmod = mkGraph([
+    { id: 'real', compartment: 'c', file: 'other.rs', name: 'config', kind: 'function' },
+    { id: 'caller', compartment: 'c', file: 'lib.rs', name: 'boot', kind: 'function' },
+  ]);
+  resolveCalls(gmod, [{ fromId: 'caller', compartment: 'c', relPath: 'lib.rs', name: 'config', line: 1 }], () => {});
+  eq(JSON.stringify(gmod.edges.filter((e) => e.type === 'CALLS').map((e) => e.to)), JSON.stringify(['real']),
+    'rust(mod): a call named after a mod now reaches only the real definition — there is no phantom left in the name index to compete with it');
+
+  // --- 3. calls inside macro invocations --------------------------------------
+  const k1 = namesOf('fn f() { println!("{}", leaf()); }');
+  ok(k1.includes('leaf'),
+    `rust(macro): a call in println!'s arguments is a call — token_tree is a token STREAM, not an opaque blob (got ${shows(k1)})`);
+  ok(k1.includes('println'),
+    `rust(macro): …and the invocation itself is a call to the macro (got ${shows(k1)})`);
+  const k2 = namesOf('fn f() { let v = vec![aa(), bb()]; }');
+  ok(k2.includes('aa') && k2.includes('bb') && k2.includes('vec'),
+    `rust(macro): a bracket-delimited invocation likewise (got ${shows(k2)})`);
+  const k3 = namesOf('fn f() { assert_eq!(cc(), dd()); }');
+  ok(k3.includes('cc') && k3.includes('dd'),
+    `rust(macro): assert_eq!'s two operands (got ${shows(k3)})`);
+  const k4 = namesOf('fn f() {\n    tokio::select! {\n        _ = ch() => { on_msg(); }\n    }\n}');
+  ok(k4.includes('ch') && k4.includes('on_msg'),
+    `rust(macro): a brace-delimited DSL macro — tokio::select!, which host/ is to be built out of (got ${shows(k4)})`);
+  ok(k4.includes('select'),
+    `rust(macro): …invoked through a module path, which reduces to the macro's own name (got ${shows(k4)})`);
+  const k5 = namesOf('fn f() { println!("{}", format!("{}", g())); }');
+  ok(k5.includes('format') && k5.includes('g'),
+    `rust(macro): a NESTED macro inside a token_tree, and the call inside that (got ${shows(k5)})`);
+  const k6 = symsOf('#[macro_export]\nmacro_rules! twice { ($x:expr) => { helper($x) * 2 }; }');
+  eq(k6.find((s) => s?.name === 'twice')?.kind, 'function',
+    `rust(macro): a macro_rules! definition is a SYMBOL — without one find_symbol and trace_callers on a macro return nothing (got ${k6.map((s) => `${s?.kind}:${s?.name}`).join(', ') || 'none'})`);
+  const k7 = namesOf('macro_rules! twice { ($x:expr) => { helper($x) * 2 }; }');
+  ok(k7.includes('helper'),
+    `rust(macro): calls in a macro's BODY belong to the macro (got ${shows(k7)})`);
+  ok(!k7.includes('expr'),
+    `rust(macro): …and its metavariable PATTERN is a token_tree_pattern, a different node, so it is never scanned (got ${shows(k7)})`);
+  const k8 = callsOf('fn f() {\n    m! {\n        first();\n        second();\n    }\n}');
+  eq(k8.find((c) => c?.name === 'first')?.line, 3,
+    `rust(macro): each call inside a multi-line macro carries its OWN line, not the invocation's (got ${JSON.stringify(k8.map((c) => `${c?.name}:${c?.line}`))})`);
+  eq(k8.find((c) => c?.name === 'second')?.line, 4,
+    'rust(macro): …for every one of them');
+
+  // --- 3b. what the macro scan must NOT pick up -------------------------------
+  // A macro body is arbitrary tokens. These are the false-positive shapes; each is
+  // rejected structurally, by the grammar's own tokenization, not by a text filter.
+  const n1 = namesOf('fn f() { m!("a call leaf() written inside a string"); }');
+  ok(!n1.includes('leaf'),
+    `rust(macro/reject): text inside a STRING is string_content and is never tokenized into identifiers (got ${shows(n1)})`);
+  const n2 = namesOf('fn f() { m!(\n        // leaf() in a comment\n        real()\n    ); }');
+  ok(n2.includes('real') && !n2.includes('leaf'),
+    `rust(macro/reject): a COMMENT inside a macro is a line_comment node, likewise (got ${shows(n2)})`);
+  const n3 = namesOf('fn f() { m!( if (cond) { aa() } else { bb() } ); }');
+  ok(n3.includes('aa') && n3.includes('bb') && !n3.includes('if') && !n3.includes('else') && !n3.includes('cond'),
+    `rust(macro/reject): Rust keywords are anonymous tokens, and an \`else { … }\` block is not a \`(\`-delimited argument list (got ${shows(n3)})`);
+  const n4 = namesOf('fn f() { m!(arr[0], 3, 0u8); }');
+  ok(n4.length === 1 && n4[0] === 'm',
+    `rust(macro/reject): an INDEX is a bracket token_tree, not a call — only the macro itself is a call here (got ${shows(n4)})`);
+  const n5 = namesOf('fn f() { m!(Vec::new()); }');
+  ok(n5.includes('Vec::new') && !n5.includes('new'),
+    `rust(macro/reject): the type qualifier applies INSIDE a macro too — otherwise the macro scan would reintroduce the very fabrication defect 1 removes (got ${shows(n5)})`);
+  const n6 = namesOf('pub struct Svc;\nfn f() { m!(Svc::make()); }');
+  ok(n6.includes('Svc::make'),
+    `rust(macro/reject): …using the same file context, so a local type is qualified in a macro exactly as outside one (got ${shows(n6)})`);
+  // ATTRIBUTES carry token_trees too, and the scan is confined to macro_invocation and
+  // macro_rule so it never reaches them. The two shapes below are the ones that would
+  // otherwise mint something: `cfg_attr(test, derive(Debug))` nests an identifier directly
+  // in front of a `(`-token_tree, and `value_parser!(u16)` is a macro invocation written
+  // inside an attribute. Both are ordinary Rust that appears in real crates.
+  const n7 = namesOf('#[derive(Debug, Clone)]\n#[serde(rename = "x")]\n#[cfg_attr(test, derive(Debug))]\nstruct S;\n#[cfg(feature = "y")]\nfn g() {}');
+  eq(n7.length, 0,
+    `rust(macro/reject): an attribute is not scanned — #[cfg_attr(test, derive(Debug))] is not a call to derive (got ${shows(n7)})`);
+  const n8 = namesOf('#[arg(value_parser = clap::value_parser!(u16))]\nstruct S;');
+  eq(n8.length, 0,
+    `rust(macro/reject): …not even a macro written INSIDE an attribute, which is an attribute's argument and not the program's code (got ${shows(n8)})`);
+
+  // --- 4. the whole thing on a real crate layout, through the db --------------
+  // fixture-rust gained a macro pair in crate-a, an inherent `new` plus an external
+  // `Vec::new()` in crate-b, and — for the first time — a CROSS-COMPARTMENT call
+  // relationship, which the fixture had none of: every CALLS assertion in it was
+  // intra-compartment, so the "no cross-compartment resolution" check had no call to be
+  // negative about.
+  const rwork = mkdtempSync(join(tmpdir(), 'cg-rust-defects-'));
+  const rproj = join(rwork, 'ws');
+  cpSync(FIXTURE_RUST, rproj, { recursive: true });
+  const rproject = realpathSync(rproj);
+  const rdb = join(rwork, 'graph.db');
+  await runBuild({ target: rproj, project: rproject, db: rdb, reset: true });
+  const rconn = connect(rdb, { readonly: true });
+
+  const rsyms = rconn.prepare("SELECT compartment, file, name, kind FROM symbols WHERE project=? AND kind<>'module'").all(rproject);
+  const rsymShown = rsyms.map((s) => `${s?.compartment}:${s?.kind}:${s?.name}`).join(', ') || 'none';
+  ok(!rsyms.some((s) => s?.name === 'svc'),
+    `rust(db/mod): crate-a/src/app.rs's \`mod svc;\` no longer reaches the database as a class (got ${rsymShown})`);
+  eq(rsyms.find((s) => s?.name === 'twice_run')?.kind, 'function',
+    `rust(db/macro): a macro_rules! definition does (got ${rsymShown})`);
+  eq(rsyms.find((s) => s?.name === 'Cache')?.compartment, 'crate-b',
+    `rust(db/qual): crate-b's own type is indexed (got ${rsymShown})`);
+
+  const redges = rconn.prepare(`SELECT a.name AS caller, a.compartment AS ac, b.name AS callee FROM edges e
+      JOIN symbols a ON a.id=e.src AND a.project=e.project
+      JOIN symbols b ON b.id=e.dst AND b.project=e.project
+      WHERE e.project=? AND e.type='CALLS'`).all(rproject);
+  const rpairs = redges.map((r) => `${r?.caller}->${r?.callee}`);
+  const rShown = [...rpairs].sort().join(', ') || 'none';
+  ok(rpairs.includes('run->new'),
+    `rust(db/qual): the cross-file Service::new() edge SURVIVES the qualifier gate — the fix must not buy precision with real edges (got ${rShown})`);
+  ok(rpairs.includes('warm->new'),
+    `rust(db/qual): a LOCAL type's constructor still resolves — crate-b's warm() reaches Cache::new (got ${rShown})`);
+  ok(!rpairs.includes('slots->new'),
+    `rust(db/qual): but Vec::new() in the same file reaches nothing — the fabricated edge is gone (got ${rShown})`);
+  ok(!rpairs.some((p) => p.startsWith('borrow_names->')),
+    `rust(db/qual): and crate-b naming crate-a's Service::new / util resolves NOTHING across the compartment boundary (got ${rShown})`);
+  ok(rpairs.includes('shout->twice_run'),
+    `rust(db/macro): a macro INVOCATION resolves to the macro definition (got ${rShown})`);
+  ok(rpairs.includes('twice_run->helper'),
+    `rust(db/macro): a call in the macro's BODY is attributed to the macro (got ${rShown})`);
+  ok(rpairs.includes('shout->helper') && rpairs.includes('shout->sock_path'),
+    `rust(db/macro): and the two calls inside println!'s arguments are attributed to the fn that wrote them (got ${rShown})`);
+  rconn.close();
+  rmSync(rwork, { recursive: true, force: true });
+})();
+
+// --- STANDALONE RUNNERS, folded in as children ---
+// These files own their own counters and exit on their own. They live outside this file
+// because it is ~13k lines and two agents appending to it concurrently has already
+// silently deleted 30 tests here once; a separate file gives each round a private lane.
+//
+// We fold their totals into ours rather than just checking exit codes, so the number this
+// file prints stays the WHOLE suite's number and can still be checked by arithmetic.
+// Parsing the summary line is deliberate: a child that fails to print one contributes a
+// hard failure here instead of silently contributing zero.
+//
+// Add a new standalone runner to this list, not as another copy of the block below.
+const STANDALONE = ['review.mjs', 'compartments.mjs'];
+for (const child of STANDALONE) {
   let out = '';
   let childFailed = false;
   try {
-    out = (await execFileP(process.execPath, [join(HERE, 'review.mjs')])).stdout;
+    out = (await execFileP(process.execPath, [join(HERE, child)])).stdout;
   } catch (e) {
     out = e.stdout || '';
     childFailed = true;
@@ -13316,14 +13696,14 @@ await (async () => {
   const m = out.match(/(\d+) passed, (\d+) failed/);
   if (!m) {
     fail++;
-    console.error(`  FAIL: test/review.mjs printed no summary${childFailed ? ' and exited non-zero' : ''}`);
+    console.error(`  FAIL: test/${child} printed no summary${childFailed ? ' and exited non-zero' : ''}`);
     if (out) console.log(out);
-    return;
+    continue;
   }
   pass += Number(m[1]);
   fail += Number(m[2]);
   if (Number(m[2])) console.log(out); // only surface the child's detail when something broke
-})();
+}
 
 rmSync(process.env.WIREGRAPH_REGISTRY, { force: true }); // drop the throwaway registry
 rmSync(process.env.WIREGRAPH_LINKS_HISTORY, { force: true }); // and the throwaway tombstone

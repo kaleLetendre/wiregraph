@@ -1,0 +1,4 @@
+# A VIRTUAL manifest: no [package], so this directory is not a crate.
+[workspace]
+members = ["server/net", "server/sim", "harness"]
+resolver = "2"

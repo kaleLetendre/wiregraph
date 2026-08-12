@@ -20,3 +20,40 @@ pub fn connect() -> String {
         Err(_) => String::from(GAME_SOCK_PATH),
     }
 }
+
+// --- `new` is a convention, not a keyword -----------------------------------
+// Every Rust crate has several inherent `new`s, so a callee reduced to its last path
+// segment cannot tell them apart — nor tell any of them from `Vec::new()`. The TYPE
+// qualifier is what does, and it has to survive as far as resolve.js, which is the first
+// place that knows which types this compartment actually defines.
+pub struct Cache {
+    hits: usize,
+}
+
+impl Cache {
+    pub fn new() -> Cache {
+        Cache { hits: 0 }
+    }
+}
+
+// `Vec` is not a type this crate defines, so `Vec::new()` is an EXTERNAL constructor and
+// must reach nothing here. Reduced to `new` it landed on Cache::new instead — a fabricated
+// edge out of a function that constructs no Cache at all.
+pub fn slots() -> Vec<u32> {
+    Vec::new()
+}
+
+// The same shape with a LOCAL type still resolves, and resolves to that type's own `new`.
+pub fn warm() -> Cache {
+    Cache::new()
+}
+
+// crate-a's names, spelled from crate-b. These two crates are separate compartments and
+// resolution never crosses a compartment boundary by name, so neither may resolve — the
+// FIRST cross-compartment call relationship in this fixture. Without it every CALLS
+// assertion here was intra-compartment and the "no cross-compartment resolution" check
+// had no call to be negative about.
+pub fn borrow_names() -> i32 {
+    let _s = crate_a::Service::new();
+    crate_a::util(1)
+}

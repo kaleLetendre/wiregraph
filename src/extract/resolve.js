@@ -9,7 +9,20 @@
 // Unresolved calls (library functions, wire calls, macros) are counted, not
 // edged, so the graph stays honest about what it actually connected.
 
+import { CALLEE_QUALIFIER_SEP } from './parse.js';
+
 const AMBIGUOUS_CAP = 6; // don't fan a single ambiguous call out to more than this
+
+// A callee name may carry the TYPE it was reached through: `Vec::new`, `World::new`. Only
+// Rust's rule produces one (see parse.js's CALLEE_QUALIFIER_SEP note) and it produces at
+// most one separator, so a plain `lastIndexOf` recovers both halves. A name without the
+// separator — every other language, and Rust's own module paths — is returned unqualified
+// and takes the untouched path below.
+function splitQualified(name) {
+  const i = name.lastIndexOf(CALLEE_QUALIFIER_SEP);
+  if (i <= 0) return { qualifier: null, member: name };
+  return { qualifier: name.slice(0, i), member: name.slice(i + CALLEE_QUALIFIER_SEP.length) };
+}
 
 // extraDefs (optional): definitions from outside `graph` to resolve against —
 // the incremental path passes the rest of the project's symbols (read from
@@ -31,14 +44,44 @@ export function resolveCalls(graph, calls, log = () => {}, extraDefs = null) {
   let ambiguousDropped = 0;
 
   for (const c of calls) {
-    const cands = byName.get(c.name);
+    const { qualifier, member } = splitQualified(c.name);
+    const cands = byName.get(member);
     if (!cands || cands.length === 0) {
       unresolved++;
       continue;
     }
-    const sameFile = cands.filter((s) => s.compartment === c.compartment && s.file === c.relPath);
     const sameCompartment = cands.filter((s) => s.compartment === c.compartment);
-    const scope = sameFile.length ? sameFile : sameCompartment;
+    let scope;
+    if (qualifier) {
+      // `Type::member()`. The definition of `Type` is the only thing that says whether this
+      // call can land here at all, and this is the first point in the pipeline that knows:
+      // the parser sees one file, but the symbol table sees the compartment.
+      //
+      // Not a container in this compartment -> the type is EXTERNAL (`Vec`, `HashMap`,
+      // `Instant`, a generic parameter, another crate's type) and the call leaves the
+      // compartment. Unresolved, and deliberately NOT falling back to bare-name matching:
+      // the fallback is precisely the fabrication — `Vec::new()` landing on every local
+      // `new`. Counting it unresolved keeps the tally honest about what was skipped.
+      const qFiles = new Set(
+        (byName.get(qualifier) || [])
+          .filter((s) => s.compartment === c.compartment && s.kind === 'class')
+          .map((s) => s.file),
+      );
+      if (qFiles.size === 0) {
+        unresolved++;
+        continue;
+      }
+      // A local type. Prefer the file(s) that define it — that is what separates
+      // `World::new` from a same-named `Scheduler::new` next door. When the type's inherent
+      // impl lives in a DIFFERENT file from its declaration (legal, and something no
+      // file-local signal can see) the narrowed set is empty, so fall back to the whole
+      // compartment: same-name ambiguity, which is what this call already had.
+      const narrowed = sameCompartment.filter((s) => qFiles.has(s.file));
+      scope = narrowed.length ? narrowed : sameCompartment;
+    } else {
+      const sameFile = cands.filter((s) => s.compartment === c.compartment && s.file === c.relPath);
+      scope = sameFile.length ? sameFile : sameCompartment;
+    }
 
     if (scope.length === 0) {
       unresolved++; // only cross-compartment name matches existed -> not a real call

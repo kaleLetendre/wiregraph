@@ -30,14 +30,44 @@ import { statSync, lstatSync } from 'node:fs';
 import { resolve, relative, isAbsolute, join, sep, basename } from 'node:path';
 import { IGNORE_DIRS } from './lang.js';
 
+// THE TWO CHARACTERS THE INFERRED PARTITION MINTS INTO A NAME, and the reason a DECLARED
+// name may not contain either. When two boundary dirs share a basename,
+// disambiguateInferredNames (src/extract/walk.js) renames the colliding ones to their path
+// relative to the walked root — `network` becomes `client/network` + `server/network` — and
+// uniquifies a degenerate leftover as `<base>#2`. Those names are MACHINE-MINTED and
+// deliberately outside the namespace a human may declare, which is what lets
+// src/store/sqlite-query.js#disambiguatedCompartments recover "this compartment was
+// auto-renamed" FROM THE GRAPH ALONE, with no extra state to keep in sync: a name carrying
+// one of these characters is an auto-renamed name, in either mode. Let a declaration spell
+// one and graph_status reports a name the user chose as a collision that never happened,
+// and find_symbol's bare-name hint offers a bare name nothing was ever renamed from.
+//
+// walk.js builds its names FROM THESE CONSTANTS, so the reserved set and the set actually
+// minted cannot drift: a third marker character has to be added here to be usable there,
+// and adding it here is what makes declarations reject it.
+export const INFERRED_PATH_SEP = '/';
+export const INFERRED_UNIQ_SEP = '#';
+export const DISAMBIGUATION_CHARS = [INFERRED_PATH_SEP, INFERRED_UNIQ_SEP];
+
 // A compartment NAME is embedded verbatim in every id — `compartment:<name>`,
 // `file:<name>:<relPath>`, `sym:<name>:<relPath>:...` — so a name carrying the id
-// separator would make two different nodes spell the same id. CONTROL CHARACTERS are
+// separator `:` would make two different nodes spell the same id (compartment `a:b` with
+// relPath `c.js`, and compartment `a` with relPath `b:c.js` — a `:` in a filename is legal
+// on every platform wiregraph indexes — are both `file:a:b:c.js`). `\` is rejected beside
+// it as the same separator's Windows-path twin. CONTROL CHARACTERS are
 // rejected for the same class of reason one level up: the declaration fingerprint and
 // several report lines join names with separators, and a name free to contain any byte
 // can forge a join boundary (a name holding a raw U+0001 made a two-compartment declaration hash
 // identically to a one-compartment one, so a real partition change escaped detection).
-const NAME_BAD_CHARS = /[:/\\]|[\u0000-\u001f\u007f]/;
+//
+// `/` AND `#` ARE REJECTED FOR A DIFFERENT REASON — the paragraph above is not true of
+// them, and the rejection message must not claim it is. Neither can forge an id: ids join
+// on `:`, and `file:server/network:x.rs` has exactly one reading. Neither can forge a
+// fingerprint boundary either, because partitionValue (scripts/lib/state.mjs) JSON-encodes
+// every component before hashing it. They are rejected because they are RESERVED for the
+// auto-disambiguated names described above — that namespace split is the entire mechanism
+// by which an auto-renamed compartment stays recognizable from the graph alone.
+const NAME_BAD_CHARS = new RegExp(`[:\\\\${DISAMBIGUATION_CHARS.join('')}]|[\\u0000-\\u001f\\u007f]`);
 
 // Normalize a declared path to the stored form: relative to the project root, with
 // no `./` prefix and no trailing separator. The project root itself is stored as '.'.
@@ -100,7 +130,15 @@ export function validateDeclaration(project, list) {
     if (typeof rawPath !== 'string' || !rawPath.trim()) { errors.push(`${at}: "path" must be a non-empty string`); continue; }
     if (typeof rawName !== 'string' || !rawName.trim()) { errors.push(`${at}: "name" must be a non-empty string`); continue; }
     const name = rawName.trim();
-    if (NAME_BAD_CHARS.test(name)) { errors.push(`${at}: name "${name}" contains ':', '/', '\\' or a control character — those are id and fingerprint separators, so the name would let two different partitions spell the same id`); continue; }
+    // TWO REASONS, NAMED SEPARATELY. This message used to blame the id separator for all
+    // of them, which is false for '/' and '#' — and it left the author of a colliding
+    // project with no legal spelling in sight, because the collision warning PRINTS
+    // `server/network` and then this line rejected the very name it printed, citing a
+    // reason the author could check and find untrue.
+    if (NAME_BAD_CHARS.test(name)) {
+      errors.push(`${at}: name "${name}" contains ':', '/', '#', '\\' or a control character. ':', '\\' and control characters are id and fingerprint separators, so such a name would let two different partitions spell the same id; '/' and '#' are RESERVED for the names wiregraph mints ITSELF when the inferred partition disambiguates a basename collision (\`client/network\`, \`network#2\`), so a declared name carrying one could not be told apart from an auto-renamed one. Declare a plain name instead — e.g. "server_network" for the compartment at server/network.`);
+      continue;
+    }
 
     // 4. Outside the project root. Absolute paths are rejected outright: loadState
     //    rebinds state.project to the directory it read from on a rename/move, so an

@@ -1,0 +1,4 @@
+# The nested virtual manifest. `cargo build` here builds the members; there is no crate
+# called `server` and nothing names one.
+[workspace]
+members = ["net", "sim"]

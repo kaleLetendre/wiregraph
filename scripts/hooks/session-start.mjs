@@ -13,7 +13,7 @@ import { realpathSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readState, findIndexedRoot, updateState } from '../lib/state.mjs';
+import { readState, findIndexedRoot, updateState, uncoveredSeams } from '../lib/state.mjs';
 import { openRefreshErrFd } from '../lib/hooklog.mjs';
 import { changedSince } from '../lib/git.mjs';
 import { record, migrateMetrics } from '../lib/metrics.mjs';
@@ -101,26 +101,22 @@ async function main() {
   child.unref();
   if (errFd !== null) { try { closeSync(errFd); } catch { /* the child holds its own dup */ } }
 
-  // Nudge toward inferring contracts only when there's REAL, uncovered potential:
-  // the last full build found cross-repo seams (messaging/state/HTTP) AND no
-  // contracts dir is present. Both come from state (persisted at build time), so
-  // this stays a cheap read — no scan. Appended to whichever note fires below,
-  // since emit() exits. Silent for contracted or signal-free workspaces.
+  // Nudge toward inferring contracts only when there's REAL, uncovered potential: the last
+  // full build found cross-repo seams (messaging/state/HTTP) AND none of the contracts dirs
+  // it recorded actually holds a spec. Appended to whichever note fires below, since emit()
+  // exits. Silent for contracted or signal-free workspaces.
   //
-  // The gate reads the SINGULAR and the PLURAL. That is BELT AND BRACES, not a fix for a
-  // real hole, and the justification this comment used to carry was false: it claimed a
-  // recursive project whose contracts all live in `server/contracts/` and
-  // `client/contracts/` "has nothing at depth 1 for the singular to name", so gating on the
-  // singular alone would nag forever. It cannot happen. `contractsDir` is
-  // `contractsDirs[0]` (src/build.js#fullBuild), and in recursive mode detectContractsDirs
-  // returns the WHOLE discovered list — nested dirs included, shallowest first — so the
-  // singular is null EXACTLY when the plural is empty. What the plural genuinely buys is
-  // robustness against a state written by a version (or a code path) that fills only one of
-  // them: `/wiregraph-contracts apply` writes both, but a legacy state.json predating the
-  // plural has only the singular. Both keys are stamped by every full build in BOTH modes,
-  // so this stays one cheap state read.
-  const seams = state.inferredSeams || 0;
-  const contractsHint = (seams > 0 && !state.contractsDir && !(state.contractsDirs?.length))
+  // THE GATE ASKS WHETHER A CONTRACT IS WRITTEN, NOT WHETHER A DIRECTORY EXISTS. It used to
+  // read `!state.contractsDir && !(state.contractsDirs?.length)` — pure state, no disk —
+  // and a contracts dir is matched by NAME, so an EMPTY `contracts/` silenced this forever.
+  // Under compartments-and-contracts an empty contracts dir is the correct state for code
+  // whose contract is not written yet, so that gate went quiet on precisely the projects
+  // that needed the nudge. uncoveredSeams (scripts/lib/state.mjs) still starts from the same
+  // two state keys — it just asks each recorded dir whether it holds a spec, using the same
+  // predicate the loader and the contracts fingerprint use. That is a readdir per recorded
+  // contracts dir, not a scan.
+  const seams = uncoveredSeams(state);
+  const contractsHint = seams > 0
     ? ` wiregraph spotted ${seams} cross-repo seam(s) (messaging/state/HTTP) with no contract yet — run /wiregraph-contracts to capture them.`
     : '';
 

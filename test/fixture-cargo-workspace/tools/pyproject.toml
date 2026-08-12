@@ -1,0 +1,6 @@
+# Tool config only. This declares no distribution — there is nothing here to package.
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+strict = true

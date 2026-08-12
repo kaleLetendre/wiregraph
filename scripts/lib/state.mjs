@@ -494,6 +494,55 @@ export function statusAdvisories(state) {
   return notes;
 }
 
+// --- the /wiregraph-contracts nudge gate --------------------------------------
+// The dirs a build RECORDED as this project's contracts homes: the plural, unioned with
+// the singular. `contractsDirs` is stamped by every full build in both modes and by
+// `/wiregraph-contracts apply`; the singular is `contractsDirs[0]` and is all a state
+// written before the plural existed carries. Deduped, plural first, so the outermost dir
+// stays first exactly as the build ordered it.
+function recordedContractsDirs(state) {
+  const out = [];
+  const add = (d) => { if (typeof d === 'string' && d && !out.includes(d)) out.push(d); };
+  for (const d of Array.isArray(state?.contractsDirs) ? state.contractsDirs : []) add(d);
+  add(state?.contractsDir);
+  return out;
+}
+
+// How many inferred seams are still UNCOVERED — the number the SessionStart nudge quotes,
+// and 0 when it must stay silent.
+//
+// A DIRECTORY IS NOT COVERAGE. detectContractsDirs matches a contracts home by NAME, so
+// `state.contractsDir` is set for a directory holding no specs at all — and the gate used
+// to be `seams > 0 && !contractsDir && !contractsDirs?.length`, i.e. "does a contracts dir
+// EXIST". Under the architecture this tool implements, a contracts dir created before its
+// contract is written is the CORRECT state (a contract must not be written before the code
+// it describes exists), so `mkdir contracts` was enough to silence the nudge permanently:
+// the projects following the methodology most carefully — the flagship has four such dirs
+// — were exactly the ones told nothing. What the nudge is about is whether any contract is
+// WRITTEN, so it asks that question instead.
+//
+// contractsDirSpecs is the SAME predicate the contracts fingerprint hashes and the loader
+// parses (src/contracts-dirs.js), so "a spec that counts here" cannot drift from "a spec
+// wiregraph reads". Cost is one readdir plus a digest of a handful of small YAML files per
+// recorded dir — this runs in a SessionStart hook, so it stays proportional to the contracts
+// dirs a build already found, never a scan of the tree.
+//
+// A recorded dir that is now MISSING contributes nothing and the nudge fires: deleting the
+// only contracts dir genuinely uncovers the seams again.
+//
+// `.wiregraph/inferred/` is deliberately not among the recorded dirs (src/build.js records
+// only HAND-WRITTEN homes), so a draft wiregraph wrote for itself still cannot silence the
+// nudge — while `/wiregraph-contracts apply`, which writes into the real contracts home,
+// does. That is the same before/after split the old gate had, kept.
+export function uncoveredSeams(state) {
+  const seams = Number(state?.inferredSeams) || 0;
+  if (seams <= 0) return 0;
+  for (const dir of recordedContractsDirs(state)) {
+    if (contractsDirSpecs(dir).length) return 0;
+  }
+  return seams;
+}
+
 // realpath a path, falling back to the input if it can't be resolved (missing dir,
 // permission). Keeps comparisons total even for a member root that has moved.
 function realpathish(p) {
