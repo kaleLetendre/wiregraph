@@ -1,6 +1,6 @@
 {
   "name": "wiregraph",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Cross-compartment call/association graph in an embedded SQLite file (no daemon, no JVM), exposed to Claude as MCP tools. Index a project once; navigate/audit/refactor code reading ~half the file bytes a grep-and-read would. Project-scoped, balanced auto-update, self-refresh via update_graph.",
   "author": { "name": "Kale Letendre", "email": "kaleletendre@gmail.com" },
   "commands": [
