@@ -111,12 +111,19 @@ Do the steps in order:
 
 9. **Contract coverage**: from the state shown in step 5, read `inferredSeams` (the
    cross-compartment seams — messaging/state/HTTP — the last full build detected) and
-   both `contractsDir` and `contractsDirs`. Judge on the PLURAL: every full build stamps
-   the whole discovered list there, and in recursive mode that list is the interesting
-   one — several dirs, one per governed subtree, none of which is "the" one.
-   - `inferredSeams > 0` and BOTH keys empty — those seams aren't captured yet; recommend
+   both `contractsDir` and `contractsDirs`. Every full build stamps the whole discovered
+   list into the plural, and in recursive mode that list is the interesting one — several
+   dirs, one per governed subtree, none of which is "the" one.
+
+   **Judge on whether a recorded dir actually HOLDS A SPEC, not on whether one exists.**
+   That is `uncoveredSeams(state)` (`scripts/lib/state.mjs`), which is also the gate the
+   SessionStart hook uses. A `contracts/` directory that is deliberately empty — the
+   correct state under the architecture recursive mode implements, where a contract is not
+   written before the code it describes — must not read as coverage, or the projects
+   following that architecture most carefully are the ones that never get told.
+   - `uncoveredSeams(state) > 0` — those seams aren't captured yet; recommend
      `/wiregraph-contracts` to draft contracts for them.
-   - either key populated — coverage is in place (nothing to do). In recursive mode also
+   - it returns 0 while seams exist — coverage is in place (nothing to do). In recursive mode also
      report how many dirs and what each governs, which is what `graph_status`'s `Mode:`
      line spells out (`contracts SCOPED to N dir(s): …`).
 

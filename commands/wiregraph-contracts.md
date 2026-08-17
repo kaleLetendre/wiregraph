@@ -73,10 +73,13 @@ Do the steps in order:
      side sat in a comment therefore flips from **satisfied** to **one-sided** at this
      rebuild. That is the true reading, not a regression — the seam was never implemented
      on that side.
-   - **Rust is now indexed.** `Cargo.toml` was already a compartment boundary, but with
-     no indexable files the compartment never materialised. A legacy repo containing
-     `.rs` files gains a compartment and its symbols here — so compartment counts, symbol
-     counts, and the set of compartments a spec can name all grow.
+   - **Rust is now indexed.** A `Cargo.toml` that declares a package was already a
+     compartment boundary, but with no indexable files the compartment never materialised.
+     A legacy repo containing `.rs` files gains a compartment and its symbols here — so
+     compartment counts, symbol counts, and the set of compartments a spec can name all
+     grow. Conversely a *virtual* manifest (`[workspace]` with no `[package]`) is no
+     longer a boundary at all, so a repo with a nested one loses that phantom compartment
+     and the files under it re-attribute to the real crates.
 
 2. **Read the project's mode.** Call `graph_status` and read its `Mode:` line before you
    explain anything about contracts, because the mode changes what a trace MEANS:

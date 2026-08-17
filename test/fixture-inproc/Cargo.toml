@@ -1,9 +1,11 @@
-# The workspace ROOT manifest. It makes this directory a compartment BOUNDARY too
-# (extract/walk.js MODULE_MANIFESTS), but it holds no source file of its own, so no root
-# compartment ever reaches the db — files under ecs/, sim/ and render/ attribute to the
-# nearest ancestor boundary, which is their own crate. That is the shape a real Cargo
-# workspace has, and it is deliberately part of the fixture: the whole reason in-process
-# contracts exist is that a multi-crate workspace indexes as N disconnected islands.
+# The workspace ROOT manifest, and a VIRTUAL one: [workspace] with no [package]. It is not
+# a compartment boundary (extract/walk.js MODULE_MANIFESTS maps each manifest to a "does
+# this declare a module" rule; Cargo's answers no for the virtual form), and it holds no
+# source file of its own either — so no root compartment reaches the db by either route.
+# Files under ecs/, sim/ and render/ attribute to the nearest ancestor boundary, which is
+# their own crate. That is the shape a real Cargo workspace has, and it is deliberately
+# part of the fixture: the whole reason in-process contracts exist is that a multi-crate
+# workspace indexes as N disconnected islands.
 [workspace]
 members = ["ecs", "sim", "render"]
 resolver = "2"

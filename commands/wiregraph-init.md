@@ -161,9 +161,11 @@ Do the steps in order; stop and report if a step fails.
    Explain both in the user's terms and what each buys:
 
    - **Global (recommended)** — wiregraph works out the compartments itself, so there is
-     nothing to maintain: a `.git` dir or a package/module manifest marks a boundary, and
-     each file belongs to its nearest one. Right for a single repo, a normal monorepo, or
-     repos side-by-side.
+     nothing to maintain: a `.git` dir, or a manifest that DECLARES a module, marks a
+     boundary, and each file belongs to its nearest one. (Declaring a module is what
+     counts, not the filename — a Cargo virtual manifest, `[workspace]` with no
+     `[package]`, is not a boundary, and neither is a `pyproject.toml` carrying only
+     tool config.) Right for a single repo, a normal monorepo, or repos side-by-side.
    - **Recursive** — you declare the compartments yourself and contracts dirs are scoped
      per subtree, so boundaries that no manifest marks become real; it costs maintenance
      (add a directory, remember to declare it).

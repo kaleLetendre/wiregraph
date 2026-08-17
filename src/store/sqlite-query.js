@@ -9,6 +9,7 @@ import { join, sep } from 'node:path';
 import { readState, members, memberRoots } from '../../scripts/lib/state.mjs';
 import { decodeResourceDirection } from '../extract/resource-spec.js';
 import { decodeInprocDirection } from '../extract/inproc-spec.js';
+import { INFERRED_PATH_SEP, INFERRED_UNIQ_SEP } from '../extract/compartment-decl.js';
 
 // Which CONTRACT TYPE a stored token came from, recovered from the free-text
 // contract_tokens.direction column: `res:` = a *.resource.yaml, `inproc:` = a
@@ -146,11 +147,17 @@ export function graphStats(db, project) {
 // inferred…` with no hint that the name a user would type does not exist, and
 // `find_symbol {"compartment":"network"}` dead-ended with `No symbol named "x" in network.`
 //
-// The graph itself is the authoritative record of what happened: a declared name can never
-// contain `/` or `#` (validateDeclaration rejects `[:/\\]` and control characters), and the
-// walk's basename never does either — so a compartment name carrying one of those IS a
-// disambiguated name, in either mode, with no extra state to keep in sync and nothing to go
-// stale. Group them by the bare name they collided on.
+// The graph itself is the authoritative record of what happened: `/` and `#` are RESERVED
+// for machine-minted names. disambiguateInferredNames is the only thing that mints them,
+// validateDeclaration refuses them in a declared name for that reason (NOT because ids join
+// on them — ids join on `:`, and partitionValue JSON-encodes every component before hashing,
+// so `/` forges nothing), and the walk's basename never contains one. So a compartment name
+// carrying one of those IS a disambiguated name, in either mode, with no extra state to keep
+// in sync and nothing to go stale.
+//
+// The two characters are imported from the module that mints them rather than spelled again
+// here, so the minted set and the set this heuristic recognizes cannot drift apart.
+// Group them by the bare name they collided on.
 export function disambiguatedCompartments(db, project) {
   let rows;
   try { rows = db.prepare('SELECT DISTINCT name FROM compartments WHERE project=? ORDER BY name').all(project); }
@@ -158,9 +165,9 @@ export function disambiguatedCompartments(db, project) {
   const byBare = new Map();
   for (const r of rows) {
     const n = r?.name;
-    if (typeof n !== 'string' || !(n.includes('/') || n.includes('#'))) continue;
+    if (typeof n !== 'string' || !(n.includes(INFERRED_PATH_SEP) || n.includes(INFERRED_UNIQ_SEP))) continue;
     // `client/network` -> `network`; `network#2` -> `network`.
-    const bare = n.split('/').pop().split('#')[0];
+    const bare = n.split(INFERRED_PATH_SEP).pop().split(INFERRED_UNIQ_SEP)[0];
     if (!bare) continue;
     if (!byBare.has(bare)) byBare.set(bare, []);
     byBare.get(bare).push(n);

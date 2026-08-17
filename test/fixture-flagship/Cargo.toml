@@ -1,6 +1,9 @@
-# The flagship's workspace root. Cargo.toml is in MODULE_MANIFESTS unconditionally, so
-# this is what makes the project root itself a compartment boundary in the INFERRED
-# partition — the same thing the real Cargo.toml does.
+# The flagship's workspace root, and a VIRTUAL manifest: [workspace] with no [package].
+# It is therefore NOT a compartment boundary. MODULE_MANIFESTS maps each manifest name to
+# a "does this declare a module" rule, and Cargo's answers no for the virtual form, so this
+# file mints nothing. The root is still a compartment in the inferred partition — via the
+# root fallback, not via this manifest — so attribution here is identical either way. The
+# real Cargo.toml at the flagship's root is the same shape.
 [workspace]
 members = ["server/ecs", "server/sim", "server/network", "server/host", "harness"]
 resolver = "2"
