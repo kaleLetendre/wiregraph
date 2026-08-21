@@ -648,7 +648,7 @@
   <section id="commands" aria-label="Command reference">
     <p class="eyebrow reveal">Reference</p>
     <h2 class="reveal">Every command. <span class="accent">One graph.</span></h2>
-    <p class="lead reveal d1">All 13 slash commands, grouped by lifecycle. Each entry gives what it does, when to reach for it, its arguments, and a representative effect. The three linking commands are marked <b style="color:var(--violet)">NEW</b>.</p>
+    <p class="lead reveal d1">All 16 slash commands, grouped by lifecycle. Each entry gives what it does, when to reach for it, its arguments, and a representative effect. The three linking commands are marked <b style="color:var(--violet)">NEW</b>.</p>
 
     <!-- GROUP 1 — SETUP -->
     <div class="grp g-setup">
@@ -693,6 +693,7 @@ MCP tools now queryable</div>
           <div class="k">daily · incremental</div>
           <p class="what">Incrementally re-indexes only the files changed since the last index (git diff + uncommitted edits) — not a full rebuild.</p>
           <p class="when"><span class="lbl">When</span> After normal editing — the cheap, everyday refresh. Hooks do this automatically at <b>balanced+</b>; this is the manual trigger. Prefers the <code style="font-family:var(--mono);color:var(--green);font-size:12px">update_graph</code> tool with no arguments.</p>
+          <p class="when"><span class="lbl">Worktree-safe</span> A <code style="font-family:var(--mono);color:var(--green);font-size:12px">git worktree add</code> inside an indexed project no longer forces a full rebuild, and a rebase / amend that orphans the stored sha reconciles the affected repo by on-disk content instead of tearing the graph down. A <b>content-hash</b> tiebreaker confirms every mtime+size match, so a same-size edit can't slip through as unchanged.</p>
           <p class="args"><span class="lbl">Args</span> none — acts on the active project</p>
           <div class="ex"><span class="c">$ /wiregraph-update</span>
 re-indexed 4 changed files · advanced git shas</div>
@@ -725,6 +726,17 @@ adoption: 82% of navigation via graph</div>
         </div>
 
         <div class="card cmd reveal d2">
+          <div class="name">/wiregraph-stats-local</div>
+          <div class="k">daily · savings (this project)</div>
+          <p class="what">The same measured token-savings dashboard as <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">/wiregraph-stats</code>, but scoped to <b>only the current project</b> instead of every graph on the machine. Deterministic; relayed <b>verbatim</b>.</p>
+          <p class="when"><span class="lbl">When</span> You want one project's numbers on their own — reporting a single repo, or comparing it against the machine-wide total. Resolves the workspace itself and works from any subdirectory.</p>
+          <p class="args"><span class="lbl">Args</span> none — the active project</p>
+          <div class="ex"><span class="c">$ /wiregraph-stats-local</span>
+this project · graph-tool calls: 96 · est. tokens saved: <span class="c">~540K</span>
+session context: <span class="c">~540K</span> once → <span class="c">~2.1M</span> recurring (measured)</div>
+        </div>
+
+        <div class="card cmd reveal d1">
           <div class="name">/wiregraph-visualize <span class="arg">[dir] [--functions|--all|--contract "&lt;name&gt;"]</span></div>
           <div class="k">daily · visualize</div>
           <p class="what">Renders the graph as a standalone offline HTML page (d3 force layout, one color cluster per repo, <b>Contract nodes as the bridges in the middle</b>) and opens it.</p>
@@ -732,6 +744,16 @@ adoption: 82% of navigation via graph</div>
           <p class="args"><span class="lbl">Args</span> default (per-repo contract view), <span style="color:var(--cyan)">--functions</span>, <span style="color:var(--cyan)">--all</span>, <span style="color:var(--cyan)">--contract "&lt;name&gt;"</span></p>
           <div class="ex"><span class="c">$ /wiregraph-visualize --contract "/api/logs"</span>
 42 nodes · 61 links → ~/log-server/.wiregraph/graph.html (opened)</div>
+        </div>
+
+        <div class="card cmd reveal d2">
+          <div class="name">/wiregraph-linearize <span class="arg">&lt;Class.method|method|ClassName&gt; [--breadth tight|medium|full] [--depth N] [--out &lt;path&gt;]</span></div>
+          <div class="k">daily · reading aid</div>
+          <p class="what">Flattens a <b>vertical call slice</b> into one top-to-bottom pseudo-source file — follows the <code style="font-family:var(--mono);color:var(--green);font-size:12px">CALLS</code> graph from a root symbol and inlines each reachable body <b>once</b>, in reading order, with a <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">file:line</code> banner and a back-reference on repeats.</p>
+          <p class="when"><span class="lbl">When</span> A flow is smeared across many files or deep call chains and you'd rather read it as a single script. It's a reading aid — the output doesn't compile. Language-agnostic and multi-compartment: it reads whatever the graph indexed, from each symbol's own compartment root.</p>
+          <p class="args"><span class="lbl">Args</span> <span style="color:var(--cyan)">root</span> (required); <span style="color:var(--cyan)">--breadth</span> tight/medium/full (how far across compartments), <span style="color:var(--cyan)">--depth</span>, <span style="color:var(--cyan)">--file</span> to disambiguate, <span style="color:var(--cyan)">--out</span> to write a file</p>
+          <div class="ex"><span class="c">$ /wiregraph-linearize ProcessOrderUseCase.execute --breadth medium</span>
+inlined 37 symbols · depth 9 → one top-to-bottom slice</div>
         </div>
 
         <div class="card cmd reveal d1">

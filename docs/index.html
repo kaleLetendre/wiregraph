@@ -574,7 +574,7 @@
         <div class="term-comment"># <span class="arrow">→</span> indexes every repo under this workspace, then keeps itself fresh</div>
       </div>
     </div>
-    <p class="install-caption reveal d2">Run <code>/wiregraph-init</code> once per workspace. It finds every repo under the root, indexes them into one graph, and re-indexes as you edit. Then just put Claude to work.</p>
+    <p class="install-caption reveal d2">Run <code>/wiregraph-init</code> once per workspace. It finds every repo under the root, indexes them into one graph, and re-indexes as you edit — <b>git-worktree-safe</b>, so adding a worktree, rebasing, or amending never forces a rebuild or leaves the graph silently stale. Then just put Claude to work.</p>
   </section>
 </main>
 
