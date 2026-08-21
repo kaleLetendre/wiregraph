@@ -648,7 +648,7 @@
   <section id="commands" aria-label="Command reference">
     <p class="eyebrow reveal">Reference</p>
     <h2 class="reveal">Every command. <span class="accent">One graph.</span></h2>
-    <p class="lead reveal d1">All 16 slash commands, grouped by lifecycle. Each entry gives what it does, when to reach for it, its arguments, and a representative effect. The three linking commands are marked <b style="color:var(--violet)">NEW</b>.</p>
+    <p class="lead reveal d1">All 17 slash commands, grouped by lifecycle. Each entry gives what it does, when to reach for it, its arguments, and a representative effect. The newer commands — the three for linking, plus review — are marked <b style="color:var(--violet)">NEW</b>.</p>
 
     <!-- GROUP 1 — SETUP -->
     <div class="grp g-setup">
@@ -795,6 +795,16 @@ full reset over 2 members (log-server + linked edge-app)
           <div class="ex"><span class="c">$ /wiregraph-contracts</span>
 scan: 1 wire seam · HTTP /api/logs
 wrote contracts/wiregraph-inferred.asyncapi.yaml</div>
+        </div>
+
+        <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-review <span class="arg">[target-dir]</span><span class="new">NEW</span></div>
+          <div class="k">ops · doc-vs-reality drift</div>
+          <p class="what">Reviews a <b>compartments-and-contracts</b> project for drift between its documentation and its reality — the directory tree, the per-compartment <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">whoami.md</code> files, the contract index, and the structure document — and fixes what the spec already settles.</p>
+          <p class="when"><span class="lbl">When</span> The architecture is cheap to design but comes apart quietly — a compartment gets added and never reaches the index, a contract is written and never listed. A script finds every finding as a set difference or <code>stat</code>; Claude never re-derives drift, only relays the findings and edits the files the script names.</p>
+          <p class="args"><span class="lbl">Args</span> optional <span style="color:var(--cyan)">target-dir</span> (defaults to the active project); <span style="color:var(--cyan)">--structure &lt;path&gt;</span> if the structure doc isn't <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">project-structure.md</code></p>
+          <div class="ex"><span class="c">$ /wiregraph-review</span>
+parsed 14 index rows · 3 findings: 1 compartment unlisted, 2 contract paths off</div>
         </div>
       </div>
       <div class="how-note reveal d1">
