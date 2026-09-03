@@ -443,7 +443,7 @@ export function formatGlobalReport({ perProject, total }, { color = false } = {}
   if (!n) {
     return [top, head, bot, '',
       C.dim('   No measured activity across your indexed projects yet — numbers accrue'),
-      C.dim('   once Claude uses the graph tools. /wiregraph-stats-local reports just'),
+      C.dim('   once Claude uses the graph tools. /wiregraph-stats --local reports just'),
       C.dim('   the current project; /wiregraph-init indexes a new one.')].join('\n');
   }
 
@@ -478,7 +478,7 @@ export function formatGlobalReport({ perProject, total }, { color = false } = {}
   }
   L.push('');
   L.push(`   ${C.dim(`${n} project(s) · ${t.events} events · local · never uploaded`)}`);
-  L.push(`   ${C.dim('/wiregraph-stats-local for just the current project')}`);
+  L.push(`   ${C.dim('/wiregraph-stats --local for just the current project')}`);
   return L.join('\n');
 }
 
