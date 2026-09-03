@@ -286,6 +286,19 @@ export function modeLine(state) {
   return `recursive — ${list.length} compartment(s) DECLARED in .wiregraph/state.json${names ? `: ${names}` : ''}${scopeNote}${pendingRebuildNote(state)}`;
 }
 
+// Compact one-phrase mode label for the EVERYDAY surfaces — the SessionStart nudge and the
+// graph_stats header — where the full modeLine (declared names, contracts scoping, and the
+// unusable/pending-rebuild advisories) would be too much to carry every session. Just the
+// mode word plus a compartment count, so a passing glance answers "what am I using".
+// graph_status stays the home for the full detail and the advisories; this asserts no
+// health and reflects the DECLARED intent (a recursive project whose declaration the build
+// had to ignore still reads `recursive` here — graph_status is where that discrepancy shows).
+export function modeSummary(state) {
+  if (!isRecursiveMode(state)) return 'global';
+  const n = Array.isArray(state?.compartments) ? state.compartments.length : 0;
+  return `recursive (${n} compartment${n === 1 ? '' : 's'})`;
+}
+
 // Whether the partition the GRAPH was built against still matches the one in force NOW —
 // and this is the difference between a Mode: line that is true and one that merely recites
 // state.json. Everything above reports the DECLARATION (or, for a global project, that

@@ -13,7 +13,7 @@ import { realpathSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readState, findIndexedRoot, updateState, uncoveredSeams } from '../lib/state.mjs';
+import { readState, findIndexedRoot, updateState, uncoveredSeams, modeSummary } from '../lib/state.mjs';
 import { openRefreshErrFd } from '../lib/hooklog.mjs';
 import { changedSince } from '../lib/git.mjs';
 import { record, migrateMetrics } from '../lib/metrics.mjs';
@@ -120,16 +120,23 @@ async function main() {
     ? ` wiregraph spotted ${seams} cross-repo seam(s) (messaging/state/HTTP) with no contract yet — run /wiregraph-contracts to capture them.`
     : '';
 
+  // Which organization method is in force, so a day-to-day session sees it passively
+  // instead of only on an explicit /wiregraph-status. Kept to the compact word + count
+  // (modeSummary) — graph_status remains the place for scoping, declared names and the
+  // rebuild/unusable advisories. Placed before the contracts CTA so the note reads
+  // "…fewer tokens. Mode: … . wiregraph spotted N seams…".
+  const modeHint = ` Mode: ${modeSummary(state)}.`;
+
   // Tailor a short note from a quick git check (don't block on the refresh).
   let changedCount = 0;
   try { changedCount = changedSince(PROJECT, state.reposLastSha || {}).files.length; } catch { /* ignore */ }
   if (changedCount > 0) {
-    emit(`wiregraph: ${changedCount} source file(s) changed since last index — refreshing the graph in the background. Prefer the wiregraph MCP tools for code navigation.${contractsHint}`);
+    emit(`wiregraph: ${changedCount} source file(s) changed since last index — refreshing the graph in the background. Prefer the wiregraph MCP tools for code navigation.${modeHint}${contractsHint}`);
   }
   // Fresh: re-assert the directive cheaply. The CLAUDE.md block is loaded once
   // and decays as context grows, so a one-line reminder each session keeps the
   // graph top-of-mind without re-stating the whole directive.
-  emit('wiregraph: graph is indexed and fresh — prefer its MCP tools (find_symbol, get_source, trace_callers/trace_callees, path_between) over grep/Read for code navigation, at ~50% fewer tokens.' + contractsHint);
+  emit('wiregraph: graph is indexed and fresh — prefer its MCP tools (find_symbol, get_source, trace_callers/trace_callees, path_between) over grep/Read for code navigation, at ~50% fewer tokens.' + modeHint + contractsHint);
 }
 
 main().catch(() => process.exit(0));
