@@ -5,6 +5,7 @@
   "author": { "name": "Kale Letendre", "email": "kaleletendre@gmail.com" },
   "commands": [
     "./commands/wiregraph-init.md",
+    "./commands/wiregraph-tutorial.md",
     "./commands/wiregraph-update.md",
     "./commands/wiregraph-rebuild.md",
     "./commands/wiregraph-status.md",

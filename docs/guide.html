@@ -3,7 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Guide — how to use wiregraph, and every command explained</title>
-<meta name="description" content="Getting started with wiregraph plus a complete reference for all 15 commands — including /wiregraph-link, -unlink and -list, which join two separately-indexed graphs so cross-repo wire and contract seams light up across the boundary.">
+<meta name="description" content="Getting started with wiregraph plus a complete reference for all 16 commands — including /wiregraph-link, -unlink and -list, which join two separately-indexed graphs so cross-repo wire and contract seams light up across the boundary.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔗</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -375,7 +375,7 @@
     <a href="index.html" class="backlink">← wiregraph</a>
     <p class="eyebrow" style="margin-top:20px">How to use it</p>
     <h1 class="hero-title">Stand a graph up, then <span class="g">let Claude drive it.</span></h1>
-    <p class="lead">Index once and wiregraph keeps itself fresh — Claude queries the graph instead of re-reading your tree. This guide walks the getting-started flow, shows how to <b style="color:var(--ink)">link two separately-indexed repos</b> so a cross-repo wire lights up, and documents every one of the 15 commands.</p>
+    <p class="lead">Index once and wiregraph keeps itself fresh — Claude queries the graph instead of re-reading your tree. This guide walks the getting-started flow, shows how to <b style="color:var(--ink)">link two separately-indexed repos</b> so a cross-repo wire lights up, and documents every one of the 16 commands.</p>
     <ul class="facts">
       <li><b>no daemon</b> · nothing runs in the background</li>
       <li><b>one SQLite db per graph</b> at <code style="font-family:var(--mono);color:var(--muted);font-size:12px">&lt;root&gt;/.wiregraph/graph.db</code></li>
@@ -648,7 +648,7 @@
   <section id="commands" aria-label="Command reference">
     <p class="eyebrow reveal">Reference</p>
     <h2 class="reveal">Every command. <span class="accent">One graph.</span></h2>
-    <p class="lead reveal d1">All 15 slash commands, grouped by lifecycle. Each entry gives what it does, when to reach for it, its arguments, and a representative effect. The newer commands — the three for linking, plus review — are marked <b style="color:var(--violet)">NEW</b>.</p>
+    <p class="lead reveal d1">All 16 slash commands, grouped by lifecycle. Each entry gives what it does, when to reach for it, its arguments, and a representative effect. The newer commands — the three for linking, plus review — are marked <b style="color:var(--violet)">NEW</b>.</p>
 
     <!-- GROUP 1 — SETUP -->
     <div class="grp g-setup">
@@ -658,6 +658,17 @@
       </div>
       <div class="cmd-grid">
         <div class="card cmd reveal d1">
+          <div class="name">/wiregraph-tutorial <span class="arg">[target-dir]</span> <span style="color:var(--violet)">NEW</span></div>
+          <div class="k">setup · learn</div>
+          <p class="what">A guided walkthrough that reads <b>your actual layout</b> and teaches the mental model — most importantly <b>where to init</b> (usually the parent of your repos, so cross-repo contracts light up) and <b>how contracts work</b>. Explains; changes nothing until you say so.</p>
+          <p class="when"><span class="lbl">When</span> Before your first <code style="font-family:var(--mono);color:var(--cyan);font-size:12px">/wiregraph-init</code>, or any time the compartment / contract model isn't clicking. Ends by offering to run init at the right directory for your setup.</p>
+          <p class="args"><span class="lbl">Args</span> optional <span style="color:var(--cyan)">target-dir</span> (defaults to cwd; it inspects this and its parent to make the advice concrete)</p>
+          <div class="ex"><span class="c">$ /wiregraph-tutorial</span>
+you're in a single repo — its siblings client/ and server/ live in ~/work
+→ init at ~/work so the wire seam between them can be traced</div>
+        </div>
+
+        <div class="card cmd reveal d2">
           <div class="name">/wiregraph-init <span class="arg">[target-dir]</span></div>
           <div class="k">setup · end-to-end</div>
           <p class="what">Sets a project up end to end — installs deps, builds the cross-compartment call graph, installs the CLAUDE.md navigation directive, turns on balanced auto-update.</p>
