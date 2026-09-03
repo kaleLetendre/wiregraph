@@ -6,7 +6,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { join, sep } from 'node:path';
-import { readState, members, memberRoots } from '../../scripts/lib/state.mjs';
+import { readState, members, memberRoots, modeSummary } from '../../scripts/lib/state.mjs';
 import { decodeResourceDirection } from '../extract/resource-spec.js';
 import { decodeInprocDirection } from '../extract/inproc-spec.js';
 import { INFERRED_PATH_SEP, INFERRED_UNIQ_SEP } from '../extract/compartment-decl.js';
@@ -101,15 +101,21 @@ export function graphStats(db, project) {
       WHERE s.project=? AND s.kind<>'module' GROUP BY s.compartment ORDER BY n DESC`).all(project);
   if (!nodes.Symbol) return `No wiregraph for this project (${project}).`;
 
+  const state = readState(project) || {};
   const head = [
     `Project: ${project}`,
     'Nodes: ' + Object.entries(nodes).filter(([, n]) => n).map(([k, n]) => `${k}=${n}`).join(', '),
     'Edges: ' + edges.map((r) => `${r.type}=${r.n}`).join(', '),
+    // Which organization method this project is on. Deliberately AFTER the three count
+    // lines: graph_status builds its own block from `graphStats(...).split('\n').slice(0,3)`
+    // (Project/Nodes/Edges) and appends the FULL modeLine itself, so this compact label must
+    // stay out of those first three lines or it would knock Edges out of that slice.
+    `Mode: ${modeSummary(state)}`,
   ];
 
   // Linked members: read this graph's own config. When there are none the output
-  // stays the flat single-graph shape (byte-compatible with a pre-link graph).
-  const mem = members(readState(project) || {});
+  // stays the flat single-graph shape (the pre-link output, plus the Mode line above).
+  const mem = members(state);
   if (!mem.length) {
     return [...head, 'Symbols per compartment:', ...compartments.map((r) => `  ${r.compartment}: ${r.n}`)].join('\n');
   }
