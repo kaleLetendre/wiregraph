@@ -367,7 +367,7 @@ const server = new McpServer({ name: 'wiregraph', version: VERSION });
 
 // --- graph_stats ------------------------------------------------------------
 server.registerTool('graph_stats', {
-  description: 'Overall size of THIS PROJECT\'s code graph: node counts by label, edge counts by type, and per-compartment symbol counts. Call this first to confirm the graph is loaded for the active project.',
+  description: 'Overall size of THIS PROJECT\'s call graph: node counts by label, edge counts by type, and per-compartment symbol counts. Call this first to confirm the graph is loaded for the active project.',
   inputSchema: {},
 }, async () => freshRead((db) => text(Q.graphStats(db, PROJECT))));
 
