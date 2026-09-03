@@ -5,11 +5,11 @@
   "author": { "name": "Kale Letendre", "email": "kaleletendre@gmail.com" },
   "commands": [
     "./commands/wiregraph-init.md",
+    "./commands/wiregraph-tutorial.md",
     "./commands/wiregraph-update.md",
     "./commands/wiregraph-rebuild.md",
     "./commands/wiregraph-status.md",
     "./commands/wiregraph-stats.md",
-    "./commands/wiregraph-stats-local.md",
     "./commands/wiregraph-posture.md",
     "./commands/wiregraph-contracts.md",
     "./commands/wiregraph-review.md",
@@ -20,24 +20,9 @@
     "./commands/wiregraph-list.md",
     "./commands/wiregraph-teardown.md",
     "./commands/wiregraph-remove.md",
-    "./commands/wiregraph-build.md",
     "./commands/wg-init.md",
     "./commands/wg-update.md",
-    "./commands/wg-rebuild.md",
-    "./commands/wg-status.md",
-    "./commands/wg-stats.md",
-    "./commands/wg-stats-local.md",
-    "./commands/wg-posture.md",
-    "./commands/wg-contracts.md",
-    "./commands/wg-review.md",
-    "./commands/wg-visualize.md",
-    "./commands/wg-linearize.md",
-    "./commands/wg-link.md",
-    "./commands/wg-unlink.md",
-    "./commands/wg-list.md",
-    "./commands/wg-teardown.md",
-    "./commands/wg-remove.md",
-    "./commands/wg-build.md"
+    "./commands/wg-status.md"
   ],
   "mcpServers": {
     "wiregraph": {
